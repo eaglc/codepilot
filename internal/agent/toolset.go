@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/eaglc/codepilot/internal/language"
 	"github.com/eaglc/codepilot/internal/session"
 	"github.com/eaglc/codepilot/internal/tool"
 )
@@ -111,14 +112,14 @@ func (s *turnToolState) snapshot() ([]session.PatchRecord, session.CheckSummary)
 
 // buildToolRegistry captures trusted turn facts in each tool so the model can
 // select operations but cannot forge the worktree, session, turn, or policy.
-func buildToolRegistry(scope session.TurnScope, language LanguageProfile, deps toolsetDependencies) (*tool.Registry, error) {
+func buildToolRegistry(scope session.TurnScope, profile language.LanguageProfile, deps toolsetDependencies) (*tool.Registry, error) {
 	if err := validateToolScope(scope); err != nil {
 		return nil, err
 	}
 	if isNilWorkspaceTools(deps.Workspaces) {
 		return nil, errors.New("build tool registry: workspace tools are required")
 	}
-	plans, err := cloneCheckPlans(language.CheckPlans)
+	plans, err := cloneCheckPlans(profile.CheckPlans)
 	if err != nil {
 		return nil, err
 	}
@@ -140,14 +141,14 @@ func buildToolRegistry(scope session.TurnScope, language LanguageProfile, deps t
 		&applyPatchTool{scope: scope, workspaces: deps.Workspaces, state: state},
 		runChecks,
 	}
-	if !isNilCodeNavigator(deps.CodeIntel) && (language.ID == LanguageGo || language.ID == LanguagePython) {
+	if !isNilCodeNavigator(deps.CodeIntel) && (profile.ID == language.LanguageGo || profile.ID == language.LanguagePython) {
 		navigationScope := NavigationScope{
 			SessionID:      scope.SessionID,
 			TurnID:         scope.TurnID,
 			WorktreeID:     scope.WorktreeID,
 			WorktreeRoot:   scope.WorktreeRoot,
 			PermissionMode: scope.PermissionMode,
-			Language:       language.ID,
+			Language:       profile.ID,
 		}
 		tools = append(tools,
 			&definitionTool{scope: scope, navigationScope: navigationScope, navigator: deps.CodeIntel},
@@ -181,8 +182,8 @@ func validateToolScope(scope session.TurnScope) error {
 
 // cloneCheckPlans freezes the trusted commands before their IDs are exposed in
 // the run_checks schema.
-func cloneCheckPlans(values []CheckPlan) (map[string]CheckPlan, error) {
-	plans := make(map[string]CheckPlan, len(values))
+func cloneCheckPlans(values []language.CheckPlan) (map[string]language.CheckPlan, error) {
+	plans := make(map[string]language.CheckPlan, len(values))
 	for _, value := range values {
 		if !validCheckPlanID(value.ID) || strings.TrimSpace(value.Description) == "" || len([]rune(value.Description)) > 500 || value.Command.ID != value.ID || strings.TrimSpace(value.Command.Program) == "" {
 			return nil, fmt.Errorf("build tool registry: check plan %q is invalid", value.ID)

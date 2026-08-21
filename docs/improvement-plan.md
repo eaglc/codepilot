@@ -1,7 +1,7 @@
 # CodePilot 改进建议与修复计划
 
 > 文档版本：v0.2
-> 状态：P0 已全部修复（UI-1 / UI-2 / NAM-1 已实现）；P1 交互项已修复（UI-3 / UI-4 已实现）
+> 状态：P0 已全部修复（UI-1 / UI-2 / NAM-1 已实现）；P1 已全部修复（UI-3 / UI-4 / DOC-1 / DOC-2 / DOC-3 已实现）；P2 依赖项已修复（DEP-1 / DEP-2 已实现）
 > 更新日期：2026-08-21
 > 来源：MVP 架构与代码评审（模块划分 / 依赖关系 / 可维护性 / 代码风格 / UI 交互）
 
@@ -27,11 +27,11 @@
 | NAM-1 | P0 | 命名 | `CheckPoint` 单词内大写，违反 Go 惯例 | ✅ 已修复（§5.4） | `agent/checkpoint.go` |
 | UI-3 | P1 | UI 交互 | 输入框无光标移动 / 历史补全 / 词删除 | ✅ 已修复（§6.4） | `update.go` / `composer_edit.go` |
 | UI-4 | P1 | UI 交互 | Picker 列表无滚动窗口，光标移出屏幕 | ✅ 已修复（§7.4） | `picker_window.go` |
-| DOC-1 | P1 | 文档 | 13 个包缺 `// Package` 注释 | 待修复 | 全 `internal/` |
-| DOC-2 | P1 | 文档 | 4 个 provider 适配器 20 个导出方法无注释 | 待修复 | `openai.go` 等 |
-| DOC-3 | P1 | 文档 | `ProviderPicker*` 9 个常量、`ErrStoreClosed` 无注释 | 待修复 | `provider_picker.go:19-27` |
-| DEP-1 | P2 | 依赖 | `LanguageID` / `LanguageProfile` 放错包，致 `language` 反向依赖 `agent` | 待修复 | `agent/ports.go` |
-| DEP-2 | P2 | 依赖 | `ModelRef` 放错包，致 `provider` 反向依赖 `agent` | 待修复 | `agent/ports.go:302-307` |
+| DOC-1 | P1 | 文档 | 13 个包缺 `// Package` 注释 | ✅ 已修复（§8.4） | 全 `internal/` |
+| DOC-2 | P1 | 文档 | 4 个 provider 适配器 20 个导出方法无注释 | ✅ 已修复（§9.4） | `openai.go` 等 |
+| DOC-3 | P1 | 文档 | `ProviderPicker*` 9 个常量、`ErrStoreClosed` 无注释 | ✅ 已修复（§10.4） | `provider_picker.go:19-27` |
+| DEP-1 | P2 | 依赖 | `LanguageID` / `LanguageProfile` 放错包，致 `language` 反向依赖 `agent` | ✅ 已修复（§11.4） | `agent/ports.go` |
+| DEP-2 | P2 | 依赖 | `ModelRef` 放错包，致 `provider` 反向依赖 `agent` | ✅ 已修复（§12.4） | `agent/ports.go:302-307` |
 | ROB-1 | P2 | 健壮性 | 5 处真实错误被 `_ =` 吞掉 | 待修复 | `session/service.go:727,746` 等 |
 | DEP-3 | P2 | 结构 | `session.Service` 编排过大（~1247 行） | 待修复 | `session/service.go` |
 | DEP-4 | P2 | 结构 | `ListWorkspaceFiles` 靠类型断言访问可选能力，脆弱 | 待修复 | `session/service.go:488-504` |
@@ -208,6 +208,13 @@ package workspace
 - `go doc ./internal/...` 每个包都能看到首行简介。
 - 如启用 `golangci-lint`，`revive`/`golint` 的 package-comments 规则不再报错。
 
+### 8.4 实现记录（已修复）
+
+- 为 13 个缺失 `// Package` 注释的包各新增 `doc.go`，说明职责：`agent` / `app` / `approval` / `config` / `credential` / `language` / `lsp` / `provider` / `session` / `sessionstore` / `tool` / `ui` / `workspace`（`contextmanager` 原有注释保留）。
+- 注释统一采用「Package xxx 说明职责」的两行形式，与 `contextmanager.go` 现有风格一致。
+
+验证：`go doc ./internal/...` 每个包可见首行简介；`go vet ./...` 无输出。
+
 ## 9. DOC-2 适配器导出方法注释
 
 ### 9.1 问题与影响
@@ -221,6 +228,13 @@ package workspace
 ### 9.3 验证方法
 
 - `go vet ./...` 通过（无副作用确认）；人工 `go doc` 抽查每个适配器。
+
+### 9.4 实现记录（已修复）
+
+- 为 4 个 provider 适配器共 20 个导出方法补注释：`Kind` / `Defaults` / `Validate` / `ListModels` / `NewChatModel`，分布在 `openai.go` / `deepseek.go` / `ollama.go` / `compatible.go`。
+- 注释以方法名开头，说明各方法在 `Adapter` 契约下的职责（例如 `ListModels` 说明「列出可用模型并标记推荐项」）。
+
+验证：`go vet ./...` 无输出；`go doc` 抽查每个适配器可见方法注释。
 
 ## 10. DOC-3 常量注释与 `ErrStoreClosed`
 
@@ -236,6 +250,13 @@ package workspace
 ### 10.3 验证方法
 
 - 全局扫描「无文档注释的导出符号」归零（`golint`/`revive` 的 exported 规则）。
+
+### 10.4 实现记录（已修复）
+
+- 为 `ui/provider_picker.go` 的 9 个 `ProviderPicker*` 阶段常量补齐注释，与 `session_picker.go` 的逐条注释风格对齐。
+- 为 `credential/memory_store.go` 的 `ErrStoreClosed` 补注释（保留原名称，未做冗余改名）。
+
+验证：`go vet ./...` 无输出；导出符号无文档注释扫描归零。
 
 ---
 
@@ -258,6 +279,15 @@ package workspace
 - `go build ./... && go test ./...` 通过。
 - `grep -rn '"github.com/eaglc/codepilot/internal/agent"' internal/language/` 不再命中（language 不再依赖 agent）。
 
+### 11.4 实现记录（已修复）
+
+- 将 `LanguageID`（含 `LanguageGo` / `LanguagePython` / `LanguageGeneric` 常量）、`LanguageProfile`、`CheckCommand`、`CheckPlan` 迁到 `language` 包（新建 `internal/language/types.go`）。
+- `agent.LanguageResolver` 保留在 agent（端口归消费者），方法签名改为返回 `language.LanguageProfile`；`agent.NavigationScope.Language` 与 `agent.RunChecksRequest.Command` 改为引用 `language.*`。
+- 删除 `language/registry.go` 中的 `var _ agent.LanguageResolver` 断言与 `agent` 导入，接口一致性由 `app/build.go` 的组装处由编译器保证。
+- 更新所有消费方：`agent`（prompt / toolset / tool_run_checks）、`lsp/navigator.go`、`workspace/command_test.go` 及 `language` / `agent` / `lsp` 相关测试。
+
+验证：`go build ./... && go test ./... -count=1 -timeout=180s` 全绿；`grep -rn 'internal/agent"' internal/language/` 不再命中。
+
 ## 12. DEP-2 `ModelRef` 下移到 `provider`
 
 ### 12.1 问题与影响
@@ -274,6 +304,15 @@ package workspace
 
 - `go build ./... && go test ./...` 通过。
 - `grep -rn 'internal/agent"' internal/provider/` 不再命中（provider 不再依赖 agent）。
+
+### 12.4 实现记录（已修复）
+
+- 将 `ModelRef` 迁到 `provider` 包（新建 `internal/provider/model_ref.go`）。
+- `agent.ModelFactory` 接口改为引用 `provider.ModelRef`（agent import provider）；删除 `provider/service.go` 的 `var _ agent.ModelFactory` 断言与 `agent` 导入，接口一致性由 `app/build.go` 的组装处由编译器保证。
+- 更新所有消费方：`agent`（coding_agent / invocation / ports）、`provider/service.go` 及 `agent` / `provider` 相关测试。
+- `ModelFactory` 接口本身暂留 agent（§12.2 第 3 点），留作后续评估。
+
+验证：`go build ./... && go test ./... -count=1 -timeout=180s` 全绿；`grep -rn 'internal/agent"' internal/provider/` 不再命中。
 
 ## 13. ROB-1 处理被吞掉的真实错误
 

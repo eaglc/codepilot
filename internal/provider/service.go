@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
-	"github.com/eaglc/codepilot/internal/agent"
 	"github.com/eaglc/codepilot/internal/session"
 )
 
@@ -19,10 +18,7 @@ const (
 	credentialLocationMissing = "missing"
 )
 
-var (
-	_ session.ModelCatalog = (*Service)(nil)
-	_ agent.ModelFactory   = (*Service)(nil)
-)
+var _ session.ModelCatalog = (*Service)(nil)
 
 // Service coordinates provider profiles, credentials, validation, and model creation.
 type Service struct {
@@ -232,8 +228,8 @@ func (s *Service) ValidateSelection(ctx context.Context, selection session.Model
 	}, nil
 }
 
-// NewChatModel implements agent.ModelFactory for EinoInvoker.
-func (s *Service) NewChatModel(ctx context.Context, modelRef agent.ModelRef) (model.ToolCallingChatModel, error) {
+// NewChatModel builds the Eino chat model for one validated profile and model.
+func (s *Service) NewChatModel(ctx context.Context, modelRef ModelRef) (model.ToolCallingChatModel, error) {
 	profileID := session.ProviderProfileID(modelRef.Provider)
 	if profileID == "" || strings.TrimSpace(modelRef.Model) == "" {
 		return nil, providerInputError("provider.new_chat_model", "Provider profile and model are required.")

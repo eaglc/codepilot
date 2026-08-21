@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eaglc/codepilot/internal/language"
 	"github.com/eaglc/codepilot/internal/session"
 	"github.com/eaglc/codepilot/internal/tool"
 )
@@ -48,7 +49,7 @@ func TestBuildToolRegistryRegistersSevenToolsInStableOrder(t *testing.T) {
 
 func TestBuildToolRegistryAppendsCodeNavigationToolsWhenAvailable(t *testing.T) {
 	navigator := &fakeCodeNavigator{}
-	registry, err := buildToolRegistry(toolTestScope(4096), LanguageProfile{ID: LanguageGo}, toolsetDependencies{
+	registry, err := buildToolRegistry(toolTestScope(4096), language.LanguageProfile{ID: language.LanguageGo}, toolsetDependencies{
 		Workspaces: &fakeWorkspaceTools{}, CodeIntel: navigator,
 	})
 	if err != nil {
@@ -63,7 +64,7 @@ func TestBuildToolRegistryAppendsCodeNavigationToolsWhenAvailable(t *testing.T) 
 		t.Fatalf("tool order = %#v, want %#v", names, want)
 	}
 
-	registry, err = buildToolRegistry(toolTestScope(4096), LanguageProfile{ID: LanguageGeneric}, toolsetDependencies{
+	registry, err = buildToolRegistry(toolTestScope(4096), language.LanguageProfile{ID: language.LanguageGeneric}, toolsetDependencies{
 		Workspaces: &fakeWorkspaceTools{}, CodeIntel: navigator,
 	})
 	if err != nil {
@@ -81,7 +82,7 @@ func TestCodeNavigationToolsCaptureScopeAndReturnBoundedData(t *testing.T) {
 		symbols:     []Symbol{{Name: "Answer", Kind: "function", Location: Location{Path: "main.go", Range: CodeRange{Start: CodePosition{Line: 2, Column: 1}, End: CodePosition{Line: 4, Column: 2}}}}},
 		diagnostics: []Diagnostic{{Path: "main.go", Range: CodeRange{Start: CodePosition{Line: 9, Column: 3}, End: CodePosition{Line: 9, Column: 5}}, Severity: DiagnosticError, Message: "broken"}},
 	}
-	registry, err := buildToolRegistry(toolTestScope(4096), LanguageProfile{ID: LanguageGo}, toolsetDependencies{
+	registry, err := buildToolRegistry(toolTestScope(4096), language.LanguageProfile{ID: language.LanguageGo}, toolsetDependencies{
 		Workspaces: &fakeWorkspaceTools{}, CodeIntel: navigator,
 	})
 	if err != nil {
@@ -108,7 +109,7 @@ func TestCodeNavigationToolsCaptureScopeAndReturnBoundedData(t *testing.T) {
 		"symbols":     navigator.symbolsRequest.Scope,
 		"diagnostics": navigator.diagnosticsRequest.Scope,
 	} {
-		if scope.WorktreeRoot != `C:\trusted\repo` || scope.WorktreeID != "worktree_test" || scope.SessionID != "session_test" || scope.TurnID != "turn_test" || scope.PermissionMode != session.PermissionAsk || scope.Language != LanguageGo {
+		if scope.WorktreeRoot != `C:\trusted\repo` || scope.WorktreeID != "worktree_test" || scope.SessionID != "session_test" || scope.TurnID != "turn_test" || scope.PermissionMode != session.PermissionAsk || scope.Language != language.LanguageGo {
 			t.Fatalf("%s scope = %#v", name, scope)
 		}
 	}
@@ -116,7 +117,7 @@ func TestCodeNavigationToolsCaptureScopeAndReturnBoundedData(t *testing.T) {
 
 func TestCodeNavigationToolRejectsForgedScopeAndDegradesWhenUnavailable(t *testing.T) {
 	navigator := &fakeCodeNavigator{}
-	registry, err := buildToolRegistry(toolTestScope(4096), LanguageProfile{ID: LanguageGo}, toolsetDependencies{
+	registry, err := buildToolRegistry(toolTestScope(4096), language.LanguageProfile{ID: language.LanguageGo}, toolsetDependencies{
 		Workspaces: &fakeWorkspaceTools{}, CodeIntel: navigator,
 	})
 	if err != nil {
@@ -151,31 +152,31 @@ func TestCodeNavigationToolRejectsForgedScopeAndDegradesWhenUnavailable(t *testi
 
 func TestBuildToolRegistryRejectsInvalidDependenciesAndPlans(t *testing.T) {
 	validScope := toolTestScope(4096)
-	validPlan := CheckPlan{
+	validPlan := language.CheckPlan{
 		ID: "go-test-all", Description: "Run Go tests.",
-		Command: CheckCommand{ID: "go-test-all", Program: "go", Args: []string{"test", "./..."}},
+		Command: language.CheckCommand{ID: "go-test-all", Program: "go", Args: []string{"test", "./..."}},
 	}
 	var typedNil *fakeWorkspaceTools
 	tests := []struct {
 		name      string
 		scope     session.TurnScope
 		workspace WorkspaceTools
-		plans     []CheckPlan
+		plans     []language.CheckPlan
 	}{
-		{name: "missing scope", workspace: &fakeWorkspaceTools{}, plans: []CheckPlan{validPlan}},
-		{name: "nil workspace", scope: validScope, plans: []CheckPlan{validPlan}},
-		{name: "typed nil workspace", scope: validScope, workspace: typedNil, plans: []CheckPlan{validPlan}},
+		{name: "missing scope", workspace: &fakeWorkspaceTools{}, plans: []language.CheckPlan{validPlan}},
+		{name: "nil workspace", scope: validScope, plans: []language.CheckPlan{validPlan}},
+		{name: "typed nil workspace", scope: validScope, workspace: typedNil, plans: []language.CheckPlan{validPlan}},
 		{
 			name:      "mismatched command ID",
 			scope:     validScope,
 			workspace: &fakeWorkspaceTools{},
-			plans:     []CheckPlan{{ID: "one", Description: "one", Command: CheckCommand{ID: "two"}}},
+			plans:     []language.CheckPlan{{ID: "one", Description: "one", Command: language.CheckCommand{ID: "two"}}},
 		},
-		{name: "duplicate plan", scope: validScope, workspace: &fakeWorkspaceTools{}, plans: []CheckPlan{validPlan, validPlan}},
+		{name: "duplicate plan", scope: validScope, workspace: &fakeWorkspaceTools{}, plans: []language.CheckPlan{validPlan, validPlan}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := buildToolRegistry(test.scope, LanguageProfile{ID: LanguageGo, CheckPlans: test.plans}, toolsetDependencies{Workspaces: test.workspace}); err == nil {
+			if _, err := buildToolRegistry(test.scope, language.LanguageProfile{ID: language.LanguageGo, CheckPlans: test.plans}, toolsetDependencies{Workspaces: test.workspace}); err == nil {
 				t.Fatal("expected registry build error")
 			}
 		})
@@ -184,9 +185,9 @@ func TestBuildToolRegistryRejectsInvalidDependenciesAndPlans(t *testing.T) {
 
 func TestBuildToolRegistryCopiesLanguageCheckPlans(t *testing.T) {
 	workspace := &fakeWorkspaceTools{checkResult: RunChecksResult{Outcome: session.CheckPassed}}
-	profile := LanguageProfile{ID: LanguageGo, CheckPlans: []CheckPlan{{
+	profile := language.LanguageProfile{ID: language.LanguageGo, CheckPlans: []language.CheckPlan{{
 		ID: "go-test-all", Description: "Run Go tests.",
-		Command: CheckCommand{ID: "go-test-all", Program: "go", Args: []string{"test", "./..."}, EnvAllowlist: []string{"GOCACHE"}},
+		Command: language.CheckCommand{ID: "go-test-all", Program: "go", Args: []string{"test", "./..."}, EnvAllowlist: []string{"GOCACHE"}},
 	}}}
 	registry, err := buildToolRegistry(toolTestScope(4096), profile, toolsetDependencies{Workspaces: workspace})
 	if err != nil {
@@ -535,12 +536,12 @@ func newToolTestRegistry(t *testing.T, workspace WorkspaceTools) (*tool.Registry
 func newToolTestRegistryWithLimit(t *testing.T, workspace WorkspaceTools, resultLimit int) (*tool.Registry, *turnToolState) {
 	t.Helper()
 	state := newTurnToolState()
-	registry, err := buildToolRegistry(toolTestScope(resultLimit), LanguageProfile{
-		ID: LanguageGo,
-		CheckPlans: []CheckPlan{{
+	registry, err := buildToolRegistry(toolTestScope(resultLimit), language.LanguageProfile{
+		ID: language.LanguageGo,
+		CheckPlans: []language.CheckPlan{{
 			ID:          "go-test-all",
 			Description: "Run all Go tests.",
-			Command: CheckCommand{
+			Command: language.CheckCommand{
 				ID:             "go-test-all",
 				Program:        "go",
 				Args:           []string{"test", "./..."},

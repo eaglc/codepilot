@@ -23,10 +23,12 @@ func NewDeepSeekAdapter(client *http.Client) *DeepSeekAdapter {
 	return &DeepSeekAdapter{client: providerHTTPClient(client)}
 }
 
+// Kind returns KindDeepSeek.
 func (a *DeepSeekAdapter) Kind() Kind {
 	return KindDeepSeek
 }
 
+// Defaults returns the DeepSeek base URL, recommended model, and credential requirement.
 func (a *DeepSeekAdapter) Defaults() Defaults {
 	return Defaults{
 		DisplayName:     "DeepSeek",
@@ -36,6 +38,7 @@ func (a *DeepSeekAdapter) Defaults() Defaults {
 	}
 }
 
+// Validate probes endpoint, credential, and tool-calling support for the requested model.
 func (a *DeepSeekAdapter) Validate(ctx context.Context, request ValidationRequest) (ValidationResult, error) {
 	if result := validateAdapterRequest(request.BaseURL, request.ModelID, request.Secret, true); !result.Valid {
 		return result, nil
@@ -50,6 +53,7 @@ func (a *DeepSeekAdapter) Validate(ctx context.Context, request ValidationReques
 	return probeToolCallingWithoutChoice(ctx, chatModel)
 }
 
+// ListModels lists the DeepSeek account's available models, marking the configured one as recommended.
 func (a *DeepSeekAdapter) ListModels(ctx context.Context, request ModelListRequest) ([]Model, error) {
 	if err := validateModelListRequest(request, true); err != nil {
 		return nil, err
@@ -61,6 +65,7 @@ func (a *DeepSeekAdapter) ListModels(ctx context.Context, request ModelListReque
 	return markRecommendedModel(models, request.ModelID), nil
 }
 
+// NewChatModel creates a DeepSeek chat model for the validated request.
 func (a *DeepSeekAdapter) NewChatModel(ctx context.Context, request ChatModelRequest) (model.ToolCallingChatModel, error) {
 	if result := validateAdapterRequest(request.BaseURL, request.ModelID, request.Secret, true); !result.Valid {
 		return nil, &adapterOperationError{operation: "create DeepSeek model", cause: nil}

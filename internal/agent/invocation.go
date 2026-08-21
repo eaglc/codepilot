@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/eaglc/codepilot/internal/provider"
 	"github.com/eaglc/codepilot/internal/tool"
 )
 
@@ -74,7 +75,7 @@ type InvocationLimits struct {
 type InvocationInput struct {
 	ID           string
 	CheckpointID string
-	Model        ModelRef
+	Model        provider.ModelRef
 	SystemPrompt string
 	Messages     []InvocationMessage
 	Tools        *tool.Registry

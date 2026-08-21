@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/eaglc/codepilot/internal/language"
 	"github.com/eaglc/codepilot/internal/session"
 	"github.com/eaglc/codepilot/internal/tool"
 )
@@ -18,7 +19,7 @@ type runChecksTool struct {
 	scope      session.TurnScope
 	workspaces WorkspaceTools
 	state      *turnToolState
-	plans      map[string]CheckPlan
+	plans      map[string]language.CheckPlan
 	definition tool.Definition
 }
 
@@ -42,7 +43,7 @@ type runChecksOutput struct {
 
 // newRunChecksTool derives the input enum from the trusted plan map so unknown
 // or model-authored commands cannot satisfy the tool schema.
-func newRunChecksTool(scope session.TurnScope, workspaces WorkspaceTools, state *turnToolState, plans map[string]CheckPlan) (*runChecksTool, error) {
+func newRunChecksTool(scope session.TurnScope, workspaces WorkspaceTools, state *turnToolState, plans map[string]language.CheckPlan) (*runChecksTool, error) {
 	planIDs := make([]string, 0, len(plans))
 	for planID := range plans {
 		planIDs = append(planIDs, planID)

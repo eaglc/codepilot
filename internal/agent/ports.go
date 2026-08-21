@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
+	"github.com/eaglc/codepilot/internal/language"
+	"github.com/eaglc/codepilot/internal/provider"
 	"github.com/eaglc/codepilot/internal/session"
 )
 
@@ -115,49 +117,10 @@ type ApplyPatchResult struct {
 	PatchRecord  session.PatchRecord
 }
 
-// CheckCommand is a trusted command plan produced by a language strategy. Dir
-// is worktree-relative and an empty value selects the worktree root.
-type CheckCommand struct {
-	ID             string
-	Program        string
-	Args           []string
-	Dir            string
-	EnvAllowlist   []string
-	Timeout        time.Duration
-	MaxOutputBytes int
-}
-
-// LanguageID is the stable identifier exposed by a language strategy.
-type LanguageID string
-
-const (
-	// LanguageGeneric selects language-neutral behavior.
-	LanguageGeneric LanguageID = "generic"
-	// LanguageGo selects Go-specific prompt guidance and check plans.
-	LanguageGo LanguageID = "go"
-	// LanguagePython selects Python-specific prompt guidance and check plans.
-	LanguagePython LanguageID = "python"
-)
-
-// CheckPlan is one immutable, model-selectable verification plan.
-type CheckPlan struct {
-	ID          string
-	Description string
-	Command     CheckCommand
-}
-
-// LanguageProfile contains prompt guidance and trusted check plans for one
-// resolved worktree language.
-type LanguageProfile struct {
-	ID         LanguageID
-	PromptHint string
-	CheckPlans []CheckPlan
-}
-
 // LanguageResolver detects a worktree language and returns only trusted,
 // pre-defined guidance and check plans.
 type LanguageResolver interface {
-	ResolveLanguage(ctx context.Context, root string) (LanguageProfile, error)
+	ResolveLanguage(ctx context.Context, root string) (language.LanguageProfile, error)
 }
 
 // ErrCodeNavigationUnavailable indicates that code intelligence can safely
@@ -171,7 +134,7 @@ type NavigationScope struct {
 	WorktreeID     session.WorktreeID
 	WorktreeRoot   string
 	PermissionMode session.PermissionMode
-	Language       LanguageID
+	Language       language.LanguageID
 }
 
 // CodePosition is a one-based source position. Column counts UTF-16 code units
@@ -270,7 +233,7 @@ type RunChecksRequest struct {
 	SessionID      session.SessionID
 	TurnID         session.TurnID
 	PermissionMode session.PermissionMode
-	Command        CheckCommand
+	Command        language.CheckCommand
 }
 
 // RunChecksResult contains bounded evidence and a programmatic check outcome.
@@ -299,14 +262,7 @@ type WorkspaceTools interface {
 	RunChecks(ctx context.Context, request RunChecksRequest) (RunChecksResult, error)
 }
 
-// ModelRef identifies one configured provider profile and model without
-// exposing credentials or provider-specific configuration.
-type ModelRef struct {
-	Provider string
-	Model    string
-}
-
 // ModelFactory creates the Eino model consumed only by EinoInvoker.
 type ModelFactory interface {
-	NewChatModel(ctx context.Context, modelRef ModelRef) (model.ToolCallingChatModel, error)
+	NewChatModel(ctx context.Context, modelRef provider.ModelRef) (model.ToolCallingChatModel, error)
 }

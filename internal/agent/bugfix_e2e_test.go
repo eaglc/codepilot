@@ -19,6 +19,7 @@ import (
 	"github.com/eaglc/codepilot/internal/approval"
 	"github.com/eaglc/codepilot/internal/contextmanager"
 	"github.com/eaglc/codepilot/internal/language"
+	"github.com/eaglc/codepilot/internal/provider"
 	"github.com/eaglc/codepilot/internal/session"
 	"github.com/eaglc/codepilot/internal/sessionstore"
 	"github.com/eaglc/codepilot/internal/workspace"
@@ -142,7 +143,7 @@ type bugfixModelFactory struct {
 	value model.ToolCallingChatModel
 }
 
-func (f bugfixModelFactory) NewChatModel(ctx context.Context, ref agent.ModelRef) (model.ToolCallingChatModel, error) {
+func (f bugfixModelFactory) NewChatModel(ctx context.Context, ref provider.ModelRef) (model.ToolCallingChatModel, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

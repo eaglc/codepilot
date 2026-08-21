@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
-
-	"github.com/eaglc/codepilot/internal/agent"
 )
 
 func TestRegistryResolveLanguageSelectsPythonProject(t *testing.T) {
@@ -22,8 +20,8 @@ func TestRegistryResolveLanguageSelectsPythonProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.ID != agent.LanguagePython {
-		t.Fatalf("language = %q, want %q", profile.ID, agent.LanguagePython)
+	if profile.ID != LanguagePython {
+		t.Fatalf("language = %q, want %q", profile.ID, LanguagePython)
 	}
 	if len(profile.CheckPlans) != 1 {
 		t.Fatalf("plans = %#v", profile.CheckPlans)
@@ -80,7 +78,7 @@ func TestRegistryResolveLanguageFallsBackForEqualGoAndPythonMetadata(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.ID != agent.LanguageGeneric || len(profile.CheckPlans) != 0 {
+	if profile.ID != LanguageGeneric || len(profile.CheckPlans) != 0 {
 		t.Fatalf("profile = %#v, want deterministic generic fallback", profile)
 	}
 }

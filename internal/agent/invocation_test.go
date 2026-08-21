@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eaglc/codepilot/internal/provider"
 	"github.com/eaglc/codepilot/internal/tool"
 )
 
@@ -53,7 +54,7 @@ func validInvocationInput(registry *tool.Registry) InvocationInput {
 	return InvocationInput{
 		ID:           "turn-1",
 		CheckpointID: "checkpoint-1",
-		Model:        ModelRef{Provider: "test", Model: "scripted"},
+		Model:        provider.ModelRef{Provider: "test", Model: "scripted"},
 		SystemPrompt: "Use the available tools.",
 		Messages:     []InvocationMessage{{Role: InvocationRoleUser, Content: "fix it"}},
 		Tools:        registry,

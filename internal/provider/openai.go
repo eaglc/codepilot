@@ -23,10 +23,12 @@ func NewOpenAIAdapter(client *http.Client) *OpenAIAdapter {
 	return &OpenAIAdapter{client: providerHTTPClient(client)}
 }
 
+// Kind returns KindOpenAI.
 func (a *OpenAIAdapter) Kind() Kind {
 	return KindOpenAI
 }
 
+// Defaults returns the OpenAI base URL, recommended model, and credential requirement.
 func (a *OpenAIAdapter) Defaults() Defaults {
 	return Defaults{
 		DisplayName:     "OpenAI",
@@ -36,6 +38,7 @@ func (a *OpenAIAdapter) Defaults() Defaults {
 	}
 }
 
+// Validate probes endpoint, credential, and tool-calling support for the requested model.
 func (a *OpenAIAdapter) Validate(ctx context.Context, request ValidationRequest) (ValidationResult, error) {
 	if result := validateAdapterRequest(request.BaseURL, request.ModelID, request.Secret, true); !result.Valid {
 		return result, nil
@@ -47,6 +50,7 @@ func (a *OpenAIAdapter) Validate(ctx context.Context, request ValidationRequest)
 	return probeToolCalling(ctx, chatModel)
 }
 
+// ListModels lists the OpenAI account's available models, marking the configured one as recommended.
 func (a *OpenAIAdapter) ListModels(ctx context.Context, request ModelListRequest) ([]Model, error) {
 	if err := validateModelListRequest(request, true); err != nil {
 		return nil, err
@@ -58,6 +62,7 @@ func (a *OpenAIAdapter) ListModels(ctx context.Context, request ModelListRequest
 	return markRecommendedModel(models, request.ModelID), nil
 }
 
+// NewChatModel creates an OpenAI chat model for the validated request.
 func (a *OpenAIAdapter) NewChatModel(ctx context.Context, request ChatModelRequest) (model.ToolCallingChatModel, error) {
 	if result := validateAdapterRequest(request.BaseURL, request.ModelID, request.Secret, true); !result.Valid {
 		return nil, &adapterOperationError{operation: "create OpenAI model", cause: nil}

@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/eaglc/codepilot/internal/agent"
 )
 
 func TestRegistryResolveLanguageSelectsGoModule(t *testing.T) {
@@ -24,8 +22,8 @@ func TestRegistryResolveLanguageSelectsGoModule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.ID != agent.LanguageGo {
-		t.Fatalf("language = %q, want %q", profile.ID, agent.LanguageGo)
+	if profile.ID != LanguageGo {
+		t.Fatalf("language = %q, want %q", profile.ID, LanguageGo)
 	}
 	wantPlans := []string{"go-test-all", "go-test-root", "go-vet-all"}
 	if len(profile.CheckPlans) != len(wantPlans) {
@@ -49,15 +47,15 @@ func TestRegistryResolveLanguageFallsBackWhenNoStrategyMatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.ID != agent.LanguageGeneric || len(profile.CheckPlans) != 0 {
+	if profile.ID != LanguageGeneric || len(profile.CheckPlans) != 0 {
 		t.Fatalf("profile = %#v, want generic without checks", profile)
 	}
 }
 
 func TestRegistryResolveLanguageFallsBackOnTiedScore(t *testing.T) {
 	registry, err := NewRegistry(
-		&fakeStrategy{id: agent.LanguageGo, detection: Detection{Score: 80}},
-		&fakeStrategy{id: agent.LanguagePython, detection: Detection{Score: 80}},
+		&fakeStrategy{id: LanguageGo, detection: Detection{Score: 80}},
+		&fakeStrategy{id: LanguagePython, detection: Detection{Score: 80}},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -67,14 +65,14 @@ func TestRegistryResolveLanguageFallsBackOnTiedScore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.ID != agent.LanguageGeneric {
-		t.Fatalf("language = %q, want %q", profile.ID, agent.LanguageGeneric)
+	if profile.ID != LanguageGeneric {
+		t.Fatalf("language = %q, want %q", profile.ID, LanguageGeneric)
 	}
 }
 
 func TestRegistryResolveLanguagePropagatesDetectionError(t *testing.T) {
 	wantErr := errors.New("detection failed")
-	registry, err := NewRegistry(&fakeStrategy{id: agent.LanguageGo, detectErr: wantErr})
+	registry, err := NewRegistry(&fakeStrategy{id: LanguageGo, detectErr: wantErr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,12 +99,12 @@ func TestGoStrategyDetectsRootGoSourceWithoutManifest(t *testing.T) {
 }
 
 type fakeStrategy struct {
-	id        agent.LanguageID
+	id        LanguageID
 	detection Detection
 	detectErr error
 }
 
-func (s *fakeStrategy) ID() agent.LanguageID {
+func (s *fakeStrategy) ID() LanguageID {
 	return s.id
 }
 
@@ -114,6 +112,6 @@ func (s *fakeStrategy) Detect(context.Context, string) (Detection, error) {
 	return s.detection, s.detectErr
 }
 
-func (s *fakeStrategy) BuildProfile(context.Context, string) (agent.LanguageProfile, error) {
-	return agent.LanguageProfile{ID: s.id, PromptHint: "test profile"}, nil
+func (s *fakeStrategy) BuildProfile(context.Context, string) (LanguageProfile, error) {
+	return LanguageProfile{ID: s.id, PromptHint: "test profile"}, nil
 }

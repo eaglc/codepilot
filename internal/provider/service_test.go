@@ -9,7 +9,6 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
-	"github.com/eaglc/codepilot/internal/agent"
 	"github.com/eaglc/codepilot/internal/session"
 )
 
@@ -166,7 +165,7 @@ func TestServiceListModelsAndCreateChatModelUseStoredContext(t *testing.T) {
 	if len(models) != 1 || models[0].ID != "configured-model" || models[0].Source != string(ModelSourceCatalog) {
 		t.Fatalf("unexpected model options: %#v", models)
 	}
-	created, err := service.NewChatModel(context.Background(), agent.ModelRef{Provider: "prv_existing", Model: "turn-model"})
+	created, err := service.NewChatModel(context.Background(), ModelRef{Provider: "prv_existing", Model: "turn-model"})
 	if err != nil {
 		t.Fatalf("create chat model: %v", err)
 	}

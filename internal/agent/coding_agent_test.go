@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/eaglc/codepilot/internal/contextmanager"
+	"github.com/eaglc/codepilot/internal/language"
 	"github.com/eaglc/codepilot/internal/session"
 	"github.com/eaglc/codepilot/internal/tool"
 )
@@ -204,10 +205,10 @@ func TestCodingEventAdapterCoalescesAssistantTextAndMapsToolFailure(t *testing.T
 }
 
 type staticLanguageResolver struct {
-	profile LanguageProfile
+	profile language.LanguageProfile
 }
 
-func (r staticLanguageResolver) ResolveLanguage(context.Context, string) (LanguageProfile, error) {
+func (r staticLanguageResolver) ResolveLanguage(context.Context, string) (language.LanguageProfile, error) {
 	return r.profile, nil
 }
 
@@ -447,13 +448,13 @@ func (s *recordingSessionEvents) diffKinds() []session.DiffKind {
 	return values
 }
 
-func testGoProfile() LanguageProfile {
-	return LanguageProfile{
-		ID:         LanguageGo,
+func testGoProfile() language.LanguageProfile {
+	return language.LanguageProfile{
+		ID:         language.LanguageGo,
 		PromptHint: "Use idiomatic Go.",
-		CheckPlans: []CheckPlan{{
+		CheckPlans: []language.CheckPlan{{
 			ID: "go-test-all", Description: "Run all tests.",
-			Command: CheckCommand{ID: "go-test-all", Program: "go", Args: []string{"test", "./..."}, Timeout: time.Minute, MaxOutputBytes: 1 << 20},
+			Command: language.CheckCommand{ID: "go-test-all", Program: "go", Args: []string{"test", "./..."}, Timeout: time.Minute, MaxOutputBytes: 1 << 20},
 		}},
 	}
 }

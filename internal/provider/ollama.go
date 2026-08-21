@@ -28,10 +28,12 @@ func NewOllamaAdapter(client *http.Client) *OllamaAdapter {
 	return &OllamaAdapter{client: providerHTTPClient(client)}
 }
 
+// Kind returns KindOllama.
 func (a *OllamaAdapter) Kind() Kind {
 	return KindOllama
 }
 
+// Defaults returns the local Ollama base URL and recommended model.
 func (a *OllamaAdapter) Defaults() Defaults {
 	return Defaults{
 		DisplayName: "Ollama",
@@ -40,6 +42,7 @@ func (a *OllamaAdapter) Defaults() Defaults {
 	}
 }
 
+// Validate probes endpoint and tool-calling support for the requested local model.
 func (a *OllamaAdapter) Validate(ctx context.Context, request ValidationRequest) (ValidationResult, error) {
 	if result := validateAdapterRequest(request.BaseURL, request.ModelID, nil, false); !result.Valid {
 		return result, nil
@@ -51,6 +54,7 @@ func (a *OllamaAdapter) Validate(ctx context.Context, request ValidationRequest)
 	return probeToolCalling(ctx, chatModel)
 }
 
+// ListModels lists the models available from the local Ollama server.
 func (a *OllamaAdapter) ListModels(ctx context.Context, request ModelListRequest) ([]Model, error) {
 	if err := validateModelListRequest(ModelListRequest{BaseURL: request.BaseURL, ModelID: request.ModelID}, false); err != nil {
 		return nil, err
@@ -108,6 +112,7 @@ func (a *OllamaAdapter) ListModels(ctx context.Context, request ModelListRequest
 	return markRecommendedModel(models, request.ModelID), nil
 }
 
+// NewChatModel creates an Ollama chat model for the validated request.
 func (a *OllamaAdapter) NewChatModel(ctx context.Context, request ChatModelRequest) (model.ToolCallingChatModel, error) {
 	if result := validateAdapterRequest(request.BaseURL, request.ModelID, nil, false); !result.Valid {
 		return nil, &adapterOperationError{operation: "create Ollama model", cause: nil}

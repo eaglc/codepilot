@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/eaglc/codepilot/internal/contextmanager"
+	"github.com/eaglc/codepilot/internal/provider"
 	"github.com/eaglc/codepilot/internal/session"
 )
 
@@ -79,7 +80,7 @@ func (a *CodingAgent) RunTurn(ctx context.Context, request session.TurnRequest, 
 	input := InvocationInput{
 		ID:           string(request.Scope.TurnID),
 		CheckpointID: string(request.Scope.TurnID),
-		Model: ModelRef{
+		Model: provider.ModelRef{
 			Provider: string(request.Scope.ProviderProfileID),
 			Model:    request.Scope.ModelID,
 		},

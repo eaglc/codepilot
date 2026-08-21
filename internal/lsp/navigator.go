@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/eaglc/codepilot/internal/agent"
+	"github.com/eaglc/codepilot/internal/language"
 	"github.com/eaglc/codepilot/internal/session"
 	"github.com/eaglc/codepilot/internal/workspace"
 )
@@ -46,7 +47,7 @@ type ServerConfig struct {
 type Options struct {
 	Executor              workspace.CommandExecutor
 	Authorizer            ActionAuthorizer
-	Servers               map[agent.LanguageID]ServerConfig
+	Servers               map[language.LanguageID]ServerConfig
 	InitializationTimeout time.Duration
 	DiagnosticWait        time.Duration
 	MaxMessageBytes       int
@@ -57,7 +58,7 @@ type Options struct {
 type serverSlot struct {
 	ready    chan struct{}
 	root     string
-	language agent.LanguageID
+	language language.LanguageID
 	client   *client
 	err      error
 }
@@ -460,18 +461,18 @@ func validateOptions(options Options) error {
 	if len(options.Servers) == 0 {
 		return errors.New("create LSP navigator: at least one server is required")
 	}
-	for language, config := range options.Servers {
-		if language != agent.LanguageGo && language != agent.LanguagePython {
-			return fmt.Errorf("create LSP navigator: language %q is unsupported", language)
+	for id, config := range options.Servers {
+		if id != language.LanguageGo && id != language.LanguagePython {
+			return fmt.Errorf("create LSP navigator: language %q is unsupported", id)
 		}
 		if strings.TrimSpace(config.Program) == "" || filepath.Base(config.Program) != config.Program || len(config.Args) > 16 {
-			return fmt.Errorf("create LSP navigator: server for %q is invalid", language)
+			return fmt.Errorf("create LSP navigator: server for %q is invalid", id)
 		}
 		program := strings.TrimSuffix(strings.ToLower(config.Program), ".exe")
-		valid := language == agent.LanguageGo && program == "gopls" && reflect.DeepEqual(config.Args, []string{"serve"})
-		valid = valid || language == agent.LanguagePython && (program == "pyright-langserver" || program == "basedpyright-langserver") && reflect.DeepEqual(config.Args, []string{"--stdio"})
+		valid := id == language.LanguageGo && program == "gopls" && reflect.DeepEqual(config.Args, []string{"serve"})
+		valid = valid || id == language.LanguagePython && (program == "pyright-langserver" || program == "basedpyright-langserver") && reflect.DeepEqual(config.Args, []string{"--stdio"})
 		if !valid {
-			return fmt.Errorf("create LSP navigator: server for %q is outside the allowlist", language)
+			return fmt.Errorf("create LSP navigator: server for %q is outside the allowlist", id)
 		}
 	}
 	if options.InitializationTimeout <= 0 || options.InitializationTimeout > time.Minute || options.DiagnosticWait < 0 || options.DiagnosticWait > 5*time.Second {
@@ -487,7 +488,7 @@ func validateNavigationScope(scope agent.NavigationScope) (string, error) {
 	if scope.SessionID == "" || scope.TurnID == "" || scope.WorktreeID == "" || strings.TrimSpace(scope.WorktreeRoot) == "" {
 		return "", errors.New("query LSP: navigation scope is incomplete")
 	}
-	if scope.Language != agent.LanguageGo && scope.Language != agent.LanguagePython {
+	if scope.Language != language.LanguageGo && scope.Language != language.LanguagePython {
 		return "", fmt.Errorf("%w: language %q has no server", agent.ErrCodeNavigationUnavailable, scope.Language)
 	}
 	switch scope.PermissionMode {
@@ -516,18 +517,18 @@ func validatePosition(value agent.CodePosition) error {
 	return nil
 }
 
-func defaultServers() map[agent.LanguageID]ServerConfig {
-	return map[agent.LanguageID]ServerConfig{
-		agent.LanguageGo:     {Program: "gopls", Args: []string{"serve"}},
-		agent.LanguagePython: {Program: "pyright-langserver", Args: []string{"--stdio"}},
+func defaultServers() map[language.LanguageID]ServerConfig {
+	return map[language.LanguageID]ServerConfig{
+		language.LanguageGo:     {Program: "gopls", Args: []string{"serve"}},
+		language.LanguagePython: {Program: "pyright-langserver", Args: []string{"--stdio"}},
 	}
 }
 
-func cloneServers(values map[agent.LanguageID]ServerConfig) map[agent.LanguageID]ServerConfig {
-	cloned := make(map[agent.LanguageID]ServerConfig, len(values))
-	for language, config := range values {
+func cloneServers(values map[language.LanguageID]ServerConfig) map[language.LanguageID]ServerConfig {
+	cloned := make(map[language.LanguageID]ServerConfig, len(values))
+	for id, config := range values {
 		config.Args = append([]string(nil), config.Args...)
-		cloned[language] = config
+		cloned[id] = config
 	}
 	return cloned
 }

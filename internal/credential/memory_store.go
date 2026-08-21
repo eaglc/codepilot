@@ -9,6 +9,8 @@ import (
 	"github.com/eaglc/codepilot/internal/session"
 )
 
+// ErrStoreClosed reports that a credential store has been closed and can no
+// longer serve requests.
 var ErrStoreClosed = errors.New("credential store is closed")
 
 var _ provider.CredentialStore = (*MemoryStore)(nil)

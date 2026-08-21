@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/eaglc/codepilot/internal/agent"
 )
 
 const (
@@ -25,8 +23,8 @@ func NewGoStrategy() *GoStrategy {
 }
 
 // ID returns the stable Go language identifier.
-func (*GoStrategy) ID() agent.LanguageID {
-	return agent.LanguageGo
+func (*GoStrategy) ID() LanguageID {
+	return LanguageGo
 }
 
 // Detect scores explicit Go module metadata above a root-level Go source file.
@@ -64,20 +62,20 @@ func (*GoStrategy) Detect(ctx context.Context, root string) (Detection, error) {
 
 // BuildProfile returns immutable, allowlisted commands for broad tests, a
 // root-package test, and static analysis.
-func (*GoStrategy) BuildProfile(ctx context.Context, root string) (agent.LanguageProfile, error) {
+func (*GoStrategy) BuildProfile(ctx context.Context, root string) (LanguageProfile, error) {
 	if err := ctx.Err(); err != nil {
-		return agent.LanguageProfile{}, err
+		return LanguageProfile{}, err
 	}
 	if info, err := os.Stat(root); err != nil || !info.IsDir() {
 		if err != nil {
-			return agent.LanguageProfile{}, err
+			return LanguageProfile{}, err
 		}
-		return agent.LanguageProfile{}, errors.New("build Go profile: worktree root is not a directory")
+		return LanguageProfile{}, errors.New("build Go profile: worktree root is not a directory")
 	}
-	return agent.LanguageProfile{
-		ID:         agent.LanguageGo,
+	return LanguageProfile{
+		ID:         LanguageGo,
 		PromptHint: "This is a Go worktree. Prefer small idiomatic changes, preserve package boundaries, format changed Go files, and use a trusted Go test plan after editing.",
-		CheckPlans: []agent.CheckPlan{
+		CheckPlans: []CheckPlan{
 			goCheckPlan("go-test-all", "Run all Go package tests.", "test", "./..."),
 			goCheckPlan("go-test-root", "Run tests for the root Go package.", "test", "."),
 			goCheckPlan("go-vet-all", "Run Go static analysis for all packages.", "vet", "./..."),
@@ -85,11 +83,11 @@ func (*GoStrategy) BuildProfile(ctx context.Context, root string) (agent.Languag
 	}, nil
 }
 
-func goCheckPlan(id string, description string, arguments ...string) agent.CheckPlan {
-	return agent.CheckPlan{
+func goCheckPlan(id string, description string, arguments ...string) CheckPlan {
+	return CheckPlan{
 		ID:          id,
 		Description: description,
-		Command: agent.CheckCommand{
+		Command: CheckCommand{
 			ID:             id,
 			Program:        "go",
 			Args:           append([]string(nil), arguments...),

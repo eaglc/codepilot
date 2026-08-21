@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/eaglc/codepilot/internal/agent"
+	"github.com/eaglc/codepilot/internal/language"
 	"github.com/eaglc/codepilot/internal/session"
 	"github.com/eaglc/codepilot/internal/workspace"
 )
@@ -102,7 +103,7 @@ func TestNewNavigatorValidatesServerAndResourceOptions(t *testing.T) {
 	authorizer := &recordingAuthorizer{outcome: session.AuthorizationAllow}
 	validPython := Options{
 		Executor: executor, Authorizer: authorizer,
-		Servers: map[agent.LanguageID]ServerConfig{agent.LanguagePython: {Program: "basedpyright-langserver", Args: []string{"--stdio"}}},
+		Servers: map[language.LanguageID]ServerConfig{language.LanguagePython: {Program: "basedpyright-langserver", Args: []string{"--stdio"}}},
 	}
 	if navigator, err := NewNavigator(validPython); err != nil {
 		t.Fatalf("create basedpyright navigator: %v", err)
@@ -113,7 +114,7 @@ func TestNewNavigatorValidatesServerAndResourceOptions(t *testing.T) {
 	tests := []Options{
 		{Authorizer: authorizer},
 		{Executor: executor},
-		{Executor: executor, Authorizer: authorizer, Servers: map[agent.LanguageID]ServerConfig{agent.LanguageGo: {Program: "go", Args: []string{"run", "gopls"}}}},
+		{Executor: executor, Authorizer: authorizer, Servers: map[language.LanguageID]ServerConfig{language.LanguageGo: {Program: "go", Args: []string{"run", "gopls"}}}},
 		{Executor: executor, Authorizer: authorizer, MaxMessageBytes: 1024, MaxDocumentBytes: 1024},
 		{Executor: executor, Authorizer: authorizer, MaxResults: 201},
 	}
@@ -292,7 +293,7 @@ func TestProtocolFrameAndSingleLocationLinkDecoding(t *testing.T) {
 func navigationTestScope(root string) agent.NavigationScope {
 	return agent.NavigationScope{
 		SessionID: "session_test", TurnID: "turn_test", WorktreeID: "worktree_test", WorktreeRoot: root,
-		PermissionMode: session.PermissionAsk, Language: agent.LanguageGo,
+		PermissionMode: session.PermissionAsk, Language: language.LanguageGo,
 	}
 }
 

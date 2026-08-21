@@ -8,6 +8,7 @@ import (
 
 	"github.com/eaglc/codepilot/internal/agent"
 	"github.com/eaglc/codepilot/internal/approval"
+	"github.com/eaglc/codepilot/internal/language"
 	"github.com/eaglc/codepilot/internal/session"
 )
 
@@ -156,7 +157,7 @@ func checkRequest(root string, mode session.PermissionMode) agent.RunChecksReque
 		SessionID:      "session_check",
 		TurnID:         "turn_check",
 		PermissionMode: mode,
-		Command: agent.CheckCommand{
+		Command: language.CheckCommand{
 			ID:             "go-test-all",
 			Program:        "go",
 			Args:           []string{"test", "./..."},

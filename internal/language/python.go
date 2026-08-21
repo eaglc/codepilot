@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/eaglc/codepilot/internal/agent"
 )
 
 const (
@@ -25,8 +23,8 @@ func NewPythonStrategy() *PythonStrategy {
 }
 
 // ID returns the stable Python language identifier.
-func (*PythonStrategy) ID() agent.LanguageID {
-	return agent.LanguagePython
+func (*PythonStrategy) ID() LanguageID {
+	return LanguagePython
 }
 
 // Detect scores explicit Python and pytest metadata above root-level Python
@@ -93,32 +91,32 @@ func (*PythonStrategy) Detect(ctx context.Context, root string) (Detection, erro
 // BuildProfile returns bounded pytest plans that rely only on the project's
 // existing Python environment. Missing Python or pytest remains an explicit
 // check-unavailable result from the command boundary.
-func (*PythonStrategy) BuildProfile(ctx context.Context, root string) (agent.LanguageProfile, error) {
+func (*PythonStrategy) BuildProfile(ctx context.Context, root string) (LanguageProfile, error) {
 	if err := ctx.Err(); err != nil {
-		return agent.LanguageProfile{}, err
+		return LanguageProfile{}, err
 	}
 	info, err := os.Stat(root)
 	if err != nil {
-		return agent.LanguageProfile{}, err
+		return LanguageProfile{}, err
 	}
 	if !info.IsDir() {
-		return agent.LanguageProfile{}, errors.New("build Python profile: worktree root is not a directory")
+		return LanguageProfile{}, errors.New("build Python profile: worktree root is not a directory")
 	}
 
-	return agent.LanguageProfile{
-		ID:         agent.LanguagePython,
+	return LanguageProfile{
+		ID:         LanguagePython,
 		PromptHint: "This is a Python worktree. Prefer small idiomatic changes, preserve the project's existing style and environment, and use a trusted pytest plan after editing. Never add or install pytest, formatters, linters, or other dependencies.",
-		CheckPlans: []agent.CheckPlan{
+		CheckPlans: []CheckPlan{
 			pythonCheckPlan("pytest-all", "Run the project's complete pytest suite with concise output.", "-m", "pytest", "-q"),
 		},
 	}, nil
 }
 
-func pythonCheckPlan(id string, description string, arguments ...string) agent.CheckPlan {
-	return agent.CheckPlan{
+func pythonCheckPlan(id string, description string, arguments ...string) CheckPlan {
+	return CheckPlan{
 		ID:          id,
 		Description: description,
-		Command: agent.CheckCommand{
+		Command: CheckCommand{
 			ID:             id,
 			Program:        "python",
 			Args:           append([]string(nil), arguments...),

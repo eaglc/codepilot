@@ -11,6 +11,7 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"github.com/eaglc/codepilot/internal/provider"
 	"github.com/eaglc/codepilot/internal/tool"
 )
 
@@ -257,7 +258,7 @@ type fixedModelFactory struct {
 	value model.ToolCallingChatModel
 }
 
-func (f *fixedModelFactory) NewChatModel(ctx context.Context, _ ModelRef) (model.ToolCallingChatModel, error) {
+func (f *fixedModelFactory) NewChatModel(ctx context.Context, _ provider.ModelRef) (model.ToolCallingChatModel, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

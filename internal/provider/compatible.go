@@ -33,10 +33,12 @@ func NewCompatibleAdapter(client *http.Client) *CompatibleAdapter {
 	return &CompatibleAdapter{client: providerHTTPClient(client)}
 }
 
+// Kind returns KindOpenAICompatible.
 func (a *CompatibleAdapter) Kind() Kind {
 	return KindOpenAICompatible
 }
 
+// Defaults returns the display name and credential requirement for a custom endpoint.
 func (a *CompatibleAdapter) Defaults() Defaults {
 	return Defaults{
 		DisplayName:     "Custom OpenAI-compatible",
@@ -44,6 +46,7 @@ func (a *CompatibleAdapter) Defaults() Defaults {
 	}
 }
 
+// Validate probes the custom endpoint, credential, and tool-calling support.
 func (a *CompatibleAdapter) Validate(ctx context.Context, request ValidationRequest) (ValidationResult, error) {
 	if result := validateAdapterRequest(request.BaseURL, request.ModelID, request.Secret, true); !result.Valid {
 		return result, nil
@@ -56,6 +59,7 @@ func (a *CompatibleAdapter) Validate(ctx context.Context, request ValidationRequ
 	return probeToolCalling(ctx, chatModel)
 }
 
+// ListModels lists models from the custom endpoint, falling back to the configured model.
 func (a *CompatibleAdapter) ListModels(ctx context.Context, request ModelListRequest) ([]Model, error) {
 	if err := validateModelListRequest(request, true); err != nil {
 		return nil, err
@@ -72,6 +76,7 @@ func (a *CompatibleAdapter) ListModels(ctx context.Context, request ModelListReq
 	return ensureConfiguredModel(models, request.ModelID, ModelSourceConfigured), nil
 }
 
+// NewChatModel creates an OpenAI-compatible chat model for the validated request.
 func (a *CompatibleAdapter) NewChatModel(ctx context.Context, request ChatModelRequest) (model.ToolCallingChatModel, error) {
 	if result := validateAdapterRequest(request.BaseURL, request.ModelID, request.Secret, true); !result.Valid {
 		return nil, errors.New(result.UserMessage)

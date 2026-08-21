@@ -16,15 +16,24 @@ import (
 type ProviderPickerStage string
 
 const (
-	ProviderPickerClosed          ProviderPickerStage = "closed"
+	// ProviderPickerClosed indicates that normal composer input owns the keyboard.
+	ProviderPickerClosed ProviderPickerStage = "closed"
+	// ProviderPickerLoadingProfiles indicates that provider profiles are being loaded.
 	ProviderPickerLoadingProfiles ProviderPickerStage = "loading-profiles"
-	ProviderPickerChooseProvider  ProviderPickerStage = "choose-provider"
-	ProviderPickerConfiguring     ProviderPickerStage = "configuring"
-	ProviderPickerLoadingModels   ProviderPickerStage = "loading-models"
-	ProviderPickerChooseModel     ProviderPickerStage = "choose-model"
-	ProviderPickerEnteringConfig  ProviderPickerStage = "entering-configuration"
-	ProviderPickerSwitching       ProviderPickerStage = "switching"
-	ProviderPickerFailed          ProviderPickerStage = "failed"
+	// ProviderPickerChooseProvider indicates that the user can select a provider.
+	ProviderPickerChooseProvider ProviderPickerStage = "choose-provider"
+	// ProviderPickerConfiguring indicates that a provider is being configured.
+	ProviderPickerConfiguring ProviderPickerStage = "configuring"
+	// ProviderPickerLoadingModels indicates that provider models are being loaded.
+	ProviderPickerLoadingModels ProviderPickerStage = "loading-models"
+	// ProviderPickerChooseModel indicates that the user can select a model.
+	ProviderPickerChooseModel ProviderPickerStage = "choose-model"
+	// ProviderPickerEnteringConfig indicates that the user is entering configuration details.
+	ProviderPickerEnteringConfig ProviderPickerStage = "entering-configuration"
+	// ProviderPickerSwitching indicates that the selected model is activating.
+	ProviderPickerSwitching ProviderPickerStage = "switching"
+	// ProviderPickerFailed indicates a safe, retryable picker error.
+	ProviderPickerFailed ProviderPickerStage = "failed"
 )
 
 // ProviderChoice is a secret-free built-in choice rendered by the TUI.

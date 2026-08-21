@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/eaglc/codepilot/internal/language"
 )
 
-func buildSystemPrompt(profile LanguageProfile) (string, error) {
+func buildSystemPrompt(profile language.LanguageProfile) (string, error) {
 	if profile.ID == "" || strings.TrimSpace(profile.PromptHint) == "" {
 		return "", errors.New("build system prompt: language profile is incomplete")
 	}
