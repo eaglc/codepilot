@@ -98,6 +98,9 @@ const (
 	// RecoveryTruncatedLog indicates that an incomplete final JSONL record was
 	// ignored while restoring an otherwise valid session.
 	RecoveryTruncatedLog RecoveryWarningCode = "truncated-log"
+	// RecoveryTurnUnrecorded indicates that a completed turn's final record or
+	// completion event could not be persisted or delivered to the UI.
+	RecoveryTurnUnrecorded RecoveryWarningCode = "turn-unrecorded"
 )
 
 // RecoveryWarning is a safe user-facing notice attached to a restored session.

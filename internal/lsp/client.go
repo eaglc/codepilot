@@ -258,6 +258,8 @@ func (c *client) handleServerMessage(envelope rpcEnvelope) {
 		var params struct {
 			Items []json.RawMessage `json:"items"`
 		}
+		// A decode failure only yields an empty configuration list, which is a
+		// safe fallback for workspace/configuration queries.
 		_ = json.Unmarshal(envelope.Params, &params)
 		configuration := make([]map[string]any, len(params.Items))
 		for index := range configuration {
@@ -279,7 +281,9 @@ func (c *client) handleServerMessage(envelope rpcEnvelope) {
 	} else {
 		response["result"] = result
 	}
-	_ = c.writeMessage(response)
+	if err := c.writeMessage(response); err != nil {
+		c.finish(fmt.Errorf("write LSP response: %w", err))
+	}
 }
 
 func (c *client) writeMessage(value any) error {

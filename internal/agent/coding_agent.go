@@ -402,6 +402,8 @@ func (p *evidencePublisher) Publish(ctx context.Context, state *turnToolState) e
 			p.proposedMarker = marker
 		}
 	}
+	// snapshot also returns the turn's check summary, which is reported only
+	// through the final turn result rather than as per-patch evidence.
 	patches, _ := state.snapshot()
 	for _, patch := range patches {
 		if _, exists := p.patches[patch.ID]; exists {

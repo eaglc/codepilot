@@ -407,10 +407,10 @@ func (t *einoRegistryTool) InvokableRun(ctx context.Context, arguments string, _
 
 	result, err := t.source.Invoke(ctx, json.RawMessage(arguments))
 	if err != nil {
-		_ = t.relay.publish(ctx, InvocationEvent{Kind: InvocationEventToolFinished, Tool: &InvocationToolEvent{
+		reportErr := t.relay.publish(ctx, InvocationEvent{Kind: InvocationEventToolFinished, Tool: &InvocationToolEvent{
 			Name: t.name, Status: tool.ResultFailed, Summary: "Tool execution failed.",
 		}})
-		return "", err
+		return "", errors.Join(err, reportErr)
 	}
 	if !validToolResultStatus(result.Status) {
 		return "", errors.New("invoke Eino tool: tool returned an invalid status")

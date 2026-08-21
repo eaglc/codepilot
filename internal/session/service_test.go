@@ -93,6 +93,52 @@ func TestService_StartTurnPersistsInputBeforeAgentAndCommitsVerifiedResult(t *te
 	}
 }
 
+func TestService_RunTurnRecordsWarningWhenFinalEventDeliveryFails(t *testing.T) {
+	store := sessionstore.NewMemoryStore()
+	events := &selectiveEventSink{failKinds: map[session.EventKind]bool{session.EventTurnCompleted: true}}
+	agent := &fakeCodingAgent{}
+	service := newTurnServiceHarness(t, store, store, events, agent)
+	agent.run = func(context.Context, session.TurnRequest, session.EventSink) (session.TurnResult, error) {
+		return session.TurnResult{FinalText: "done"}, nil
+	}
+
+	if _, err := service.StartTurn(context.Background(), "Finish"); err != nil {
+		t.Fatalf("start turn: %v", err)
+	}
+	waitForIdle(t, service)
+
+	snapshot, err := service.CurrentSession(context.Background())
+	if err != nil {
+		t.Fatalf("current session: %v", err)
+	}
+	if !hasRecoveryWarning(snapshot.RecoveryWarnings, session.RecoveryTurnUnrecorded) {
+		t.Fatalf("recovery warnings = %#v, want a turn-unrecorded warning", snapshot.RecoveryWarnings)
+	}
+}
+
+func TestService_RunTurnRecordsWarningWhenSaveFailureEventDeliveryFails(t *testing.T) {
+	store := sessionstore.NewMemoryStore()
+	events := &selectiveEventSink{failKinds: map[session.EventKind]bool{session.EventSessionSaveFailed: true}}
+	agent := &fakeCodingAgent{}
+	service := newTurnServiceHarness(t, store, &commitFailingStore{MemoryStore: store}, events, agent)
+	agent.run = func(context.Context, session.TurnRequest, session.EventSink) (session.TurnResult, error) {
+		return session.TurnResult{FinalText: "done"}, nil
+	}
+
+	if _, err := service.StartTurn(context.Background(), "Finish"); err != nil {
+		t.Fatalf("start turn: %v", err)
+	}
+	waitForIdle(t, service)
+
+	snapshot, err := service.CurrentSession(context.Background())
+	if err != nil {
+		t.Fatalf("current session: %v", err)
+	}
+	if !hasRecoveryWarning(snapshot.RecoveryWarnings, session.RecoveryTurnUnrecorded) {
+		t.Fatalf("recovery warnings = %#v, want a turn-unrecorded warning", snapshot.RecoveryWarnings)
+	}
+}
+
 func TestService_CancelTurnWaitsForAgentAndPreservesPatch(t *testing.T) {
 	fixture := newServiceFixture(t)
 	started := make(chan struct{})
@@ -688,4 +734,87 @@ func waitForIdle(t *testing.T, service *session.Service) {
 func hasErrorCode(err error, code session.ErrorCode) bool {
 	var appError *session.AppError
 	return errors.As(err, &appError) && appError.Code == code
+}
+
+func hasRecoveryWarning(warnings []session.RecoveryWarning, code session.RecoveryWarningCode) bool {
+	for _, warning := range warnings {
+		if warning.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+// newTurnServiceHarness seeds and activates a service whose single turn uses the
+// given agent. `store` is the SessionStore (may be a failing wrapper) while
+// `base` remains the WorkspaceRegistry and seed target.
+func newTurnServiceHarness(t *testing.T, base *sessionstore.MemoryStore, store session.SessionStore, events session.EventSink, agent *fakeCodingAgent) *session.Service {
+	t.Helper()
+	ctx := context.Background()
+	root := "H:\\workspace\\repo"
+	now := time.Date(2026, 8, 20, 8, 0, 0, 0, time.UTC)
+	workspace := session.WorkspaceRecord{ID: "ws_turn", DisplayName: "repo", GitCommonDir: root + "\\.git", Trusted: true, CreatedAt: now, LastUsedAt: now}
+	worktree := session.WorktreeRecord{ID: "wt_turn", WorkspaceID: workspace.ID, Root: root, GitDir: root + "\\.git", LastSessionID: "ses_turn", CreatedAt: now, LastUsedAt: now}
+	activeSession := session.Session{ID: worktree.LastSessionID, WorkspaceID: workspace.ID, WorktreeID: worktree.ID, ProviderProfileID: "prv_turn", ModelID: "model-turn", PermissionMode: session.PermissionAsk, CreatedAt: now, UpdatedAt: now}
+	if err := base.SaveWorkspace(ctx, workspace); err != nil {
+		t.Fatalf("save workspace: %v", err)
+	}
+	if err := base.SaveWorktree(ctx, worktree); err != nil {
+		t.Fatalf("save worktree: %v", err)
+	}
+	if err := base.CreateSession(ctx, activeSession); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	reader := &fakeWorkspaceReader{
+		resolved: session.ResolvedWorktree{DisplayName: "repo", Root: root, GitDir: worktree.GitDir, GitCommonDir: workspace.GitCommonDir},
+		state:    session.WorktreeState{Root: root, Branch: "main", HeadCommit: "abcdef", Available: true},
+	}
+	service, err := session.NewService(session.Dependencies{
+		CodingAgents:      &fakeCodingAgentFactory{agent: agent},
+		SessionStore:      store,
+		WorkspaceRegistry: base,
+		WorkspaceReader:   reader,
+		ModelCatalog:      &fakeModelCatalog{},
+		Authorizer:        &fakeAuthorizer{},
+		Events:            events,
+		Limits:            session.RunLimits{MaxSteps: 30, MaxTurnDuration: time.Minute, CommandTimeout: time.Minute, ToolResultMaxBytes: 64 << 10, CommandOutputMaxBytes: 256 << 10},
+	})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	if _, err := service.Activate(ctx, root); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	return service
+}
+
+// commitFailingStore fails CommitTurn while delegating everything else to a
+// real in-memory store.
+type commitFailingStore struct {
+	*sessionstore.MemoryStore
+}
+
+func (s *commitFailingStore) CommitTurn(context.Context, session.TurnCommit) error {
+	return errors.New("commit turn failed")
+}
+
+// selectiveEventSink records every event but fails delivery for configured kinds.
+type selectiveEventSink struct {
+	mu        sync.Mutex
+	events    []session.Event
+	failKinds map[session.EventKind]bool
+}
+
+func (s *selectiveEventSink) Publish(ctx context.Context, event session.Event) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.events = append(s.events, event)
+	s.mu.Unlock()
+	if s.failKinds[event.Kind] {
+		return errors.New("event delivery failed")
+	}
+	return nil
 }

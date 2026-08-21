@@ -44,6 +44,9 @@ type WorkspaceReader interface {
 	ResolveWorktree(ctx context.Context, path string) (ResolvedWorktree, error)
 	ReadWorktreeState(ctx context.Context, root string) (WorktreeState, error)
 	ReadDiff(ctx context.Context, request DiffRequest) (DiffResult, error)
+	// ListWorkspaceFiles returns bounded safe file and directory paths for the
+	// active worktree's UI mention picker.
+	ListWorkspaceFiles(ctx context.Context, root string, limit int) (WorkspaceFileList, error)
 }
 
 // ModelCatalog exposes secret-free provider and model selection operations.

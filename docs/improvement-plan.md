@@ -32,9 +32,9 @@
 | DOC-3 | P1 | 文档 | `ProviderPicker*` 9 个常量、`ErrStoreClosed` 无注释 | ✅ 已修复（§10.4） | `provider_picker.go:19-27` |
 | DEP-1 | P2 | 依赖 | `LanguageID` / `LanguageProfile` 放错包，致 `language` 反向依赖 `agent` | ✅ 已修复（§11.4） | `agent/ports.go` |
 | DEP-2 | P2 | 依赖 | `ModelRef` 放错包，致 `provider` 反向依赖 `agent` | ✅ 已修复（§12.4） | `agent/ports.go:302-307` |
-| ROB-1 | P2 | 健壮性 | 5 处真实错误被 `_ =` 吞掉 | 待修复 | `session/service.go:727,746` 等 |
-| DEP-3 | P2 | 结构 | `session.Service` 编排过大（~1247 行） | 待修复 | `session/service.go` |
-| DEP-4 | P2 | 结构 | `ListWorkspaceFiles` 靠类型断言访问可选能力，脆弱 | 待修复 | `session/service.go:488-504` |
+| ROB-1 | P2 | 健壮性 | 5 处真实错误被 `_ =` 吞掉 | ✅ 已修复（§13.4） | `session/service.go:727,746` 等 |
+| DEP-3 | P2 | 结构 | `session.Service` 编排过大（~1247 行） | ✅ 已修复（§14.4） | `service.go` → `service_turn.go` / `service_clone.go` |
+| DEP-4 | P2 | 结构 | `ListWorkspaceFiles` 靠类型断言访问可选能力，脆弱 | ✅ 已修复（§15.4） | `ports.go` / `service.go` |
 | UI-5 | P3 | UI 增强 | 无浅色主题 / `NO_COLOR` 支持，硬编码深色背景 | 待修复 | `view.go:107` |
 | UI-6 | P3 | UI 增强 | 宽屏下焦点指示近乎无意义 | 待修复 | `view.go:119,127` |
 | DEP-5 | P3 | 结构 | `contextmanager` 包在 MVP 仅为 Nop 占位 | 待修复 | `build.go:146` |
@@ -341,6 +341,16 @@ package workspace
 - 单测：注入会失败的 EventSink / 写连接，断言错误被记录或向上传递，不再静默。
 - 静态：`grep -rn '_ = ' internal/` 复查，仅剩无害清理类（Close / 临时文件 / 响应体 drain）。
 
+### 13.4 实现记录（已修复）
+
+- `session/service.go`：`runTurn` 两处最终事件投递失败不再 `_ =` 丢弃，改为调用 `recordRecoveryWarning` 写入一条 `RecoveryTurnUnrecorded` 警告到 `active.RecoveryWarnings`（新增 `RecoveryTurnUnrecorded` 码，`view.go` 已渲染 `RecoveryWarnings`）。
+- `lsp/client.go:282`：回写语言服务器响应失败时调用 `c.finish` 关闭连接，错误经 `failure()` 向上暴露。
+- `agent/eino_invoker.go:410`：工具失败上报失败改为 `errors.Join(err, reportErr)`，两条错误都不再丢失。
+- `agent/coding_agent.go:404`：经核实 `state.snapshot()` 返回 `([]PatchRecord, CheckSummary)`，`_` 丢弃的是未使用的 CheckSummary 而非错误——原问题描述不成立，已补注释说明，未改行为。
+- `lsp/client.go:261`：JSON 解码失败属无害回退，已补注释说明。
+- 单测：`TestService_RunTurnRecordsWarningWhenFinalEventDeliveryFails` / `...WhenSaveFailureEventDeliveryFails`、`TestClientWriteFailureClosesConnection`、`TestEinoRegistryToolJoinsToolFailureWithReportFailure`。
+- 静态复查：`grep -rn '_ = ' internal/` 仅剩 Close / 临时文件 / 响应体 drain / 哈希与缓冲区写入等无害清理。
+
 ## 14. DEP-3 `session.Service` 编排过大
 
 ### 14.1 问题与影响
@@ -361,6 +371,13 @@ package workspace
 
 - 每步拆分后 `go test ./internal/session/...` 全绿，保证纯重构不改行为。
 
+### 14.4 实现记录（已修复）
+
+- 新增 `session/service_turn.go`：抽走 `validateRunLimits` / `validPermissionMode` / `classifyTurnStatus` / `finalEventKind` / `finalTextForStatus` / `codingAgentConfig` / `sessionSummaryFromSession` / `worktreeSummaryFromRecord` / `titleFromMessage` 等纯函数。
+- 新增 `session/service_clone.go`：抽走 `cloneSessionSnapshot` / `cloneMessages` / `clonePatchRecords` / `clonePatchRecord` / `containsPatchRecord`。
+- `service.go` 由 1263 行降至 1119 行；`newEntityID` / `applicationError` / `hasApplicationErrorCode` 留在 `service.go`（错误与 ID 基础设施）。
+- 纯重构不改行为：`go test ./internal/session/...` 全绿。
+
 ## 15. DEP-4 `ListWorkspaceFiles` 类型断言脆弱
 
 ### 15.1 问题与影响
@@ -377,6 +394,11 @@ package workspace
 ### 15.3 验证方法
 
 - `go build ./... && go test ./...` 通过；构造期缺能力时在 `NewService` 即报错或明确降级。
+
+### 15.4 实现记录（已修复）
+
+- 选择方案 (a)：把 `ListWorkspaceFiles` 加入 `WorkspaceReader` 接口（`ports.go`），移除 `service.go` 中的本地 `fileLister` 类型断言与 `ErrInternal` 降级分支。
+- `workspace.Service` 与测试 `fakeWorkspaceReader` 均已实现该方法，`go build ./... && go test ./...` 通过；能力缺失现在在编译期暴露，而非运行期静默降级。
 
 ---
 
