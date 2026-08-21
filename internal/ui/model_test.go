@@ -99,6 +99,45 @@ func TestModel_RejectsEventsForInactiveSessionOrTurn(t *testing.T) {
 	}
 }
 
+func TestModelTurnStartedRefreshesUserMessage(t *testing.T) {
+	client := newInteractionClient()
+	model := NewModel(client, nil, client.snapshot)
+
+	// The service persists the user message before publishing EventTurnStarted,
+	// so a reload at turn-start must surface it immediately rather than waiting
+	// for the assistant's first token or the turn's completion.
+	client.snapshot.Messages = append(client.snapshot.Messages, session.Message{
+		ID:        "msg_new",
+		SessionID: client.snapshot.Session.ID,
+		TurnID:    "turn_interaction",
+		Role:      session.RoleUser,
+		Content:   "Fix the flaky test",
+	})
+
+	command := model.applyEvent(session.Event{
+		SessionID: client.snapshot.Session.ID,
+		TurnID:    "turn_interaction",
+		Kind:      session.EventTurnStarted,
+	})
+	if command == nil {
+		t.Fatal("turn-start event did not schedule a session reload")
+	}
+	model.Update(command())
+
+	if !hasMessageContent(model.snapshot.Messages, "Fix the flaky test") {
+		t.Fatalf("user message missing from snapshot after turn start: %#v", model.snapshot.Messages)
+	}
+}
+
+func hasMessageContent(messages []session.Message, content string) bool {
+	for _, message := range messages {
+		if message.Role == session.RoleUser && message.Content == content {
+			return true
+		}
+	}
+	return false
+}
+
 func TestSafeErrorMessage_DoesNotExposeDiagnosticCause(t *testing.T) {
 	err := &session.AppError{
 		Code:      session.ErrProviderUnavailable,

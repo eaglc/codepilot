@@ -502,6 +502,10 @@ func (m *Model) applyEvent(event session.Event) tea.Cmd {
 		m.assistant = ""
 		m.snapshot.RuntimeState = session.RuntimeRunning
 		m.status = "Agent is working..."
+		// The service persists the user message before emitting this event, so
+		// reload the snapshot to show it immediately instead of waiting for the
+		// assistant's first token or the turn's completion.
+		return loadCurrentSessionCmd(m.client)
 	case session.EventAssistantDelta:
 		if event.Payload.Text != nil {
 			m.assistant += event.Payload.Text.Text
