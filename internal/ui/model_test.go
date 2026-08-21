@@ -33,6 +33,8 @@ func TestModel_ViewNarrowTerminalSwitchesSingleVisiblePanel(t *testing.T) {
 	if !strings.Contains(conversation, "Conversation") || strings.Contains(conversation, "Diff (session)") {
 		t.Fatalf("initial narrow view did not show only conversation:\n%s", conversation)
 	}
+	// Tab cycles input → conversation → diff, so two tabs reach the diff panel.
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
 	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
 	diff := model.View().Content
 	if !strings.Contains(diff, "Diff (session)") || strings.Contains(diff, "Conversation") {

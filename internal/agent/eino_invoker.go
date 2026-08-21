@@ -34,20 +34,20 @@ var (
 	_ AgentInvokerFactory    = (*EinoInvokerFactory)(nil)
 	_ AgentInvoker           = (*EinoInvoker)(nil)
 	_ einotool.InvokableTool = (*einoRegistryTool)(nil)
-	_ adk.CheckPointStore    = (*MemoryCheckPointStore)(nil)
-	_ adk.CheckPointDeleter  = (*MemoryCheckPointStore)(nil)
+	_ adk.CheckPointStore    = (*MemoryCheckpointStore)(nil)
+	_ adk.CheckPointDeleter  = (*MemoryCheckpointStore)(nil)
 )
 
 // EinoInvokerDependencies contains the version-specific Eino boundaries.
 type EinoInvokerDependencies struct {
 	Models      ModelFactory
-	Checkpoints CheckPointStore
+	Checkpoints CheckpointStore
 }
 
 // EinoInvokerFactory creates independent invokers over shared external ports.
 type EinoInvokerFactory struct {
 	models      ModelFactory
-	checkpoints CheckPointStore
+	checkpoints CheckpointStore
 }
 
 // NewEinoInvokerFactory validates and captures Eino adapter dependencies.
@@ -77,7 +77,7 @@ func (f *EinoInvokerFactory) CreateInvoker(ctx context.Context) (AgentInvoker, e
 type EinoInvoker struct {
 	mu           sync.Mutex
 	models       ModelFactory
-	checkpoints  CheckPointStore
+	checkpoints  CheckpointStore
 	runner       *adk.Runner
 	relay        *invocationEventRelay
 	checkpointID string
@@ -717,7 +717,7 @@ func boundedInvocationText(value string, limit int) string {
 	return truncateToolText(strings.TrimSpace(value), limit)
 }
 
-func deleteCheckpoint(ctx context.Context, store CheckPointStore, checkpointID string) error {
+func deleteCheckpoint(ctx context.Context, store CheckpointStore, checkpointID string) error {
 	deleter, ok := store.(interface {
 		Delete(context.Context, string) error
 	})

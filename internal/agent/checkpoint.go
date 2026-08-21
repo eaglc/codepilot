@@ -7,29 +7,29 @@ import (
 	"sync"
 )
 
-// ErrCheckPointStoreClosed indicates access after checkpoint teardown.
-var ErrCheckPointStoreClosed = errors.New("checkpoint store is closed")
+// ErrCheckpointStoreClosed indicates access after checkpoint teardown.
+var ErrCheckpointStoreClosed = errors.New("checkpoint store is closed")
 
-// CheckPointStore is the minimal persistence contract consumed by Eino Runner.
-type CheckPointStore interface {
+// CheckpointStore is the minimal persistence contract consumed by Eino Runner.
+type CheckpointStore interface {
 	Set(ctx context.Context, key string, value []byte) error
 	Get(ctx context.Context, key string) ([]byte, bool, error)
 }
 
-// MemoryCheckPointStore retains resumable state only for the current process.
-type MemoryCheckPointStore struct {
+// MemoryCheckpointStore retains resumable state only for the current process.
+type MemoryCheckpointStore struct {
 	mu     sync.RWMutex
 	values map[string][]byte
 	closed bool
 }
 
-// NewMemoryCheckPointStore creates an empty process-local checkpoint store.
-func NewMemoryCheckPointStore() *MemoryCheckPointStore {
-	return &MemoryCheckPointStore{values: make(map[string][]byte)}
+// NewMemoryCheckpointStore creates an empty process-local checkpoint store.
+func NewMemoryCheckpointStore() *MemoryCheckpointStore {
+	return &MemoryCheckpointStore{values: make(map[string][]byte)}
 }
 
 // Set stores a defensive copy of one checkpoint.
-func (s *MemoryCheckPointStore) Set(ctx context.Context, key string, value []byte) error {
+func (s *MemoryCheckpointStore) Set(ctx context.Context, key string, value []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -42,14 +42,14 @@ func (s *MemoryCheckPointStore) Set(ctx context.Context, key string, value []byt
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return ErrCheckPointStoreClosed
+		return ErrCheckpointStoreClosed
 	}
 	s.values[key] = append([]byte(nil), value...)
 	return nil
 }
 
 // Get returns a defensive copy of one checkpoint when present.
-func (s *MemoryCheckPointStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
+func (s *MemoryCheckpointStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -62,7 +62,7 @@ func (s *MemoryCheckPointStore) Get(ctx context.Context, key string) ([]byte, bo
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
-		return nil, false, ErrCheckPointStoreClosed
+		return nil, false, ErrCheckpointStoreClosed
 	}
 	value, exists := s.values[key]
 	if !exists {
@@ -73,7 +73,7 @@ func (s *MemoryCheckPointStore) Get(ctx context.Context, key string) ([]byte, bo
 
 // Delete removes one checkpoint. Its signature also satisfies Eino's optional
 // CheckPointDeleter contract for automatic lifecycle cleanup.
-func (s *MemoryCheckPointStore) Delete(ctx context.Context, key string) error {
+func (s *MemoryCheckpointStore) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -86,14 +86,14 @@ func (s *MemoryCheckPointStore) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return ErrCheckPointStoreClosed
+		return ErrCheckpointStoreClosed
 	}
 	delete(s.values, key)
 	return nil
 }
 
 // Close clears all transient checkpoints and rejects future access.
-func (s *MemoryCheckPointStore) Close() error {
+func (s *MemoryCheckpointStore) Close() error {
 	if s == nil {
 		return nil
 	}

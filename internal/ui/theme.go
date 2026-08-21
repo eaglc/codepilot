@@ -56,6 +56,10 @@ var codePilotStyles = struct {
 	diffMeta       lipgloss.Style
 	composerPrompt lipgloss.Style
 	placeholder    lipgloss.Style
+	cursor         lipgloss.Style
+	focusBar       lipgloss.Style
+	scrollbarThumb lipgloss.Style
+	scrollbarTrack lipgloss.Style
 }{
 	brand:          lipgloss.NewStyle().Bold(true).Foreground(codePilotTheme.background).Background(codePilotTheme.primary).Padding(0, 1),
 	header:         lipgloss.NewStyle().Foreground(codePilotTheme.foreground),
@@ -78,4 +82,8 @@ var codePilotStyles = struct {
 	diffMeta:       lipgloss.NewStyle().Foreground(codePilotTheme.muted),
 	composerPrompt: lipgloss.NewStyle().Foreground(codePilotTheme.primary).Bold(true),
 	placeholder:    lipgloss.NewStyle().Foreground(codePilotTheme.muted).Italic(true),
+	cursor:         lipgloss.NewStyle().Foreground(codePilotTheme.background).Background(codePilotTheme.foreground),
+	focusBar:       lipgloss.NewStyle().Foreground(codePilotTheme.success).Bold(true),
+	scrollbarThumb: lipgloss.NewStyle().Foreground(codePilotTheme.primary),
+	scrollbarTrack: lipgloss.NewStyle().Foreground(codePilotTheme.border),
 }

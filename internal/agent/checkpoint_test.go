@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-func TestMemoryCheckPointStoreCopiesValuesAndDeletes(t *testing.T) {
+func TestMemoryCheckpointStoreCopiesValuesAndDeletes(t *testing.T) {
 	t.Parallel()
-	store := NewMemoryCheckPointStore()
+	store := NewMemoryCheckpointStore()
 	original := []byte("checkpoint")
 	if err := store.Set(context.Background(), "turn-1", original); err != nil {
 		t.Fatalf("Set() error = %v", err)
@@ -36,9 +36,9 @@ func TestMemoryCheckPointStoreCopiesValuesAndDeletes(t *testing.T) {
 	}
 }
 
-func TestMemoryCheckPointStoreHonorsContextAndClose(t *testing.T) {
+func TestMemoryCheckpointStoreHonorsContextAndClose(t *testing.T) {
 	t.Parallel()
-	store := NewMemoryCheckPointStore()
+	store := NewMemoryCheckpointStore()
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := store.Set(cancelled, "turn-1", []byte("value")); !errors.Is(err, context.Canceled) {
@@ -50,7 +50,7 @@ func TestMemoryCheckPointStoreHonorsContextAndClose(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatalf("second Close() error = %v", err)
 	}
-	if _, _, err := store.Get(context.Background(), "turn-1"); !errors.Is(err, ErrCheckPointStoreClosed) {
-		t.Fatalf("Get() error = %v, want ErrCheckPointStoreClosed", err)
+	if _, _, err := store.Get(context.Background(), "turn-1"); !errors.Is(err, ErrCheckpointStoreClosed) {
+		t.Fatalf("Get() error = %v, want ErrCheckpointStoreClosed", err)
 	}
 }

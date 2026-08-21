@@ -58,24 +58,32 @@ type Model struct {
 	client SessionClient
 	bridge *EventBridge
 
-	snapshot         session.SessionSnapshot
-	diff             session.DiffResult
-	diffKind         session.DiffKind
-	width            int
-	height           int
-	focus            PanelFocus
-	activeTurn       session.TurnID
-	assistant        string
-	status           string
-	errorMessage     string
-	approval         *session.ApprovalRequest
-	staleEvents      uint64
-	composer         []rune
-	inputBusy        bool
-	overlayTitle     string
-	overlayText      string
-	pendingWorkspace string
-	completion       completionState
+	snapshot           session.SessionSnapshot
+	diff               session.DiffResult
+	diffKind           session.DiffKind
+	width              int
+	height             int
+	focus              PanelFocus
+	cursorOn           bool
+	scrollbarVisible   bool
+	activeTurn         session.TurnID
+	assistant          string
+	conversationScroll int
+	diffScroll         int
+	status             string
+	errorMessage       string
+	approval           *session.ApprovalRequest
+	staleEvents        uint64
+	composer           []rune
+	composerCursor     int
+	inputBusy          bool
+	history            []string
+	historyIndex       int
+	historyStash       []rune
+	overlayTitle       string
+	overlayText        string
+	pendingWorkspace   string
+	completion         completionState
 
 	workspaceFiles          []session.WorkspaceFile
 	workspaceFilesRoot      string
@@ -91,13 +99,16 @@ type Model struct {
 // NewModel creates the root TUI model with a restored or newly activated snapshot.
 func NewModel(client SessionClient, bridge *EventBridge, snapshot session.SessionSnapshot) *Model {
 	model := &Model{
-		client:   client,
-		bridge:   bridge,
-		snapshot: cloneSnapshot(snapshot),
-		diffKind: session.DiffSession,
-		width:    80,
-		height:   24,
-		focus:    FocusConversation,
+		client:             client,
+		bridge:             bridge,
+		snapshot:           cloneSnapshot(snapshot),
+		diffKind:           session.DiffSession,
+		width:              80,
+		height:             24,
+		focus:              FocusInput,
+		cursorOn:           true,
+		conversationScroll: scrollFollowBottom,
+		diffScroll:         scrollFollowBottom,
 	}
 	if client != nil {
 		model.providerPicker = NewProviderPicker(client)
@@ -121,6 +132,7 @@ func (m *Model) Init() tea.Cmd {
 	if m.providerPicker != nil && (m.snapshot.Session.ProviderProfileID == "" || m.snapshot.Session.ModelID == "") {
 		commands = append(commands, m.openProviderPicker())
 	}
+	commands = append(commands, blinkCmd())
 	return batchCommands(commands...)
 }
 

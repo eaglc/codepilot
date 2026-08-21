@@ -171,21 +171,11 @@ func (m *Model) completionView(width int) []string {
 			content = append(content, "Path list truncated; type more characters to narrow it.")
 		}
 	}
-	return renderPanel(title, content, width, len(content)+2, true, styleDialogLine)
+	return renderPanel(title, content, width, len(content)+2, true, false, false, 0, styleDialogLine)
 }
 
 func completionWindow(cursor int, count int) (int, int) {
-	if count <= maxVisibleCompletions {
-		return 0, count
-	}
-	start := cursor - maxVisibleCompletions/2
-	if start < 0 {
-		start = 0
-	}
-	if start+maxVisibleCompletions > count {
-		start = count - maxVisibleCompletions
-	}
-	return start, start + maxVisibleCompletions
+	return pickerWindow(cursor, count, maxVisibleCompletions)
 }
 
 func (m *Model) acceptCompletion() tea.Cmd {
@@ -204,6 +194,7 @@ func (m *Model) acceptCompletion() tea.Cmd {
 		prefix := append([]rune(nil), m.composer[:start]...)
 		m.composer = append(prefix, []rune(item.insert)...)
 	}
+	m.composerCursor = len(m.composer)
 	m.closeCompletion()
 	if item.keepOpen {
 		return m.refreshCompletion()

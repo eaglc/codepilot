@@ -181,7 +181,7 @@ func TestEinoInvokerReportsStepAndDurationLimits(t *testing.T) {
 		}
 	})
 	t.Run("duration", func(t *testing.T) {
-		store := NewMemoryCheckPointStore()
+		store := NewMemoryCheckpointStore()
 		factory, err := NewEinoInvokerFactory(EinoInvokerDependencies{
 			Models:      &fixedModelFactory{value: blockingToolCallingModel{}},
 			Checkpoints: store,
@@ -211,14 +211,14 @@ func TestNewEinoInvokerFactoryRejectsNilDependencies(t *testing.T) {
 		t.Fatal("NewEinoInvokerFactory() error = nil")
 	}
 	var typedNil *fixedModelFactory
-	if _, err := NewEinoInvokerFactory(EinoInvokerDependencies{Models: typedNil, Checkpoints: NewMemoryCheckPointStore()}); err == nil {
+	if _, err := NewEinoInvokerFactory(EinoInvokerDependencies{Models: typedNil, Checkpoints: NewMemoryCheckpointStore()}); err == nil {
 		t.Fatal("NewEinoInvokerFactory() typed nil error = nil")
 	}
 }
 
 type einoInvokerFixture struct {
 	invoker AgentInvoker
-	store   *MemoryCheckPointStore
+	store   *MemoryCheckpointStore
 	source  *interruptingRegistryTool
 	input   InvocationInput
 	sink    *recordingInvocationSink
@@ -226,7 +226,7 @@ type einoInvokerFixture struct {
 
 func newEinoInvokerFixture(t *testing.T) *einoInvokerFixture {
 	t.Helper()
-	store := NewMemoryCheckPointStore()
+	store := NewMemoryCheckpointStore()
 	modelValue := &scriptedToolCallingModel{state: &scriptedModelState{}}
 	factory, err := NewEinoInvokerFactory(EinoInvokerDependencies{
 		Models:      &fixedModelFactory{value: modelValue},

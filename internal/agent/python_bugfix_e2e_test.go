@@ -42,7 +42,7 @@ func TestPythonBugfixEndToEndIsRecordedAsVerified(t *testing.T) {
 		t.Fatal(err)
 	}
 	modelValue := &pythonBugfixModel{}
-	checkpoints := agent.NewMemoryCheckPointStore()
+	checkpoints := agent.NewMemoryCheckpointStore()
 	t.Cleanup(func() { _ = checkpoints.Close() })
 	invokers, err := agent.NewEinoInvokerFactory(agent.EinoInvokerDependencies{
 		Models:      bugfixModelFactory{value: modelValue},

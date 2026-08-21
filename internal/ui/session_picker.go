@@ -182,7 +182,12 @@ func (p *SessionPicker) View(activeID session.SessionID) string {
 		return "Session selection failed\n" + p.message
 	case SessionPickerChoosing:
 		lines := []string{"Select session"}
-		for index, value := range p.sessions {
+		start, end := pickerWindow(p.cursor, len(p.sessions), maxVisiblePickerItems)
+		if start > 0 {
+			lines = append(lines, "  …")
+		}
+		for index := start; index < end; index++ {
+			value := p.sessions[index]
 			title := strings.TrimSpace(value.Title)
 			if title == "" {
 				title = string(value.ID)
@@ -196,6 +201,9 @@ func (p *SessionPicker) View(activeID session.SessionID) string {
 				active = " (active)"
 			}
 			lines = append(lines, pickerLine(index == p.cursor, fmt.Sprintf("%s%s · %s · %s%s", title, active, value.WorktreeID, value.PermissionMode, age)))
+		}
+		if end < len(p.sessions) {
+			lines = append(lines, "  …")
 		}
 		if len(p.sessions) == 0 {
 			lines = append(lines, "No matching sessions.")

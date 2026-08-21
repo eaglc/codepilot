@@ -7,7 +7,7 @@ import (
 	"github.com/eaglc/codepilot/internal/session"
 )
 
-func diffView(result session.DiffResult, selectedKind session.DiffKind, width int, height int) []string {
+func diffView(result session.DiffResult) []string {
 	lines := make([]string, 0, len(result.Files)+2)
 	if result.Drifted {
 		lines = append(lines, "DRIFTED: Session Diff no longer matches current files; inspect Workspace Diff.")
@@ -25,7 +25,7 @@ func diffView(result session.DiffResult, selectedKind session.DiffKind, width in
 	if result.Truncated {
 		lines = append(lines, "Diff output was truncated.")
 	}
-	return tailBoundedLines(lines, width, height)
+	return lines
 }
 
 func diffTitle(result session.DiffResult, selectedKind session.DiffKind) string {

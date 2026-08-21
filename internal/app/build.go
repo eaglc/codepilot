@@ -46,7 +46,7 @@ type capabilities struct {
 }
 
 type runtime struct {
-	checkpoints *agent.MemoryCheckPointStore
+	checkpoints *agent.MemoryCheckpointStore
 	sessions    *session.Service
 	snapshot    session.SessionSnapshot
 }
@@ -124,7 +124,7 @@ func buildCapabilities(base foundation) (capabilities, error) {
 }
 
 func buildRuntime(ctx context.Context, base foundation, caps capabilities) (runtime, error) {
-	values := runtime{checkpoints: agent.NewMemoryCheckPointStore()}
+	values := runtime{checkpoints: agent.NewMemoryCheckpointStore()}
 	resolved, err := caps.workspaces.ResolveWorktree(ctx, base.workingDirectory)
 	if err != nil {
 		return runtime{}, errors.Join(err, closeRuntime(values))

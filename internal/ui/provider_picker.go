@@ -308,19 +308,33 @@ func (p *ProviderPicker) View() string {
 		if p.message != "" {
 			lines = append(lines, "Error: "+p.message)
 		}
+		total := len(p.profiles) + len(providerChoices)
+		start, end := pickerWindow(p.cursor, total, maxVisiblePickerItems)
 		if len(p.profiles) == 0 {
 			lines = append(lines, "  None configured")
+		} else if start > 0 {
+			lines = append(lines, "  …")
 		}
-		for index, profile := range p.profiles {
+		profileEnd := min(end, len(p.profiles))
+		for index := start; index < profileEnd; index++ {
+			profile := p.profiles[index]
 			label := fmt.Sprintf("%s  ·  %s", profile.DisplayName, profile.ModelID)
 			if profile.ID == p.current.ProviderProfileID && profile.ModelID == p.current.ModelID {
 				label += "  (current)"
 			}
 			lines = append(lines, pickerLine(index == p.cursor, label))
 		}
+		if profileEnd < len(p.profiles) {
+			lines = append(lines, "  …")
+		}
 		lines = append(lines, "", "Add provider")
-		for index, choice := range providerChoices {
-			lines = append(lines, pickerLine(len(p.profiles)+index == p.cursor, choice.DisplayName))
+		choiceStart := len(p.profiles)
+		for index := max(start, choiceStart); index < end; index++ {
+			choice := providerChoices[index-choiceStart]
+			lines = append(lines, pickerLine(index == p.cursor, choice.DisplayName))
+		}
+		if end < total {
+			lines = append(lines, "  …")
 		}
 		return strings.Join(lines, "\n")
 	case ProviderPickerEnteringConfig:
@@ -348,7 +362,12 @@ func (p *ProviderPicker) View() string {
 		if p.message != "" {
 			lines = append(lines, "Error: "+p.message)
 		}
-		for index, model := range p.models {
+		start, end := pickerWindow(p.cursor, len(p.models), maxVisiblePickerItems)
+		if start > 0 {
+			lines = append(lines, "  …")
+		}
+		for index := start; index < end; index++ {
+			model := p.models[index]
 			label := model.DisplayName
 			if label == "" {
 				label = model.ID
@@ -357,6 +376,9 @@ func (p *ProviderPicker) View() string {
 				label += " (recommended)"
 			}
 			lines = append(lines, pickerLine(index == p.cursor, label))
+		}
+		if end < len(p.models) {
+			lines = append(lines, "  …")
 		}
 		if len(p.models) == 0 {
 			lines = append(lines, "No models were returned.")

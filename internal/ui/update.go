@@ -36,6 +36,19 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		commands = appendCommand(commands, m.handleKey(value))
 	case tea.PasteMsg:
 		commands = appendCommand(commands, m.handlePaste(value))
+	case tea.MouseWheelMsg:
+		commands = appendCommand(commands, m.handleMouseWheel(value.Mouse().Button == tea.MouseWheelUp))
+	case tea.MouseClickMsg:
+		if value.Mouse().Button == tea.MouseLeft {
+			commands = appendCommand(commands, m.handleMouseClick(value.Mouse().X, value.Mouse().Y))
+		}
+	case scrollbarHideMsg:
+		m.scrollbarVisible = false
+	case blinkTickMsg:
+		if m.focus == FocusInput {
+			m.cursorOn = !m.cursorOn
+		}
+		commands = appendCommand(commands, blinkCmd())
 	case eventBridgeMsg:
 		commands = appendCommand(commands, m.applyEvent(value.event))
 		commands = appendCommand(commands, m.nextEventCmd())
@@ -47,7 +60,12 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		previousRoot := m.snapshot.WorktreeState.Root
+		previousSession := m.snapshot.Session.ID
 		m.snapshot = cloneSnapshot(value.snapshot)
+		if previousSession != m.snapshot.Session.ID {
+			m.resetScroll()
+			m.resetHistory()
+		}
 		if previousRoot != m.snapshot.WorktreeState.Root {
 			m.resetWorkspaceFileCache()
 			m.closeCompletion()
@@ -88,6 +106,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if value.err != nil {
 			if len(m.composer) == 0 {
 				m.composer = []rune(value.text)
+				m.composerCursor = len(m.composer)
 			}
 			m.errorMessage = SafeErrorMessage(value.err, "The turn could not be started.")
 			if hasErrorCode(value.err, session.ErrProviderUnavailable) && m.providerPicker != nil {
@@ -199,42 +218,54 @@ func (m *Model) handleKey(message tea.KeyPressMsg) tea.Cmd {
 		return m.openSessionPicker(false)
 	}
 	if m.inputBusy {
+		// The composer is disabled while the assistant streams, so the arrow,
+		// Home/End, and PageUp/PageDown keys scroll the focused panel instead.
+		if m.handleScrollKey(key) {
+			return nil
+		}
 		return nil
 	}
 	if handled, command := m.handleCompletionKey(message); handled {
 		return command
 	}
+	// Tab cycles focus in every idle state, regardless of the active region.
 	if isPanelSwitchKey(message) {
 		m.toggleFocus()
 		return nil
 	}
-	if key.Code == tea.KeyBackspace {
-		if len(m.composer) > 0 {
-			m.composer[len(m.composer)-1] = 0
-			m.composer = m.composer[:len(m.composer)-1]
+	if m.focus != FocusInput {
+		// A panel owns the keyboard: arrows/page/home/end scroll it, and typing
+		// a printable character hands focus back to the input box.
+		if m.handleScrollKey(key) {
+			return nil
 		}
-		return m.refreshCompletion()
+		if key.Text != "" && key.Mod&tea.ModCtrl == 0 {
+			m.setFocus(FocusInput)
+			return m.insertComposerText([]rune(key.Text))
+		}
+		return nil
+	}
+	if handled, command := m.handleHistoryKey(key); handled {
+		return command
+	}
+	if handled, command := m.handleComposerEditKey(message); handled {
+		return command
+	}
+	if m.handlePageScrollKey(key) {
+		return nil
 	}
 	if isEnterKey(key.Code) {
 		if key.Mod&tea.ModAlt != 0 {
 			if len(m.composer) < maxComposerRunes {
-				m.composer = append(m.composer, '\n')
+				m.composer = insertRunes(m.composer, m.composerCursor, []rune{'\n'})
+				m.composerCursor++
 			}
 			return m.refreshCompletion()
 		}
 		return m.submitComposer()
 	}
 	if key.Text != "" && key.Mod&tea.ModCtrl == 0 {
-		input := []rune(key.Text)
-		remaining := maxComposerRunes - len(m.composer)
-		if remaining <= 0 {
-			return nil
-		}
-		if len(input) > remaining {
-			input = input[:remaining]
-		}
-		m.composer = append(m.composer, input...)
-		return m.refreshCompletion()
+		return m.insertComposerText([]rune(key.Text))
 	}
 	return nil
 }
@@ -258,7 +289,8 @@ func (m *Model) handlePaste(message tea.PasteMsg) tea.Cmd {
 	if len(input) > remaining {
 		input = input[:remaining]
 	}
-	m.composer = append(m.composer, input...)
+	m.composer = insertRunes(m.composer, m.composerCursor, input)
+	m.composerCursor += len(input)
 	return m.refreshCompletion()
 }
 
@@ -267,6 +299,7 @@ func (m *Model) submitComposer() tea.Cmd {
 	if text == "" {
 		return nil
 	}
+	m.recordHistory(text)
 	if strings.HasPrefix(text, "/") {
 		m.clearComposer()
 		return m.executeCommand(text)
@@ -405,7 +438,8 @@ func (m *Model) executeDiffCommand(arguments []string) tea.Cmd {
 		return nil
 	}
 	m.diffKind = kind
-	m.focus = FocusDiff
+	m.setFocus(FocusDiff)
+	m.diffScroll = scrollFollowBottom
 	m.status = "Loading " + string(kind) + " diff..."
 	return readDiffCmd(m.client, kind)
 }
@@ -539,14 +573,86 @@ func (m *Model) finishTurn(status string) {
 	m.approval = nil
 	m.snapshot.RuntimeState = session.RuntimeIdle
 	m.status = status
+	m.setFocus(FocusInput)
 }
 
 func (m *Model) toggleFocus() {
-	if m.focus == FocusDiff {
-		m.focus = FocusConversation
-		return
+	switch m.focus {
+	case FocusConversation:
+		m.setFocus(FocusDiff)
+	case FocusDiff:
+		m.setFocus(FocusInput)
+	default:
+		m.setFocus(FocusConversation)
 	}
-	m.focus = FocusDiff
+}
+
+// handleScrollKey scrolls the focused panel. It is used while the assistant
+// streams (inputBusy), when the composer does not own the arrow/Home/End keys,
+// and skips scrolling while a completion menu is open.
+func (m *Model) handleScrollKey(key tea.Key) bool {
+	switch key.Code {
+	case tea.KeyUp, tea.KeyDown, tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+	default:
+		return false
+	}
+	if m.completion.active() {
+		return false
+	}
+	layout := m.layout()
+	panelHeight := layout.BodyHeight - 2
+	if panelHeight <= 0 {
+		return false
+	}
+	scroll := &m.conversationScroll
+	content := conversationView(m.snapshot, m.assistant, conversationContentWidth(layout))
+	if m.focus == FocusDiff {
+		scroll = &m.diffScroll
+		content = diffView(m.diff)
+	}
+	total := len(content)
+	maxOffset := max(0, total-panelHeight)
+	current := resolveScroll(*scroll, total, panelHeight)
+	switch key.Code {
+	case tea.KeyUp:
+		*scroll = clampInt(current-1, 0, maxOffset)
+	case tea.KeyDown:
+		if current+1 >= maxOffset {
+			*scroll = scrollFollowBottom
+		} else {
+			*scroll = current + 1
+		}
+	case tea.KeyPgUp:
+		*scroll = clampInt(current-scrollPageSize, 0, maxOffset)
+	case tea.KeyPgDown:
+		if current+scrollPageSize >= maxOffset {
+			*scroll = scrollFollowBottom
+		} else {
+			*scroll = current + scrollPageSize
+		}
+	case tea.KeyHome:
+		*scroll = 0
+	case tea.KeyEnd:
+		*scroll = scrollFollowBottom
+	}
+	return true
+}
+
+// handlePageScrollKey scrolls the focused panel with PageUp/PageDown while the
+// composer owns the keyboard. ↑/↓/Home/End are reserved for history recall and
+// cursor movement in that state, so only the page keys fall through to scroll.
+func (m *Model) handlePageScrollKey(key tea.Key) bool {
+	switch key.Code {
+	case tea.KeyPgUp, tea.KeyPgDown:
+		return m.handleScrollKey(key)
+	default:
+		return false
+	}
+}
+
+func (m *Model) resetScroll() {
+	m.conversationScroll = scrollFollowBottom
+	m.diffScroll = scrollFollowBottom
 }
 
 func (m *Model) turnIsActive() bool {
@@ -558,6 +664,7 @@ func (m *Model) clearComposer() {
 		m.composer[index] = 0
 	}
 	m.composer = nil
+	m.composerCursor = 0
 	m.closeCompletion()
 }
 
