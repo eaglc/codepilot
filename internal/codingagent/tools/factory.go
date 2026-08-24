@@ -134,6 +134,10 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 	if err != nil {
 		return nil, fmt.Errorf("create Coding tools: resolve root: %w", err)
 	}
+	root, err = filepath.EvalSymlinks(filepath.Clean(root))
+	if err != nil {
+		return nil, errors.New("create Coding tools: worktree root is unavailable")
+	}
 	root = filepath.Clean(root)
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {

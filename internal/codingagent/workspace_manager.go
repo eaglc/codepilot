@@ -184,11 +184,19 @@ func probeBinding(ctx context.Context, workspace Workspace, worktree Worktree) (
 }
 
 func samePath(left, right string) bool {
-	left, right = filepath.Clean(left), filepath.Clean(right)
+	left, right = canonicalPath(left), canonicalPath(right)
 	if runtime.GOOS == "windows" {
 		return strings.EqualFold(left, right)
 	}
 	return left == right
+}
+
+func canonicalPath(value string) string {
+	value = filepath.Clean(value)
+	if resolved, err := filepath.EvalSymlinks(value); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return value
 }
 
 var _ WorkspaceController = (*WorkspaceManager)(nil)

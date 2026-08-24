@@ -24,6 +24,11 @@ type document struct {
 }
 
 func readDocument(root, requested string, profile language.Profile, maximum int64) (document, error) {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return document{}, errors.New("query language server: worktree root is unavailable")
+	}
+	root = filepath.Clean(resolvedRoot)
 	requested = strings.TrimSpace(strings.ReplaceAll(requested, "\\", "/"))
 	if requested == "" || filepath.IsAbs(requested) || requested == "." || requested == ".." || strings.HasPrefix(requested, "../") || strings.ContainsAny(requested, "\x00\r\n:") {
 		return document{}, errors.New("query language server: path must be a normalized worktree-relative file")

@@ -79,9 +79,17 @@ func runGit(t *testing.T, directory string, arguments ...string) {
 }
 
 func locatorSamePath(left, right string) bool {
-	left, right = filepath.Clean(left), filepath.Clean(right)
+	left, right = locatorCanonicalPath(left), locatorCanonicalPath(right)
 	if runtime.GOOS == "windows" {
 		return strings.EqualFold(left, right)
 	}
 	return left == right
+}
+
+func locatorCanonicalPath(value string) string {
+	value = filepath.Clean(value)
+	if resolved, err := filepath.EvalSymlinks(value); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return value
 }
