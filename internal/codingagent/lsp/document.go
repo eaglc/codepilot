@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/eaglc/codepilot/internal/codingagent/language"
+	workspaceinfra "github.com/eaglc/codepilot/internal/codingagent/workspace"
 )
 
 type document struct {
@@ -24,11 +25,7 @@ type document struct {
 }
 
 func readDocument(root, requested string, profile language.Profile, maximum int64) (document, error) {
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return document{}, errors.New("query language server: worktree root is unavailable")
-	}
-	root = filepath.Clean(resolvedRoot)
+	root = workspaceinfra.CanonicalPath(root)
 	requested = strings.TrimSpace(strings.ReplaceAll(requested, "\\", "/"))
 	if requested == "" || filepath.IsAbs(requested) || requested == "." || requested == ".." || strings.HasPrefix(requested, "../") || strings.ContainsAny(requested, "\x00\r\n:") {
 		return document{}, errors.New("query language server: path must be a normalized worktree-relative file")
@@ -42,7 +39,11 @@ func readDocument(root, requested string, profile language.Profile, maximum int6
 	}
 	joined := filepath.Join(root, filepath.FromSlash(clean))
 	resolved, err := filepath.EvalSymlinks(joined)
-	if err != nil || !withinRoot(root, resolved) || !samePath(joined, resolved) {
+	if err != nil {
+		return document{}, errors.New("query language server: file is unavailable or crosses a symlink boundary")
+	}
+	resolved = workspaceinfra.CanonicalPath(resolved)
+	if !withinRoot(root, resolved) || !samePath(joined, resolved) {
 		return document{}, errors.New("query language server: file is unavailable or crosses a symlink boundary")
 	}
 	file, err := os.Open(resolved)

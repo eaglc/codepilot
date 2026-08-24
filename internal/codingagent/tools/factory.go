@@ -134,11 +134,7 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 	if err != nil {
 		return nil, fmt.Errorf("create Coding tools: resolve root: %w", err)
 	}
-	root, err = filepath.EvalSymlinks(filepath.Clean(root))
-	if err != nil {
-		return nil, errors.New("create Coding tools: worktree root is unavailable")
-	}
-	root = filepath.Clean(root)
+	root = workspacefiles.CanonicalPath(root)
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
 		return nil, errors.New("create Coding tools: worktree root is unavailable")
@@ -539,6 +535,7 @@ func secureExistingPath(root, requested string) (string, string, error) {
 	if err != nil {
 		return "", "", errors.New("The requested worktree path is unavailable.")
 	}
+	resolved = workspacefiles.CanonicalPath(resolved)
 	resolvedRelative, err := filepath.Rel(root, resolved)
 	if err != nil || resolvedRelative == ".." || strings.HasPrefix(resolvedRelative, ".."+string(filepath.Separator)) {
 		return "", "", errors.New("The requested path resolves outside the worktree.")

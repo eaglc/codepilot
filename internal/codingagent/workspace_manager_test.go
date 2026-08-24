@@ -147,9 +147,5 @@ func managerSamePath(left, right string) bool {
 }
 
 func managerCanonicalPath(value string) string {
-	value = filepath.Clean(value)
-	if resolved, err := filepath.EvalSymlinks(value); err == nil {
-		return filepath.Clean(resolved)
-	}
-	return value
+	return workspaceinfra.CanonicalPath(value)
 }

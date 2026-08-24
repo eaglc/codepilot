@@ -15,6 +15,7 @@ require (
 	github.com/gofrs/flock v0.13.0
 	github.com/hexops/gotextdiff v1.0.3
 	github.com/zalando/go-keyring v0.2.8
+	golang.org/x/sys v0.46.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -81,7 +82,6 @@ require (
 	golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa // indirect
 	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.36.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 )

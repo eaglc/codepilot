@@ -87,9 +87,5 @@ func locatorSamePath(left, right string) bool {
 }
 
 func locatorCanonicalPath(value string) string {
-	value = filepath.Clean(value)
-	if resolved, err := filepath.EvalSymlinks(value); err == nil {
-		return filepath.Clean(resolved)
-	}
-	return value
+	return CanonicalPath(value)
 }

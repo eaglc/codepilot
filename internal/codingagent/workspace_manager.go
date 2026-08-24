@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -192,11 +191,7 @@ func samePath(left, right string) bool {
 }
 
 func canonicalPath(value string) string {
-	value = filepath.Clean(value)
-	if resolved, err := filepath.EvalSymlinks(value); err == nil {
-		return filepath.Clean(resolved)
-	}
-	return value
+	return workspaceinfra.CanonicalPath(value)
 }
 
 var _ WorkspaceController = (*WorkspaceManager)(nil)

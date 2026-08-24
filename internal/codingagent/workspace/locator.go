@@ -200,8 +200,5 @@ func resolveGitReportedPath(base string, value string) string {
 	if err != nil {
 		return filepath.Clean(value)
 	}
-	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
-		return filepath.Clean(resolved)
-	}
-	return filepath.Clean(absolute)
+	return CanonicalPath(absolute)
 }
