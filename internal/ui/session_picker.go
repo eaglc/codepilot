@@ -1,263 +1,220 @@
 package ui
 
 import (
-	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/eaglc/codepilot/internal/session"
+
+	"github.com/eaglc/codepilot/internal/codingagent"
 )
 
-// SessionPickerStage describes the asynchronous session selection flow.
-type SessionPickerStage string
-
-const (
-	// SessionPickerClosed indicates that normal composer input owns the keyboard.
-	SessionPickerClosed SessionPickerStage = "closed"
-	// SessionPickerLoading indicates that session summaries are being loaded.
-	SessionPickerLoading SessionPickerStage = "loading"
-	// SessionPickerChoosing indicates that the user can select a session.
-	SessionPickerChoosing SessionPickerStage = "choosing"
-	// SessionPickerConfirming indicates that a cross-worktree switch needs an
-	// explicit confirmation before application state is rebound.
-	SessionPickerConfirming SessionPickerStage = "confirming"
-	// SessionPickerSwitching indicates that the selected session is activating.
-	SessionPickerSwitching SessionPickerStage = "switching"
-	// SessionPickerFailed indicates a safe, retryable picker error.
-	SessionPickerFailed SessionPickerStage = "failed"
-)
-
-// SessionPicker coordinates listing and switching sessions without exposing
-// persistence adapters to the UI.
-type SessionPicker struct {
-	controller       SessionController
-	stage            SessionPickerStage
-	filter           session.SessionFilter
-	sessions         []session.SessionSummary
-	cursor           int
-	message          string
-	generation       uint64
-	activeWorktreeID session.WorktreeID
-	pendingSessionID session.SessionID
+type sessionPicker struct {
+	active   bool
+	loading  bool
+	sessions []codingagent.Session
+	cursor   int
+	error    string
 }
 
-// NewSessionPicker creates a closed picker bound to the application service.
-func NewSessionPicker(controller SessionController) *SessionPicker {
-	return &SessionPicker{controller: controller, stage: SessionPickerClosed}
-}
-
-// Open starts a fresh session listing operation.
-func (p *SessionPicker) Open(ctx context.Context, filter session.SessionFilter) tea.Cmd {
-	return p.OpenForWorktree(ctx, filter, "")
-}
-
-// OpenForWorktree starts listing and records the worktree used to identify a
-// cross-worktree selection that needs confirmation.
-func (p *SessionPicker) OpenForWorktree(ctx context.Context, filter session.SessionFilter, activeWorktreeID session.WorktreeID) tea.Cmd {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	p.generation++
-	p.stage = SessionPickerLoading
-	p.filter = filter
-	p.sessions = nil
-	p.cursor = 0
-	p.message = ""
-	p.activeWorktreeID = activeWorktreeID
-	p.pendingSessionID = ""
-	generation := p.generation
-	return func() tea.Msg {
-		if p.controller == nil {
-			return sessionsLoadedMsg{generation: generation, message: "Session selection is unavailable."}
-		}
-		values, err := p.controller.ListSessions(ctx, filter)
-		return sessionsLoadedMsg{generation: generation, sessions: values, message: SafeErrorMessage(err, "Sessions could not be loaded.")}
-	}
-}
-
-// Cancel invalidates in-flight results and returns keyboard ownership to the composer.
-func (p *SessionPicker) Cancel() {
-	if p == nil {
-		return
-	}
-	p.generation++
-	p.stage = SessionPickerClosed
-	p.sessions = nil
-	p.cursor = 0
-	p.message = ""
-	p.activeWorktreeID = ""
-	p.pendingSessionID = ""
-}
-
-// Update applies asynchronous listing and switching results.
-func (p *SessionPicker) Update(message tea.Msg) tea.Cmd {
-	if p == nil {
-		return nil
-	}
-	switch value := message.(type) {
-	case sessionsLoadedMsg:
-		if value.generation != p.generation || p.stage == SessionPickerClosed {
-			return nil
-		}
-		if value.message != "" {
-			p.stage = SessionPickerFailed
-			p.message = value.message
-			return nil
-		}
-		p.sessions = append([]session.SessionSummary(nil), value.sessions...)
-		p.cursor = 0
-		p.stage = SessionPickerChoosing
-	case sessionSwitchedMsg:
-		if value.generation != p.generation || p.stage == SessionPickerClosed {
-			return nil
-		}
-		if value.message != "" {
-			p.stage = SessionPickerFailed
-			p.message = value.message
-			return nil
-		}
-		p.Cancel()
-	}
-	return nil
-}
-
-// HandleKey navigates the picker and starts an asynchronous switch.
-func (p *SessionPicker) HandleKey(message tea.KeyPressMsg) tea.Cmd {
-	if p == nil || p.stage == SessionPickerClosed {
-		return nil
-	}
-	key := message.Key()
-	if p.stage == SessionPickerConfirming {
-		if key.Code == tea.KeyEscape || key.Code == tea.KeyEsc || strings.EqualFold(key.Text, "n") {
-			p.stage = SessionPickerChoosing
-			p.pendingSessionID = ""
-			return nil
-		}
-		if strings.EqualFold(key.Text, "y") {
-			return p.switchSession(p.pendingSessionID)
-		}
-		return nil
-	}
-	if key.Code == tea.KeyEscape || key.Code == tea.KeyEsc {
-		p.Cancel()
-		return nil
-	}
-	switch p.stage {
-	case SessionPickerChoosing:
-		if movePickerCursor(&p.cursor, message, len(p.sessions)) {
-			return nil
-		}
-		if isEnterKey(key.Code) && len(p.sessions) > 0 {
-			selected := p.sessions[p.cursor]
-			if p.activeWorktreeID != "" && selected.WorktreeID != "" && selected.WorktreeID != p.activeWorktreeID {
-				p.pendingSessionID = selected.ID
-				p.stage = SessionPickerConfirming
-				return nil
-			}
-			return p.switchSession(selected.ID)
-		}
-	case SessionPickerFailed:
-		if isEnterKey(key.Code) {
-			return p.OpenForWorktree(context.Background(), p.filter, p.activeWorktreeID)
-		}
-	}
-	return nil
-}
-
-// View returns a compact accessible session selection overlay.
-func (p *SessionPicker) View(activeID session.SessionID) string {
-	if p == nil || p.stage == SessionPickerClosed {
-		return ""
-	}
-	switch p.stage {
-	case SessionPickerLoading:
-		return "Sessions\nLoading sessions..."
-	case SessionPickerSwitching:
-		return "Sessions\nSwitching session..."
-	case SessionPickerConfirming:
-		return fmt.Sprintf("Switch to another worktree?\nSession: %s\nWorktree: %s", p.pendingSessionID, p.pendingWorktreeID())
-	case SessionPickerFailed:
-		return "Session selection failed\n" + p.message
-	case SessionPickerChoosing:
-		lines := []string{"Select session"}
-		start, end := pickerWindow(p.cursor, len(p.sessions), maxVisiblePickerItems)
-		if start > 0 {
-			lines = append(lines, "  …")
-		}
-		for index := start; index < end; index++ {
-			value := p.sessions[index]
-			title := strings.TrimSpace(value.Title)
-			if title == "" {
-				title = string(value.ID)
-			}
-			age := ""
-			if !value.UpdatedAt.IsZero() {
-				age = " · " + value.UpdatedAt.Local().Format(time.DateTime)
-			}
-			active := ""
-			if value.ID == activeID {
-				active = " (active)"
-			}
-			lines = append(lines, pickerLine(index == p.cursor, fmt.Sprintf("%s%s · %s · %s%s", title, active, value.WorktreeID, value.PermissionMode, age)))
-		}
-		if end < len(p.sessions) {
-			lines = append(lines, "  …")
-		}
-		if len(p.sessions) == 0 {
-			lines = append(lines, "No matching sessions.")
-		}
-		return strings.Join(lines, "\n")
-	default:
-		return ""
-	}
-}
-
-func (p *SessionPicker) switchSession(id session.SessionID) tea.Cmd {
-	p.stage = SessionPickerSwitching
-	generation := p.generation
-	return func() tea.Msg {
-		if p.controller == nil {
-			return sessionSwitchedMsg{generation: generation, message: "Session selection is unavailable."}
-		}
-		err := p.controller.SwitchSession(context.Background(), id)
-		return sessionSwitchedMsg{generation: generation, message: SafeErrorMessage(err, "The selected session could not be activated.")}
-	}
-}
-
-func (p *SessionPicker) pendingWorktreeID() session.WorktreeID {
-	for _, value := range p.sessions {
-		if value.ID == p.pendingSessionID {
-			return value.WorktreeID
-		}
-	}
-	return ""
-}
-
-// Stage returns the current picker stage.
-func (p *SessionPicker) Stage() SessionPickerStage {
-	if p == nil {
-		return SessionPickerClosed
-	}
-	return p.stage
-}
-
-// Sessions returns a defensive copy of the visible summaries.
-func (p *SessionPicker) Sessions() []session.SessionSummary {
-	if p == nil {
-		return nil
-	}
-	return append([]session.SessionSummary(nil), p.sessions...)
-}
-
-type sessionsLoadedMsg struct {
+type sessionsMsg struct {
+	sessions   []codingagent.Session
+	err        error
 	generation uint64
-	sessions   []session.SessionSummary
-	message    string
 }
 
 type sessionSwitchedMsg struct {
+	snapshot   codingagent.Snapshot
+	err        error
 	generation uint64
-	message    string
+}
+
+type sessionCreatedMsg struct {
+	snapshot   codingagent.Snapshot
+	err        error
+	generation uint64
+}
+
+type sessionRenamedMsg struct {
+	session    codingagent.Session
+	err        error
+	generation uint64
+}
+
+type sessionArchivedMsg struct {
+	session    codingagent.Session
+	err        error
+	generation uint64
+}
+
+type laneForkedMsg struct {
+	snapshot   codingagent.Snapshot
+	err        error
+	generation uint64
+}
+
+func newSessionPicker() sessionPicker {
+	return sessionPicker{active: true, loading: true}
+}
+
+func (p *sessionPicker) selected() *codingagent.Session {
+	if p == nil || len(p.sessions) == 0 {
+		return nil
+	}
+	p.cursor = min(max(0, p.cursor), len(p.sessions)-1)
+	return &p.sessions[p.cursor]
+}
+
+func (m *Model) loadSessions() tea.Cmd {
+	client, ctx, generation := m.client, m.ctx, m.generation
+	options := codingagent.SessionListOptions{WorktreeID: m.snapshot.Session.WorktreeID}
+	return func() tea.Msg {
+		values, err := client.ListSessions(ctx, options)
+		return sessionsMsg{sessions: values, err: err, generation: generation}
+	}
+}
+
+func (m *Model) handleSessionKey(message tea.KeyPressMsg) tea.Cmd {
+	key := message.Key()
+	if key.Code == tea.KeyEscape || key.Code == tea.KeyEsc {
+		m.sessionPicker = sessionPicker{}
+		return nil
+	}
+	if m.sessionPicker.loading {
+		return nil
+	}
+	switch {
+	case key.Code == tea.KeyUp || strings.EqualFold(key.Text, "k"):
+		m.sessionPicker.cursor = max(0, m.sessionPicker.cursor-1)
+	case key.Code == tea.KeyDown || strings.EqualFold(key.Text, "j"):
+		m.sessionPicker.cursor = min(max(0, len(m.sessionPicker.sessions)-1), m.sessionPicker.cursor+1)
+	case key.Code == tea.KeyEnter:
+		selected := m.sessionPicker.selected()
+		if selected == nil {
+			return nil
+		}
+		if selected.ID == m.sessionID {
+			m.sessionPicker = sessionPicker{}
+			return nil
+		}
+		m.sessionPicker.loading = true
+		m.sessionPicker.error = ""
+		return m.switchSession(selected.ID)
+	case strings.EqualFold(key.Text, "n"):
+		m.sessionPicker = sessionPicker{}
+		return m.createSession("")
+	case strings.EqualFold(key.Text, "a"):
+		selected := m.sessionPicker.selected()
+		if selected == nil {
+			return nil
+		}
+		if selected.ID == m.sessionID {
+			m.sessionPicker.error = "Switch to another session before archiving this one."
+			return nil
+		}
+		m.sessionPicker.loading = true
+		client, ctx, generation, id := m.client, m.ctx, m.generation, selected.ID
+		return func() tea.Msg {
+			session, err := client.ArchiveSession(ctx, id)
+			return sessionArchivedMsg{session: session, err: err, generation: generation}
+		}
+	}
+	return nil
+}
+
+func (m *Model) switchSession(id codingagent.SessionID) tea.Cmd {
+	client, ctx, generation := m.client, m.ctx, m.generation
+	return func() tea.Msg {
+		snapshot, err := client.SwitchSession(ctx, id)
+		return sessionSwitchedMsg{snapshot: snapshot, err: err, generation: generation}
+	}
+}
+
+func (m *Model) createSession(title string) tea.Cmd {
+	title = strings.TrimSpace(title)
+	template := m.snapshot.Session
+	request := codingagent.Session{
+		WorkspaceID: template.WorkspaceID, WorktreeID: template.WorktreeID, Title: title,
+		ProviderProfileID: template.ProviderProfileID, ModelID: template.ModelID,
+		PermissionMode: template.PermissionMode, BaseCommit: template.BaseCommit,
+	}
+	m.busy = true
+	m.errorMessage = ""
+	m.status = "Creating session..."
+	client, ctx, generation := m.client, m.ctx, m.generation
+	return func() tea.Msg {
+		created, err := client.CreateSession(ctx, request)
+		if err != nil {
+			return sessionCreatedMsg{err: err, generation: generation}
+		}
+		snapshot, err := client.SwitchSession(ctx, created.ID)
+		return sessionCreatedMsg{snapshot: snapshot, err: err, generation: generation}
+	}
+}
+
+func (m *Model) renameSession(title string) tea.Cmd {
+	m.busy = true
+	m.errorMessage = ""
+	m.status = "Renaming session..."
+	client, ctx, generation, id := m.client, m.ctx, m.generation, m.sessionID
+	return func() tea.Msg {
+		session, err := client.RenameSession(ctx, id, title)
+		return sessionRenamedMsg{session: session, err: err, generation: generation}
+	}
+}
+
+func (m *Model) forkLane(entryID string) tea.Cmd {
+	m.busy = true
+	m.errorMessage = ""
+	m.status = "Forking conversation branch..."
+	client, ctx, generation, id := m.client, m.ctx, m.generation, m.sessionID
+	return func() tea.Msg {
+		snapshot, err := client.ForkLane(ctx, codingagent.ForkLaneRequest{SessionID: id, FromEntryID: entryID})
+		return laneForkedMsg{snapshot: snapshot, err: err, generation: generation}
+	}
+}
+
+func (m *Model) sessionView(width, height int) tea.View {
+	lines := []string{theme.header.Render("Sessions"), theme.muted.Render("Enter switch  •  n new  •  a archive  •  Esc close"), ""}
+	if m.sessionPicker.loading {
+		lines = append(lines, theme.muted.Render("Loading sessions..."))
+	} else if m.sessionPicker.error != "" {
+		lines = append(lines, theme.failure.Render(m.sessionPicker.error), "")
+	}
+	if !m.sessionPicker.loading && len(m.sessionPicker.sessions) == 0 {
+		lines = append(lines, theme.muted.Render("No sessions are available for this worktree."))
+	}
+	visible := max(1, (height-7)/2)
+	start, end := pickerWindow(m.sessionPicker.cursor, len(m.sessionPicker.sessions), visible)
+	if start > 0 {
+		lines = append(lines, theme.muted.Render("  … earlier sessions"))
+	}
+	for index := start; index < end; index++ {
+		session := m.sessionPicker.sessions[index]
+		marker := "  "
+		if index == m.sessionPicker.cursor {
+			marker = "❯ "
+		}
+		active := ""
+		if session.ID == m.sessionID {
+			active = "  • active"
+		}
+		title := strings.TrimSpace(session.Title)
+		if title == "" {
+			title = string(session.ID)
+		}
+		row := fmt.Sprintf("%s%s%s", marker, title, active)
+		lines = append(lines, theme.user.Render(row))
+		lines = append(lines, theme.muted.Render(fmt.Sprintf("    %s/%s  •  %s", session.ProviderProfileID, session.ModelID, session.UpdatedAt.Local().Format("2006-01-02 15:04"))))
+	}
+	if end < len(m.sessionPicker.sessions) {
+		lines = append(lines, theme.muted.Render("  … more sessions"))
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	view := tea.NewView(strings.Join(lines[:min(len(lines), height)], "\n"))
+	view.AltScreen = true
+	view.WindowTitle = "CodePilot Sessions"
+	return view
 }

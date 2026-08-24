@@ -1,136 +1,240 @@
 package ui
 
 import (
-	"context"
-	"errors"
+	"fmt"
 	"strings"
 
-	"github.com/eaglc/codepilot/internal/session"
+	tea "charm.land/bubbletea/v2"
 )
 
-const defaultOperationError = "The operation could not be completed."
-
-const helpText = `/model                         configure or switch provider/model
-/permissions MODE              set read-only, ask, or auto-edit
-/session create [TITLE]         create and activate a session (/session new is an alias)
-/session list [--all]           open the session picker
-/session switch ID              switch directly by ID
-/session rename NAME            rename the active session
-/session archive                archive it and create a replacement
-/workspace open PATH            activate another Git worktree
-/workspace list                 show registered worktrees
-/status                         show active session and worktree state
-/diff [proposed|session|workspace]
-/clear                          start a new session with empty context
-/help                           show this help
-/exit                           save and exit
-
-Ctrl+C cancel turn · Ctrl+D exit · Ctrl+N new session · Ctrl+O sessions · Tab switch panel`
-
-type slashCommand struct {
-	name      string
-	arguments []string
+type commandSpec struct {
+	name        string
+	usage       string
+	description string
+	aliases     []string
+	takesArg    bool
+	requiresArg bool
+	run         func(*Model, string) tea.Cmd
 }
 
-type slashCommandDefinition struct {
-	command        string
-	usage          string
-	insert         string
-	description    string
-	executeOnEnter bool
+func registeredCommands() []commandSpec {
+	return []commandSpec{
+		{name: "/help", usage: "/help", description: "Show this command guide", run: runHelpCommand},
+		{name: "/workspace", usage: "/workspace", description: "Choose or repair a workspace", run: runWorkspaceCommand},
+		{name: "/provider", usage: "/provider", description: "Configure a provider and choose a model", aliases: []string{"/model"}, run: runModelCommand},
+		{name: "/permissions", usage: "/permissions", description: "Choose the active session's safety mode", run: runPermissionsCommand},
+		{name: "/session", usage: "/session", description: "Choose, create, or archive a session", run: runSessionCommand},
+		{name: "/clear", usage: "/clear", description: "Start a clean session and preserve this conversation", run: runClearCommand},
+		{name: "/rename", usage: "/rename <title>", description: "Rename the active session", takesArg: true, requiresArg: true, run: runRenameCommand},
+		{name: "/fork", usage: "/fork", description: "Continue from a historical message", run: runForkCommand},
+		{name: "/md", usage: "/md [on|off]", description: "Toggle Markdown rendering for assistant messages", aliases: []string{"/markdown"}, takesArg: true, run: runMarkdownCommand},
+		{name: "/exit", usage: "/exit", description: "Exit CodePilot", aliases: []string{"/quit"}, run: runExitCommand},
+	}
 }
 
-var slashCommandDefinitions = []slashCommandDefinition{
-	{command: "model", usage: "/model", insert: "/model", description: "Configure or switch provider/model", executeOnEnter: true},
-	{command: "permissions read-only", usage: "/permissions read-only", insert: "/permissions read-only", description: "Allow inspection only", executeOnEnter: true},
-	{command: "permissions ask", usage: "/permissions ask", insert: "/permissions ask", description: "Ask before edits and checks", executeOnEnter: true},
-	{command: "permissions auto-edit", usage: "/permissions auto-edit", insert: "/permissions auto-edit", description: "Allow validated edits", executeOnEnter: true},
-	{command: "session create", usage: "/session create [TITLE]", insert: "/session create ", description: "Create and activate a session"},
-	{command: "session list", usage: "/session list", insert: "/session list", description: "List sessions in this worktree", executeOnEnter: true},
-	{command: "session list --all", usage: "/session list --all", insert: "/session list --all", description: "List sessions in all worktrees", executeOnEnter: true},
-	{command: "session switch", usage: "/session switch ID", insert: "/session switch ", description: "Switch directly by session ID"},
-	{command: "session rename", usage: "/session rename NAME", insert: "/session rename ", description: "Rename the active session"},
-	{command: "session archive", usage: "/session archive", insert: "/session archive", description: "Archive the active session", executeOnEnter: true},
-	{command: "workspace open", usage: "/workspace open PATH", insert: "/workspace open ", description: "Open another Git worktree"},
-	{command: "workspace list", usage: "/workspace list", insert: "/workspace list", description: "List registered worktrees", executeOnEnter: true},
-	{command: "status", usage: "/status", insert: "/status", description: "Show active session and worktree state", executeOnEnter: true},
-	{command: "diff proposed", usage: "/diff proposed", insert: "/diff proposed", description: "Show the proposed diff", executeOnEnter: true},
-	{command: "diff session", usage: "/diff session", insert: "/diff session", description: "Show the active session diff", executeOnEnter: true},
-	{command: "diff workspace", usage: "/diff workspace", insert: "/diff workspace", description: "Show the worktree diff", executeOnEnter: true},
-	{command: "clear", usage: "/clear", insert: "/clear", description: "Start a session with empty context", executeOnEnter: true},
-	{command: "help", usage: "/help", insert: "/help", description: "Show command help", executeOnEnter: true},
-	{command: "exit", usage: "/exit", insert: "/exit", description: "Save and exit", executeOnEnter: true},
+func (m *Model) submitCommand(text string) tea.Cmd {
+	spec, arguments, found := lookupCommand(text)
+	if !found {
+		m.clearInput()
+		m.errorMessage = "Unknown command. Use /help to see available commands."
+		return nil
+	}
+	m.clearInput()
+	m.errorMessage = ""
+	return spec.run(m, arguments)
 }
 
-func parseSlashCommand(input string) (slashCommand, error) {
-	trimmed := strings.TrimSpace(input)
-	if !strings.HasPrefix(trimmed, "/") {
-		return slashCommand{}, errors.New("command must start with /")
-	}
-	fields := strings.Fields(strings.TrimPrefix(trimmed, "/"))
-	if len(fields) == 0 {
-		return slashCommand{}, errors.New("enter a command after /")
-	}
-	return slashCommand{name: strings.ToLower(fields[0]), arguments: fields[1:]}, nil
-}
-
-// SafeErrorMessage converts an application error to terminal-safe user copy.
-// Wrapped diagnostic causes are intentionally never formatted or returned.
-func SafeErrorMessage(err error, fallback string) string {
-	if err == nil {
-		return ""
-	}
-	if strings.TrimSpace(fallback) == "" {
-		fallback = defaultOperationError
-	}
-
-	var appError *session.AppError
-	if errors.As(err, &appError) {
-		if message := strings.TrimSpace(appError.UserMessage); message != "" {
-			return message
-		}
-		if message := errorCodeMessage(appError.Code); message != "" {
-			return message
+func lookupCommand(value string) (commandSpec, string, bool) {
+	value = strings.TrimSpace(value)
+	for _, spec := range registeredCommands() {
+		names := append([]string{spec.name}, spec.aliases...)
+		for _, name := range names {
+			if strings.EqualFold(value, name) {
+				return spec, "", true
+			}
+			prefix := name + " "
+			if spec.takesArg && len(value) > len(prefix) && strings.EqualFold(value[:len(prefix)], prefix) {
+				return spec, strings.TrimSpace(value[len(prefix):]), true
+			}
 		}
 	}
-	if errors.Is(err, context.Canceled) {
-		return "Operation was cancelled."
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return "Operation timed out. Try again."
-	}
-	return fallback
+	return commandSpec{}, "", false
 }
 
-func errorCodeMessage(code session.ErrorCode) string {
-	switch code {
-	case session.ErrInvalidInput:
-		return "The request is invalid."
-	case session.ErrInvalidState:
-		return "That action is not available right now."
-	case session.ErrNotFound:
-		return "The requested item was not found."
-	case session.ErrConflict:
-		return "The workspace changed. Refresh and try again."
-	case session.ErrWorkspaceUnavailable:
-		return "The worktree is unavailable. Restore its original path and try again."
-	case session.ErrProviderUnavailable:
-		return "The selected provider or model is unavailable."
-	case session.ErrPermissionDenied:
-		return "The current permission mode does not allow that action."
-	case session.ErrApprovalRequired:
-		return "Approval is required before this action can run."
-	case session.ErrCancelled:
-		return "Operation was cancelled."
-	case session.ErrTimeout:
-		return "Operation timed out. Try again."
-	case session.ErrCorruptedState:
-		return "Stored session data is corrupted and could not be restored."
-	case session.ErrPersistence:
-		return "Session state could not be read or saved."
-	case session.ErrInternal:
-		return defaultOperationError
+func filterCommands(prefix string) []commandSpec {
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if !strings.HasPrefix(prefix, "/") || strings.ContainsAny(prefix, " \t\r\n") {
+		return nil
+	}
+	var matches []commandSpec
+	for _, spec := range registeredCommands() {
+		matched := strings.HasPrefix(spec.name, prefix)
+		for _, alias := range spec.aliases {
+			matched = matched || strings.HasPrefix(alias, prefix)
+		}
+		if matched {
+			matches = append(matches, spec)
+		}
+	}
+	return matches
+}
+
+func (m *Model) commandMatches() []commandSpec {
+	return filterCommands(string(m.input))
+}
+
+func (m *Model) completionActive() bool {
+	return !m.busy && !m.picker.active && !m.sessionPicker.active && !m.workspacePicker.active && !m.permissionPicker.active && !m.forkPicker.active && !m.helpActive &&
+		m.pendingApproval() == nil && m.pendingRecovery() == nil && !m.completionDismissed && len(m.commandMatches()) != 0
+}
+
+func (m *Model) moveCompletionSelection(delta int) {
+	matches := m.commandMatches()
+	if len(matches) == 0 {
+		m.completionCursor = 0
+		return
+	}
+	m.completionCursor = (m.completionCursor + delta + len(matches)) % len(matches)
+}
+
+func (m *Model) completeCommand() {
+	matches := m.commandMatches()
+	if len(matches) == 0 {
+		return
+	}
+	m.completionCursor = min(max(0, m.completionCursor), len(matches)-1)
+	selected := matches[m.completionCursor]
+	value := selected.name
+	if selected.takesArg {
+		value += " "
+	}
+	m.replaceInput(value)
+	m.completionDismissed = true
+}
+
+func (m *Model) submitSelectedCommand() tea.Cmd {
+	matches := m.commandMatches()
+	if len(matches) == 0 {
+		return nil
+	}
+	m.completionCursor = min(max(0, m.completionCursor), len(matches)-1)
+	selected := matches[m.completionCursor]
+	if selected.requiresArg {
+		m.completeCommand()
+		return nil
+	}
+	return m.submitCommand(selected.name)
+}
+
+func (m *Model) commandCompletionLines(width, limit int) []string {
+	if !m.completionActive() {
+		return nil
+	}
+	matches := m.commandMatches()
+	if len(matches) == 0 || limit <= 0 {
+		return nil
+	}
+	m.completionCursor = min(max(0, m.completionCursor), len(matches)-1)
+	start, end := pickerWindow(m.completionCursor, len(matches), limit)
+	lines := make([]string, 0, end-start)
+	for index := start; index < end; index++ {
+		if index == m.completionCursor {
+			line := theme.user.Render(fmt.Sprintf("❯ %-22s", matches[index].usage)) + theme.muted.Render("— "+matches[index].description)
+			lines = append(lines, truncateANSI(line, width))
+			continue
+		}
+		line := theme.muted.Render(fmt.Sprintf("  %-22s— %s", matches[index].usage, matches[index].description))
+		lines = append(lines, truncateANSI(line, width))
+	}
+	return lines
+}
+
+func noCommandArguments(m *Model, arguments, usage string) bool {
+	if arguments == "" {
+		return true
+	}
+	m.errorMessage = "Usage: " + usage
+	return false
+}
+
+func runHelpCommand(m *Model, arguments string) tea.Cmd {
+	if noCommandArguments(m, arguments, "/help") {
+		m.helpActive = true
+	}
+	return nil
+}
+
+func runWorkspaceCommand(m *Model, arguments string) tea.Cmd {
+	if !noCommandArguments(m, arguments, "/workspace") {
+		return nil
+	}
+	m.workspacePicker = newWorkspacePicker()
+	return m.loadWorkspaces()
+}
+
+func runModelCommand(m *Model, arguments string) tea.Cmd {
+	if !noCommandArguments(m, arguments, "/model") {
+		return nil
+	}
+	m.picker = newProviderPicker("", false)
+	return m.loadProviderProfiles()
+}
+
+func runPermissionsCommand(m *Model, arguments string) tea.Cmd {
+	if noCommandArguments(m, arguments, "/permissions") {
+		m.permissionPicker = newPermissionPicker(m.snapshot.Session.PermissionMode)
+	}
+	return nil
+}
+
+func runSessionCommand(m *Model, arguments string) tea.Cmd {
+	if !noCommandArguments(m, arguments, "/session") {
+		return nil
+	}
+	m.sessionPicker = newSessionPicker()
+	return m.loadSessions()
+}
+
+func runRenameCommand(m *Model, arguments string) tea.Cmd {
+	if arguments == "" {
+		m.errorMessage = "Usage: /rename <title>"
+		return nil
+	}
+	return m.renameSession(arguments)
+}
+
+func runForkCommand(m *Model, arguments string) tea.Cmd {
+	if !noCommandArguments(m, arguments, "/fork") {
+		return nil
+	}
+	m.forkPicker = newForkPicker(m.snapshot.Transcript)
+	return nil
+}
+
+func runClearCommand(m *Model, arguments string) tea.Cmd {
+	if !noCommandArguments(m, arguments, "/clear") {
+		return nil
+	}
+	return m.createSession("")
+}
+
+func runMarkdownCommand(m *Model, arguments string) tea.Cmd {
+	switch strings.ToLower(arguments) {
+	case "", "toggle":
+		m.setMarkdownEnabled(!m.markdownEnabled)
+	case "on":
+		m.setMarkdownEnabled(true)
+	case "off":
+		m.setMarkdownEnabled(false)
 	default:
-		return ""
+		m.errorMessage = "Usage: /md [on|off]"
 	}
+	return nil
+}
+
+func runExitCommand(m *Model, arguments string) tea.Cmd {
+	if !noCommandArguments(m, arguments, "/exit") {
+		return nil
+	}
+	return tea.Quit
 }

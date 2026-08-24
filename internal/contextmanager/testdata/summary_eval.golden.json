@@ -1,0 +1,13 @@
+{
+  "facts": [
+    {"kind": "tool", "value": "apply_patch"},
+    {"kind": "changed_file", "value": "internal/agent/runtime.go"},
+    {"kind": "artifact", "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  ],
+  "accepted": "apply_patch changed internal/agent/runtime.go; full output is sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+  "rejected": [
+    "A patch was applied and its output was archived.",
+    "apply_patch completed; full output is sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+    "apply_patch changed internal/agent/runtime.go."
+  ]
+}

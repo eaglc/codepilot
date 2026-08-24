@@ -1,153 +1,136 @@
 package tool
 
 import (
-	"encoding/json"
-	"errors"
+	"context"
 	"fmt"
 	"reflect"
-	"strings"
+	"sort"
+
+	"github.com/eaglc/codepilot/internal/llm"
 )
 
-var (
-	// ErrNilTool indicates that a nil Tool was registered.
-	ErrNilTool = errors.New("tool is nil")
-	// ErrInvalidDefinition indicates that a tool definition violates the registry contract.
-	ErrInvalidDefinition = errors.New("tool definition is invalid")
-	// ErrDuplicateTool indicates that a tool name is already registered.
-	ErrDuplicateTool = errors.New("tool name is already registered")
-)
-
-type registryEntry struct {
-	tool       Tool
-	definition Definition
-}
-
-// Registry stores the immutable tool set available to one agent turn.
+// Registry is an immutable validated set of tools available to one Agent run.
 type Registry struct {
-	entries map[string]registryEntry
-	names   []string
+	tools map[string]Tool
+	names []string
 }
 
-// NewRegistry creates an empty per-turn tool registry.
-func NewRegistry() *Registry {
-	return &Registry{
-		entries: make(map[string]registryEntry),
+// NewRegistry validates tools and rejects duplicate model-visible names.
+func NewRegistry(tools ...Tool) (*Registry, error) {
+	registry := &Registry{tools: make(map[string]Tool, len(tools))}
+	for _, executable := range tools {
+		if isNilTool(executable) {
+			return nil, fmt.Errorf("create tool registry: tool is nil")
+		}
+		definition := executable.Definition()
+		if err := definition.Validate(); err != nil {
+			return nil, fmt.Errorf("create tool registry: %w", err)
+		}
+		switch executable.ReplayPolicy() {
+		case ReplayNever, ReplaySafe, ReplayIdempotent:
+		default:
+			return nil, fmt.Errorf("create tool registry %q: unsupported replay policy %q", definition.Name, executable.ReplayPolicy())
+		}
+		if _, exists := registry.tools[definition.Name]; exists {
+			return nil, fmt.Errorf("create tool registry: duplicate tool %q", definition.Name)
+		}
+		registry.tools[definition.Name] = executable
+		registry.names = append(registry.names, definition.Name)
 	}
+	sort.Strings(registry.names)
+	return registry, nil
 }
 
-// Register validates and adds a tool while preserving registration order.
-func (r *Registry) Register(value Tool) error {
+// Definitions returns defensive model-facing declarations ordered by name.
+func (r *Registry) Definitions() []llm.ToolDefinition {
 	if r == nil {
-		return fmt.Errorf("register tool: %w", ErrInvalidDefinition)
+		return nil
 	}
-
-	if isNilTool(value) {
-		return fmt.Errorf("register tool: %w", ErrNilTool)
+	definitions := make([]llm.ToolDefinition, 0, len(r.names))
+	for _, name := range r.names {
+		definition := r.tools[name].Definition()
+		definition.InputSchema = append([]byte(nil), definition.InputSchema...)
+		definitions = append(definitions, definition)
 	}
-
-	definition := value.Definition()
-	if err := validateDefinition(definition); err != nil {
-		return fmt.Errorf("register tool %q: %w", definition.Name, err)
-	}
-
-	if _, exists := r.entries[definition.Name]; exists {
-		return fmt.Errorf("register tool %q: %w", definition.Name, ErrDuplicateTool)
-	}
-
-	definition.InputSchema = append(json.RawMessage(nil), definition.InputSchema...)
-	r.entries[definition.Name] = registryEntry{
-		tool:       value,
-		definition: definition,
-	}
-	r.names = append(r.names, definition.Name)
-
-	return nil
+	return definitions
 }
 
-// Lookup returns the tool registered under name.
+// Lookup returns a registered executable tool by its exact model-visible name.
 func (r *Registry) Lookup(name string) (Tool, bool) {
 	if r == nil {
 		return nil, false
 	}
-
-	entry, exists := r.entries[name]
-	return entry.tool, exists
+	executable, exists := r.tools[name]
+	return executable, exists
 }
 
-// List returns tools in registration order using a new slice.
-func (r *Registry) List() []Tool {
-	if r == nil {
-		return nil
+// Execute validates and dispatches a call without emitting activities or writing storage.
+func (r *Registry) Execute(ctx context.Context, call Call, progress ProgressSink) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
 	}
-
-	values := make([]Tool, 0, len(r.names))
-	for _, name := range r.names {
-		values = append(values, r.entries[name].tool)
+	modelCall := llm.ToolCall{ID: call.ID, Name: call.Name, Arguments: call.Arguments}
+	if err := modelCall.Validate(); err != nil {
+		return Result{}, err
 	}
-
-	return values
+	executable, exists := r.Lookup(call.Name)
+	if !exists {
+		return Result{}, fmt.Errorf("execute tool %q: tool is not registered", call.Name)
+	}
+	result, err := executable.Execute(ctx, Call{
+		ID:             call.ID,
+		Name:           call.Name,
+		Arguments:      append([]byte(nil), call.Arguments...),
+		IdempotencyKey: call.IdempotencyKey,
+	}, progress)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := result.Validate(); err != nil {
+		return Result{}, fmt.Errorf("execute tool %q: %w", call.Name, err)
+	}
+	return result.Clone(), nil
 }
 
-// Definitions returns defensive copies in registration order.
-func (r *Registry) Definitions() []Definition {
-	if r == nil {
-		return nil
+// Resume dispatches a durable interrupted call to a resumable tool. Tools that do
+// not implement ResumableTool use the externally supplied resolution unchanged.
+func (r *Registry) Resume(ctx context.Context, call Call, interrupt Interrupt, resolution Result, progress ProgressSink) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
 	}
-
-	definitions := make([]Definition, 0, len(r.names))
-	for _, name := range r.names {
-		definition := r.entries[name].definition
-		definition.InputSchema = append(json.RawMessage(nil), definition.InputSchema...)
-		definitions = append(definitions, definition)
+	if err := resolution.Validate(); err != nil {
+		return Result{}, fmt.Errorf("resume tool %q: %w", call.Name, err)
 	}
-
-	return definitions
-}
-
-func validateDefinition(definition Definition) error {
-	if !isSnakeCaseName(definition.Name) {
-		return fmt.Errorf("%w: name must use lower snake_case", ErrInvalidDefinition)
+	executable, exists := r.Lookup(call.Name)
+	if !exists {
+		return Result{}, fmt.Errorf("resume tool %q: tool is not registered", call.Name)
 	}
-
-	if strings.TrimSpace(definition.Description) == "" {
-		return fmt.Errorf("%w: description is empty", ErrInvalidDefinition)
+	resumable, supportsResume := executable.(ResumableTool)
+	if !supportsResume {
+		return resolution.Clone(), nil
 	}
-
-	var schema map[string]json.RawMessage
-	if err := json.Unmarshal(definition.InputSchema, &schema); err != nil || schema == nil {
-		return fmt.Errorf("%w: input schema must be a JSON object", ErrInvalidDefinition)
+	result, err := resumable.Resume(ctx, Call{
+		ID:             call.ID,
+		Name:           call.Name,
+		Arguments:      append([]byte(nil), call.Arguments...),
+		IdempotencyKey: call.IdempotencyKey,
+	}, Interrupt{ID: interrupt.ID, Kind: interrupt.Kind, Payload: append([]byte(nil), interrupt.Payload...)}, resolution.Clone(), progress)
+	if err != nil {
+		return Result{}, err
 	}
-
-	return nil
-}
-
-func isSnakeCaseName(name string) bool {
-	if name == "" || name[0] < 'a' || name[0] > 'z' || name[len(name)-1] == '_' {
-		return false
+	if err := result.Validate(); err != nil {
+		return Result{}, fmt.Errorf("resume tool %q: %w", call.Name, err)
 	}
-
-	previousUnderscore := false
-	for _, character := range name {
-		isLowercase := character >= 'a' && character <= 'z'
-		isDigit := character >= '0' && character <= '9'
-		isUnderscore := character == '_'
-		if !isLowercase && !isDigit && !isUnderscore {
-			return false
-		}
-		if isUnderscore && previousUnderscore {
-			return false
-		}
-		previousUnderscore = isUnderscore
+	if result.Status == ResultInterrupted {
+		return Result{}, fmt.Errorf("resume tool %q: resumed execution cannot interrupt again", call.Name)
 	}
-
-	return true
+	return result.Clone(), nil
 }
 
 func isNilTool(value Tool) bool {
 	if value == nil {
 		return true
 	}
-
 	reflected := reflect.ValueOf(value)
 	switch reflected.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:

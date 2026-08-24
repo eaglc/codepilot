@@ -1,0 +1,81 @@
+version: 2
+
+project_name: codepilot
+
+builds:
+  - id: codepilot
+    main: ./cmd/codepilot
+    binary: codepilot
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    ldflags:
+      - >-
+        -s -w -buildid=
+        -X main.version={{ .Version }}
+        -X main.commit={{ .Commit }}
+        -X main.buildDate={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: codepilot
+    ids:
+      - codepilot
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    wrap_in_directory: true
+    builds_info:
+      mtime: "{{ .CommitDate }}"
+    files:
+      - src: README.md
+        info:
+          mtime: "{{ .CommitDate }}"
+          mode: 0644
+      - src: LICENSE
+        info:
+          mtime: "{{ .CommitDate }}"
+          mode: 0644
+      - src: CHANGELOG.md
+        info:
+          mtime: "{{ .CommitDate }}"
+          mode: 0644
+      - src: docs/release-and-upgrade.md
+        dst: docs
+        strip_parent: true
+        info:
+          mtime: "{{ .CommitDate }}"
+          mode: 0644
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - id: archive-sbom
+    artifacts: archive
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  prerelease: auto

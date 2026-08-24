@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CODEPILOT_REQUIRE_PYTHON_E2E: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Full offline suite
+        run: go test ./... -count=1 -timeout=10m
+      - name: Vet
+        run: go vet ./...
+      - name: Verify tag, changelog, and reproducible binaries
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT_DATE="$(git show -s --format=%cI "$GITHUB_SHA")"
+          go run ./cmd/releasecheck \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA" \
+            --date "$COMMIT_DATE" \
+            --require-clean \
+            --require-changelog
+
+  release:
+    name: Publish release artifacts
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.51.0
+      - name: Add Syft to PATH
+        shell: bash
+        run: echo "$(dirname '${{ steps.syft.outputs.cmd }}')" >> "$GITHUB_PATH"
+      - name: Publish with pinned GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.17.1
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

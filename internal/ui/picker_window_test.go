@@ -5,85 +5,46 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/eaglc/codepilot/internal/session"
+	"github.com/eaglc/codepilot/internal/codingagent"
 )
 
-func TestPickerWindowClampsAroundCursor(t *testing.T) {
-	if start, end := pickerWindow(0, 5, 8); start != 0 || end != 5 {
-		t.Fatalf("small list = %d,%d, want 0,5", start, end)
+func TestPickerWindowKeepsCursorInBoundedRange(t *testing.T) {
+	tests := []struct {
+		name                string
+		cursor, count, size int
+		start, end          int
+	}{
+		{name: "empty", cursor: 0, count: 0, size: 8, start: 0, end: 0},
+		{name: "small", cursor: 2, count: 5, size: 8, start: 0, end: 5},
+		{name: "top", cursor: 0, count: 20, size: 8, start: 0, end: 8},
+		{name: "middle", cursor: 10, count: 20, size: 8, start: 6, end: 14},
+		{name: "bottom", cursor: 19, count: 20, size: 8, start: 12, end: 20},
 	}
-	if start, end := pickerWindow(0, 20, 8); start != 0 || end != 8 {
-		t.Fatalf("top = %d,%d, want 0,8", start, end)
-	}
-	if start, end := pickerWindow(19, 20, 8); start != 12 || end != 20 {
-		t.Fatalf("bottom = %d,%d, want 12,20", start, end)
-	}
-	if start, end := pickerWindow(10, 20, 8); start != 6 || end != 14 {
-		t.Fatalf("center = %d,%d, want 6,14", start, end)
-	}
-	if start, end := pickerWindow(5, 20, 0); start != 0 || end != 0 {
-		t.Fatalf("zero visible = %d,%d, want 0,0", start, end)
-	}
-}
-
-func TestSessionPickerKeepsCursorVisible(t *testing.T) {
-	picker := NewSessionPicker(nil)
-	picker.stage = SessionPickerChoosing
-	picker.sessions = make([]session.SessionSummary, 20)
-	for index := range picker.sessions {
-		picker.sessions[index] = session.SessionSummary{
-			ID:    session.SessionID(fmt.Sprintf("ses-%02d", index)),
-			Title: fmt.Sprintf("S%02d", index),
-		}
-	}
-	for cursor := 0; cursor < len(picker.sessions); cursor++ {
-		picker.cursor = cursor
-		view := picker.View("")
-		if marker := fmt.Sprintf("> S%02d", cursor); !strings.Contains(view, marker) {
-			t.Fatalf("session cursor %d not visible:\n%s", cursor, view)
-		}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			start, end := pickerWindow(test.cursor, test.count, test.size)
+			if start != test.start || end != test.end {
+				t.Fatalf("pickerWindow() = %d,%d, want %d,%d", start, end, test.start, test.end)
+			}
+		})
 	}
 }
 
-func TestProviderPickerChooseModelKeepsCursorVisible(t *testing.T) {
-	picker := NewProviderPicker(nil)
-	picker.stage = ProviderPickerChooseModel
-	picker.models = make([]session.ModelOption, 20)
-	for index := range picker.models {
-		picker.models[index] = session.ModelOption{ID: fmt.Sprintf("model-%02d", index)}
-	}
-	for cursor := 0; cursor < len(picker.models); cursor++ {
-		picker.cursor = cursor
-		view := picker.View()
-		if marker := fmt.Sprintf("> model-%02d", cursor); !strings.Contains(view, marker) {
-			t.Fatalf("model cursor %d not visible:\n%s", cursor, view)
+func TestSessionAndWorkspaceViewsKeepSelectedItemVisible(t *testing.T) {
+	model := &Model{sessionID: "session-19"}
+	model.sessionPicker = sessionPicker{active: true, cursor: 19, sessions: make([]codingagent.Session, 20)}
+	model.workspacePicker = workspacePicker{active: true, cursor: 19, items: make([]workspacePickerItem, 20)}
+	for index := 0; index < 20; index++ {
+		model.sessionPicker.sessions[index] = codingagent.Session{ID: codingagent.SessionID(fmt.Sprintf("session-%02d", index)), Title: fmt.Sprintf("Session %02d", index)}
+		model.workspacePicker.items[index] = workspacePickerItem{
+			workspace: codingagent.WorkspaceSummary{ID: codingagent.WorkspaceID(fmt.Sprintf("workspace-%02d", index)), DisplayName: fmt.Sprintf("Workspace %02d", index)},
+			worktree:  codingagent.WorktreeSummary{ID: codingagent.WorktreeID(fmt.Sprintf("worktree-%02d", index)), Root: fmt.Sprintf("/worktree/%02d", index), Availability: codingagent.WorktreeAvailable},
 		}
 	}
-}
-
-func TestProviderPickerChooseProviderKeepsCursorVisible(t *testing.T) {
-	picker := NewProviderPicker(nil)
-	picker.stage = ProviderPickerChooseProvider
-	picker.profiles = make([]session.ProviderProfile, 20)
-	for index := range picker.profiles {
-		picker.profiles[index] = session.ProviderProfile{
-			ID:          session.ProviderProfileID(fmt.Sprintf("prv-%02d", index)),
-			DisplayName: fmt.Sprintf("Provider %02d", index),
-			ModelID:     fmt.Sprintf("model-%02d", index),
-		}
+	if view := model.sessionView(100, 16).Content; !strings.Contains(view, "Session 19") || !strings.Contains(view, "earlier sessions") {
+		t.Fatalf("selected session is not windowed into view: %q", view)
 	}
-	total := len(picker.profiles) + len(providerChoices)
-	for cursor := 0; cursor < total; cursor++ {
-		picker.cursor = cursor
-		view := picker.View()
-		var marker string
-		if cursor < len(picker.profiles) {
-			marker = fmt.Sprintf("> Provider %02d  ·", cursor)
-		} else {
-			marker = "> " + providerChoices[cursor-len(picker.profiles)].DisplayName
-		}
-		if !strings.Contains(view, marker) {
-			t.Fatalf("provider cursor %d not visible:\n%s", cursor, view)
-		}
+	if view := model.workspaceView(100, 16).Content; !strings.Contains(view, "Workspace 19") || !strings.Contains(view, "earlier worktrees") {
+		t.Fatalf("selected worktree is not windowed into view: %q", view)
 	}
 }

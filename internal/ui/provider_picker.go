@@ -1,768 +1,695 @@
 package ui
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"strings"
-	"unicode"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/eaglc/codepilot/internal/session"
+
+	"github.com/eaglc/codepilot/internal/codingagent"
 )
 
-// ProviderPickerStage describes the visible step in the provider/model flow.
-type ProviderPickerStage string
+type providerStage uint8
 
 const (
-	// ProviderPickerClosed indicates that normal composer input owns the keyboard.
-	ProviderPickerClosed ProviderPickerStage = "closed"
-	// ProviderPickerLoadingProfiles indicates that provider profiles are being loaded.
-	ProviderPickerLoadingProfiles ProviderPickerStage = "loading-profiles"
-	// ProviderPickerChooseProvider indicates that the user can select a provider.
-	ProviderPickerChooseProvider ProviderPickerStage = "choose-provider"
-	// ProviderPickerConfiguring indicates that a provider is being configured.
-	ProviderPickerConfiguring ProviderPickerStage = "configuring"
-	// ProviderPickerLoadingModels indicates that provider models are being loaded.
-	ProviderPickerLoadingModels ProviderPickerStage = "loading-models"
-	// ProviderPickerChooseModel indicates that the user can select a model.
-	ProviderPickerChooseModel ProviderPickerStage = "choose-model"
-	// ProviderPickerEnteringConfig indicates that the user is entering configuration details.
-	ProviderPickerEnteringConfig ProviderPickerStage = "entering-configuration"
-	// ProviderPickerSwitching indicates that the selected model is activating.
-	ProviderPickerSwitching ProviderPickerStage = "switching"
-	// ProviderPickerFailed indicates a safe, retryable picker error.
-	ProviderPickerFailed ProviderPickerStage = "failed"
+	providerProfiles providerStage = iota
+	providerModels
+	providerCredential
+	providerForm
 )
 
-// ProviderChoice is a secret-free built-in choice rendered by the TUI.
-type ProviderChoice struct {
-	Kind            string
-	DisplayName     string
-	NeedsCredential bool
-	NeedsEndpoint   bool
+type providerPicker struct {
+	active          bool
+	required        bool
+	stage           providerStage
+	profiles        []codingagent.ProviderProfile
+	models          []providerModelOption
+	selectedProfile codingagent.ProviderProfile
+	cursor          int
+	busy            bool
+	busyMessage     string
+	message         string
+	errorMessage    string
+	form            providerFormState
 }
 
-var providerChoices = []ProviderChoice{
-	{Kind: "openai", DisplayName: "OpenAI", NeedsCredential: true},
-	{Kind: "deepseek", DisplayName: "DeepSeek", NeedsCredential: true},
-	{Kind: "ollama", DisplayName: "Ollama"},
-	{Kind: "openai-compatible", DisplayName: "Custom OpenAI-compatible", NeedsCredential: true, NeedsEndpoint: true},
+type providerModelOption struct {
+	ID          string
+	DisplayName string
+	Reasoning   bool
+	Available   bool
+	Configured  bool
+	Current     bool
 }
 
-const maxProviderFieldRunes = 4096
-
-// ProviderChoices returns the stable picker order without exposing its backing slice.
-func ProviderChoices() []ProviderChoice {
-	return append([]ProviderChoice(nil), providerChoices...)
+type providerFormState struct {
+	id         string
+	kind       string
+	display    string
+	baseURL    string
+	model      string
+	credential []rune
+	field      int
+	cursor     int
 }
 
-// ProviderPicker coordinates asynchronous provider configuration and model switching.
-// Field editing and visual styling remain separate so this state machine can be tested
-// without a terminal.
-type ProviderPicker struct {
-	controller  ModelController
-	stage       ProviderPickerStage
-	profiles    []session.ProviderProfile
-	models      []session.ModelOption
-	profileID   session.ProviderProfileID
-	message     string
-	cancel      context.CancelFunc
-	generation  uint64
-	cursor      int
-	choice      ProviderChoice
-	fields      []providerInputField
-	fieldIndex  int
-	current     session.ModelSelection
-	preferred   string
-	returnStage ProviderPickerStage
+type providerProfilesMsg struct {
+	profiles []codingagent.ProviderProfile
+	err      error
 }
 
-type providerInputField struct {
-	label  string
-	secret bool
-	value  []rune
+type providerModelsMsg struct {
+	profile codingagent.ProviderProfile
+	models  []codingagent.ProviderModel
+	err     error
 }
 
-// NewProviderPicker creates a closed provider picker.
-func NewProviderPicker(controller ModelController) *ProviderPicker {
-	return &ProviderPicker{controller: controller, stage: ProviderPickerClosed}
+type providerSavedMsg struct {
+	profile codingagent.ProviderProfile
+	err     error
 }
 
-// Init returns no command. The owner opens the picker explicitly when needed.
-func (p *ProviderPicker) Init() tea.Cmd {
-	return nil
+type providerSelectedMsg struct {
+	session codingagent.Session
+	err     error
 }
 
-// Open starts a fresh, cancellable profile-loading flow.
-func (p *ProviderPicker) Open(parent context.Context) tea.Cmd {
-	return p.OpenForSelection(parent, session.ModelSelection{})
+func newProviderPicker(message string, required bool) providerPicker {
+	return providerPicker{active: true, required: required, stage: providerProfiles, message: strings.TrimSpace(message)}
 }
 
-// OpenForSelection opens the picker and keeps the active provider/model
-// selected when it is present in the configured profile list.
-func (p *ProviderPicker) OpenForSelection(parent context.Context, current session.ModelSelection) tea.Cmd {
-	ctx := p.resetContext(parent)
-	p.stage = ProviderPickerLoadingProfiles
-	p.message = ""
-	p.models = nil
-	p.profileID = ""
-	p.cursor = 0
-	p.current = current
-	p.preferred = ""
-	p.clearConfiguration()
-	return listProviderProfilesCmd(ctx, p.controller, p.generation)
-}
-
-// Configure validates and stores a provider using a short-lived credential copy.
-// The caller's byte buffer is zeroed before this method returns.
-func (p *ProviderPicker) Configure(request session.ConfigureProviderRequest) tea.Cmd {
-	ctx := p.beginOperation()
-	generation := p.generation
-	p.stage = ProviderPickerConfiguring
-	p.message = ""
-
-	credential := append([]byte(nil), request.CredentialInput...)
-	wipeBytes(request.CredentialInput)
-	request.CredentialInput = credential
+func (m *Model) loadProviderProfiles() tea.Cmd {
+	client, ctx := m.client, m.ctx
+	m.picker.busy = true
+	m.picker.busyMessage = "Loading Provider profiles…"
 	return func() tea.Msg {
-		defer wipeBytes(credential)
-		if p.controller == nil {
-			return providerConfiguredMsg{generation: generation, message: "Provider setup is unavailable."}
-		}
-		profile, err := p.controller.ConfigureProvider(ctx, request)
-		return providerConfiguredMsg{generation: generation, profile: profile, message: pickerErrorMessage(err)}
+		profiles, err := client.ListProviderProfiles(ctx)
+		return providerProfilesMsg{profiles: profiles, err: err}
 	}
 }
 
-// LoadModels fetches choices for an existing provider profile.
-func (p *ProviderPicker) LoadModels(profileID session.ProviderProfileID) tea.Cmd {
-	ctx := p.beginOperation()
-	p.stage = ProviderPickerLoadingModels
-	p.profileID = profileID
-	p.preferred = p.preferredModel(profileID)
-	p.models = nil
-	p.message = ""
-	return listModelsCmd(ctx, p.controller, profileID, p.generation)
-}
-
-// SwitchModel validates and applies a selection at a Session turn boundary.
-func (p *ProviderPicker) SwitchModel(selection session.ModelSelection) tea.Cmd {
-	ctx := p.beginOperation()
-	generation := p.generation
-	p.returnStage = p.stage
-	p.stage = ProviderPickerSwitching
-	p.message = ""
+func (m *Model) loadProviderModels(profile codingagent.ProviderProfile) tea.Cmd {
+	client, ctx := m.client, m.ctx
+	m.picker.busy = true
+	m.picker.busyMessage = "Loading models from " + profile.DisplayName + "…"
+	m.picker.errorMessage = ""
 	return func() tea.Msg {
-		if p.controller == nil {
-			return modelSwitchedMsg{generation: generation, message: "Provider setup is unavailable."}
-		}
-		err := p.controller.SwitchModel(ctx, selection)
-		return modelSwitchedMsg{generation: generation, message: pickerErrorMessage(err)}
+		models, err := client.ListProviderModels(ctx, profile.ID)
+		return providerModelsMsg{profile: profile, models: models, err: err}
 	}
 }
 
-// Cancel stops in-flight work and closes the picker.
-func (p *ProviderPicker) Cancel() {
-	if p.cancel != nil {
-		p.cancel()
-	}
-	p.cancel = nil
-	p.generation++
-	p.stage = ProviderPickerClosed
-	p.models = nil
-	p.message = ""
-	p.cursor = 0
-	p.clearConfiguration()
-}
-
-// Update applies asynchronous command results for composition into the root model.
-func (p *ProviderPicker) Update(message tea.Msg) (*ProviderPicker, tea.Cmd) {
-	switch value := message.(type) {
-	case providerProfilesLoadedMsg:
-		if value.generation != p.generation || p.stage == ProviderPickerClosed {
-			return p, nil
-		}
-		if value.message != "" {
-			p.fail(value.message)
-			return p, nil
-		}
-		p.profiles = deduplicateProfiles(value.profiles, p.current.ProviderProfileID)
-		p.cursor = profileCursor(p.profiles, p.current.ProviderProfileID)
-		p.stage = ProviderPickerChooseProvider
-	case providerConfiguredMsg:
-		if value.generation != p.generation || p.stage == ProviderPickerClosed {
-			return p, nil
-		}
-		if value.message != "" {
-			p.fail(value.message)
-			return p, nil
-		}
-		p.upsertProfile(value.profile)
-		return p, p.LoadModels(value.profile.ID)
-	case providerModelsLoadedMsg:
-		if value.generation != p.generation || p.stage == ProviderPickerClosed {
-			return p, nil
-		}
-		if value.message != "" {
-			p.fail(value.message)
-			return p, nil
-		}
-		p.models = deduplicateModels(value.models)
-		p.cursor = modelCursor(p.models, p.preferred)
-		p.stage = ProviderPickerChooseModel
-	case modelSwitchedMsg:
-		if value.generation != p.generation || p.stage == ProviderPickerClosed {
-			return p, nil
-		}
-		if value.message != "" {
-			p.stage = p.returnStage
-			if p.stage != ProviderPickerChooseProvider && p.stage != ProviderPickerChooseModel {
-				p.stage = ProviderPickerChooseProvider
-			}
-			p.message = value.message
-			return p, nil
-		}
-		p.Cancel()
-	}
-	return p, nil
-}
-
-// HandleKey applies picker navigation and field editing on the Bubble Tea loop.
-func (p *ProviderPicker) HandleKey(message tea.KeyPressMsg) tea.Cmd {
-	if p == nil || p.stage == ProviderPickerClosed {
-		return nil
-	}
-	key := message.Key()
-	if key.Code == tea.KeyEscape || key.Code == tea.KeyEsc {
-		p.Cancel()
-		return nil
-	}
-	switch p.stage {
-	case ProviderPickerChooseProvider:
-		count := len(p.profiles) + len(providerChoices)
-		if movePickerCursor(&p.cursor, message, count) {
-			return nil
-		}
-		if isEnterKey(key.Code) {
-			if p.cursor < len(p.profiles) {
-				profile := p.profiles[p.cursor]
-				selection := session.ModelSelection{ProviderProfileID: profile.ID, ModelID: profile.ModelID}
-				if selection == p.current {
-					p.Cancel()
-					return nil
-				}
-				return p.SwitchModel(selection)
-			}
-			return p.beginConfiguration(providerChoices[p.cursor-len(p.profiles)])
-		}
-	case ProviderPickerChooseModel:
-		if movePickerCursor(&p.cursor, message, len(p.models)) {
-			return nil
-		}
-		if isEnterKey(key.Code) && len(p.models) > 0 {
-			model := p.models[p.cursor]
-			return p.SwitchModel(session.ModelSelection{ProviderProfileID: p.profileID, ModelID: model.ID})
-		}
-	case ProviderPickerEnteringConfig:
-		return p.handleConfigurationKey(key)
-	case ProviderPickerFailed:
-		if isEnterKey(key.Code) {
-			return p.Open(context.Background())
-		}
-	}
-	return nil
-}
-
-// HandlePaste appends bracketed-paste content to the active configuration
-// field. Control sequences are removed before any non-secret field is rendered.
-func (p *ProviderPicker) HandlePaste(message tea.PasteMsg) {
-	if p == nil || p.stage != ProviderPickerEnteringConfig {
+func (m *Model) applyProviderProfiles(message providerProfilesMsg) {
+	m.picker.busy = false
+	m.picker.busyMessage = ""
+	if message.err != nil {
+		m.picker.errorMessage = safeError(message.err)
 		return
 	}
-	if len(p.fields) == 0 || p.fieldIndex < 0 || p.fieldIndex >= len(p.fields) {
-		p.fail("Provider configuration fields are unavailable.")
-		return
-	}
-	input := sanitizePasteRunes(message.Content, false)
-	if len(input) == 0 {
-		return
-	}
-	p.message = ""
-	field := &p.fields[p.fieldIndex]
-	remaining := maxProviderFieldRunes - len(field.value)
-	if remaining <= 0 {
-		return
-	}
-	if len(input) > remaining {
-		input = input[:remaining]
-	}
-	field.value = append(field.value, input...)
-}
-
-// View returns a minimal accessible representation for the surrounding TUI.
-func (p *ProviderPicker) View() string {
-	if p == nil || p.stage == ProviderPickerClosed {
-		return ""
-	}
-	if p.stage == ProviderPickerFailed {
-		return "Provider setup failed\n" + p.message
-	}
-	switch p.stage {
-	case ProviderPickerLoadingProfiles:
-		return "Provider setup\nLoading configured providers..."
-	case ProviderPickerChooseProvider:
-		lines := []string{"Select provider or model", "", "Configured models"}
-		if p.message != "" {
-			lines = append(lines, "Error: "+p.message)
+	m.picker.profiles = message.profiles
+	m.picker.stage = providerProfiles
+	m.picker.cursor = 0
+	for index, profile := range message.profiles {
+		if profile.ID == m.snapshot.Session.ProviderProfileID {
+			m.picker.cursor = index
+			break
 		}
-		total := len(p.profiles) + len(providerChoices)
-		start, end := pickerWindow(p.cursor, total, maxVisiblePickerItems)
-		if len(p.profiles) == 0 {
-			lines = append(lines, "  None configured")
-		} else if start > 0 {
-			lines = append(lines, "  …")
-		}
-		profileEnd := min(end, len(p.profiles))
-		for index := start; index < profileEnd; index++ {
-			profile := p.profiles[index]
-			label := fmt.Sprintf("%s  ·  %s", profile.DisplayName, profile.ModelID)
-			if profile.ID == p.current.ProviderProfileID && profile.ModelID == p.current.ModelID {
-				label += "  (current)"
-			}
-			lines = append(lines, pickerLine(index == p.cursor, label))
-		}
-		if profileEnd < len(p.profiles) {
-			lines = append(lines, "  …")
-		}
-		lines = append(lines, "", "Add provider")
-		choiceStart := len(p.profiles)
-		for index := max(start, choiceStart); index < end; index++ {
-			choice := providerChoices[index-choiceStart]
-			lines = append(lines, pickerLine(index == p.cursor, choice.DisplayName))
-		}
-		if end < total {
-			lines = append(lines, "  …")
-		}
-		return strings.Join(lines, "\n")
-	case ProviderPickerEnteringConfig:
-		lines := []string{"Configure " + p.choice.DisplayName, "Credentials are checked now; the selected model is validated afterward."}
-		if p.message != "" {
-			lines = append(lines, "Error: "+p.message)
-		}
-		for index, field := range p.fields {
-			value := string(field.value)
-			if field.secret {
-				value = strings.Repeat("•", len(field.value))
-			}
-			if value == "" {
-				value = "<required>"
-			}
-			lines = append(lines, pickerLine(index == p.fieldIndex, field.label+": "+value))
-		}
-		return strings.Join(lines, "\n")
-	case ProviderPickerConfiguring:
-		return "Provider setup\nChecking credentials and endpoint..."
-	case ProviderPickerLoadingModels:
-		return "Provider setup\nLoading available models..."
-	case ProviderPickerChooseModel:
-		lines := []string{"Select model"}
-		if p.message != "" {
-			lines = append(lines, "Error: "+p.message)
-		}
-		start, end := pickerWindow(p.cursor, len(p.models), maxVisiblePickerItems)
-		if start > 0 {
-			lines = append(lines, "  …")
-		}
-		for index := start; index < end; index++ {
-			model := p.models[index]
-			label := model.DisplayName
-			if label == "" {
-				label = model.ID
-			}
-			if model.Recommended {
-				label += " (recommended)"
-			}
-			lines = append(lines, pickerLine(index == p.cursor, label))
-		}
-		if end < len(p.models) {
-			lines = append(lines, "  …")
-		}
-		if len(p.models) == 0 {
-			lines = append(lines, "No models were returned.")
-		}
-		return strings.Join(lines, "\n")
-	case ProviderPickerSwitching:
-		return "Provider setup\nValidating selected model..."
-	default:
-		return fmt.Sprintf("Provider setup: %s", p.stage)
 	}
 }
 
-// Stage returns the current picker stage.
-func (p *ProviderPicker) Stage() ProviderPickerStage {
-	if p == nil {
-		return ProviderPickerClosed
-	}
-	return p.stage
-}
-
-// Profiles returns a secret-free defensive copy.
-func (p *ProviderPicker) Profiles() []session.ProviderProfile {
-	if p == nil {
-		return nil
-	}
-	return append([]session.ProviderProfile(nil), p.profiles...)
-}
-
-// Models returns a defensive copy of the current profile's model choices.
-func (p *ProviderPicker) Models() []session.ModelOption {
-	if p == nil {
-		return nil
-	}
-	return append([]session.ModelOption(nil), p.models...)
-}
-
-// ProfileID identifies the profile whose models are currently displayed.
-func (p *ProviderPicker) ProfileID() session.ProviderProfileID {
-	if p == nil {
-		return ""
-	}
-	return p.profileID
-}
-
-// Message returns the safe user-facing failure message.
-func (p *ProviderPicker) Message() string {
-	if p == nil {
-		return ""
-	}
-	return p.message
-}
-
-func (p *ProviderPicker) resetContext(parent context.Context) context.Context {
-	if p.cancel != nil {
-		p.cancel()
-	}
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, cancel := context.WithCancel(parent)
-	p.cancel = cancel
-	p.generation++
-	return ctx
-}
-
-func (p *ProviderPicker) beginOperation() context.Context {
-	if p.cancel != nil {
-		p.cancel()
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	p.cancel = cancel
-	p.generation++
-	return ctx
-}
-
-func (p *ProviderPicker) fail(message string) {
-	p.stage = ProviderPickerFailed
-	p.message = message
-}
-
-func (p *ProviderPicker) beginConfiguration(choice ProviderChoice) tea.Cmd {
-	p.choice = choice
-	p.cursor = 0
-	p.fieldIndex = 0
-	p.fields = nil
-	if choice.NeedsEndpoint {
-		p.fields = append(p.fields,
-			providerInputField{label: "Base URL"},
-			providerInputField{label: "Model ID"},
-		)
-	}
-	if choice.NeedsCredential {
-		p.fields = append(p.fields, providerInputField{label: "API key", secret: true})
-	}
-	if len(p.fields) == 0 {
-		return p.Configure(session.ConfigureProviderRequest{Kind: choice.Kind, DisplayName: choice.DisplayName})
-	}
-	p.stage = ProviderPickerEnteringConfig
-	return nil
-}
-
-func (p *ProviderPicker) handleConfigurationKey(key tea.Key) tea.Cmd {
-	if len(p.fields) == 0 || p.fieldIndex < 0 || p.fieldIndex >= len(p.fields) {
-		p.fail("Provider configuration fields are unavailable.")
-		return nil
-	}
-	field := &p.fields[p.fieldIndex]
-	if key.Code == tea.KeyBackspace {
-		if len(field.value) > 0 {
-			field.value[len(field.value)-1] = 0
-			field.value = field.value[:len(field.value)-1]
-		}
-		return nil
-	}
-	if isEnterKey(key.Code) {
-		if strings.TrimSpace(string(field.value)) == "" {
-			p.message = field.label + " is required."
-			return nil
-		}
-		p.message = ""
-		if p.fieldIndex < len(p.fields)-1 {
-			p.fieldIndex++
-			return nil
-		}
-		request := p.configurationRequest()
-		command := p.Configure(request)
-		p.clearConfiguration()
-		return command
-	}
-	if key.Text != "" && key.Mod&tea.ModCtrl == 0 {
-		remaining := maxProviderFieldRunes - len(field.value)
-		if remaining <= 0 {
-			return nil
-		}
-		input := []rune(key.Text)
-		if len(input) > remaining {
-			input = input[:remaining]
-		}
-		field.value = append(field.value, input...)
-	}
-	return nil
-}
-
-// sanitizePasteRunes strips terminal control sequences before pasted content
-// reaches either a rendered field or an in-memory credential buffer.
-func sanitizePasteRunes(value string, allowNewlines bool) []rune {
-	value = strings.ReplaceAll(ansi.Strip(value), "\r\n", "\n")
-	result := make([]rune, 0, len(value))
-	for _, current := range value {
-		switch current {
-		case '\n', '\r':
-			if allowNewlines {
-				result = append(result, '\n')
-			}
-		default:
-			if !unicode.IsControl(current) {
-				result = append(result, current)
+func (m *Model) applyProviderModels(message providerModelsMsg) {
+	m.picker.busy = false
+	m.picker.busyMessage = ""
+	m.picker.selectedProfile = message.profile
+	m.picker.models = m.mergeProviderModels(message.profile, message.models)
+	m.picker.stage = providerModels
+	m.picker.cursor = 0
+	for index, model := range m.picker.models {
+		if model.Current || model.Configured {
+			m.picker.cursor = index
+			if model.Current {
+				break
 			}
 		}
 	}
-	return result
-}
-
-func (p *ProviderPicker) configurationRequest() session.ConfigureProviderRequest {
-	request := session.ConfigureProviderRequest{Kind: p.choice.Kind, DisplayName: p.choice.DisplayName}
-	for _, field := range p.fields {
-		switch field.label {
-		case "Base URL":
-			request.BaseURL = strings.TrimSpace(string(field.value))
-		case "Model ID":
-			request.ModelID = strings.TrimSpace(string(field.value))
-		case "API key":
-			request.CredentialInput = []byte(string(field.value))
-		}
-	}
-	return request
-}
-
-func (p *ProviderPicker) clearConfiguration() {
-	for fieldIndex := range p.fields {
-		for valueIndex := range p.fields[fieldIndex].value {
-			p.fields[fieldIndex].value[valueIndex] = 0
-		}
-	}
-	p.fields = nil
-	p.fieldIndex = 0
-	p.choice = ProviderChoice{}
-}
-
-func movePickerCursor(cursor *int, message tea.KeyPressMsg, count int) bool {
-	if count <= 0 {
-		*cursor = 0
-		return false
-	}
-	switch pickerNavigationDirection(message) {
-	case -1:
-		*cursor = (*cursor - 1 + count) % count
-		return true
-	case 1:
-		*cursor = (*cursor + 1) % count
-		return true
-	default:
-		return false
+	if message.err != nil {
+		m.picker.errorMessage = safeError(message.err) + "  Saved model choices are still shown; selecting one retries the access check."
+	} else if len(m.picker.models) == 0 {
+		m.picker.errorMessage = "No models were returned. Edit the profile or install a model."
+	} else {
+		m.picker.errorMessage = ""
 	}
 }
 
-// pickerNavigationDirection also checks alternate key codes because the
-// Windows Console API can report a physical arrow through BaseCode while Code
-// is empty or contains translated text.
-func pickerNavigationDirection(message tea.KeyPressMsg) int {
-	key := message.Key()
-	for _, code := range []rune{key.Code, key.BaseCode, key.ShiftedCode} {
-		switch code {
-		case tea.KeyUp:
-			return -1
-		case tea.KeyDown:
-			return 1
-		}
-	}
-	keystroke := strings.ToLower(strings.TrimSpace(message.Keystroke()))
-	switch {
-	case keystroke == "up" || strings.HasSuffix(keystroke, "+up"):
-		return -1
-	case keystroke == "down" || strings.HasSuffix(keystroke, "+down"):
-		return 1
-	default:
-		return 0
-	}
-}
-
-func pickerLine(selected bool, value string) string {
-	if selected {
-		return "> " + value
-	}
-	return "  " + value
-}
-
-func isEnterKey(code rune) bool {
-	return code == tea.KeyEnter || code == tea.KeyReturn || code == tea.KeyKpEnter
-}
-
-func (p *ProviderPicker) upsertProfile(profile session.ProviderProfile) {
-	for index := range p.profiles {
-		if p.profiles[index].ID == profile.ID {
-			p.profiles[index] = profile
+func (m *Model) mergeProviderModels(profile codingagent.ProviderProfile, discovered []codingagent.ProviderModel) []providerModelOption {
+	values := make([]providerModelOption, 0, len(discovered)+2)
+	indexes := make(map[string]int, len(discovered)+2)
+	add := func(id, display string, available, configured, current, reasoning bool) {
+		id = strings.TrimSpace(id)
+		if id == "" {
 			return
 		}
-	}
-	p.profiles = append(p.profiles, profile)
-}
-
-func (p *ProviderPicker) preferredModel(profileID session.ProviderProfileID) string {
-	if profileID == p.current.ProviderProfileID && strings.TrimSpace(p.current.ModelID) != "" {
-		return p.current.ModelID
-	}
-	for _, profile := range p.profiles {
-		if profile.ID == profileID {
-			return profile.ModelID
-		}
-	}
-	return ""
-}
-
-// deduplicateProfiles keeps the active profile selectable; otherwise the most
-// recently validated duplicate represents the same provider/model endpoint.
-func deduplicateProfiles(values []session.ProviderProfile, currentID session.ProviderProfileID) []session.ProviderProfile {
-	result := make([]session.ProviderProfile, 0, len(values))
-	indexes := make(map[string]int, len(values))
-	for _, value := range values {
-		key := strings.ToLower(strings.TrimSpace(value.Kind)) + "\x00" +
-			strings.ToLower(strings.TrimRight(strings.TrimSpace(value.BaseURL), "/")) + "\x00" +
-			strings.ToLower(strings.TrimSpace(value.ModelID))
-		if index, exists := indexes[key]; exists {
-			if value.ID == currentID || (result[index].ID != currentID && value.ValidatedAt.After(result[index].ValidatedAt)) {
-				result[index] = value
+		if index, ok := indexes[id]; ok {
+			values[index].Available = values[index].Available || available
+			values[index].Configured = values[index].Configured || configured
+			values[index].Current = values[index].Current || current
+			values[index].Reasoning = values[index].Reasoning || reasoning
+			if values[index].DisplayName == "" && strings.TrimSpace(display) != "" {
+				values[index].DisplayName = strings.TrimSpace(display)
 			}
-			continue
+			return
 		}
-		indexes[key] = len(result)
-		result = append(result, value)
+		display = strings.TrimSpace(display)
+		if display == "" {
+			display = id
+		}
+		indexes[id] = len(values)
+		values = append(values, providerModelOption{ID: id, DisplayName: display, Available: available, Configured: configured, Current: current, Reasoning: reasoning})
 	}
-	return result
+	if profile.ID == m.snapshot.Session.ProviderProfileID {
+		add(m.snapshot.Session.ModelID, m.snapshot.Session.ModelID, false, true, true, false)
+	}
+	add(profile.DefaultModel, profile.DefaultModel, false, true, false, false)
+	for _, model := range discovered {
+		add(model.ID, model.DisplayName, true, false, false, model.Reasoning)
+	}
+	return values
 }
 
-func deduplicateModels(values []session.ModelOption) []session.ModelOption {
-	result := make([]session.ModelOption, 0, len(values))
-	indexes := make(map[string]int, len(values))
-	for _, value := range values {
-		key := strings.ToLower(strings.TrimSpace(value.ID))
-		if key == "" {
-			continue
-		}
-		if index, exists := indexes[key]; exists {
-			result[index].Recommended = result[index].Recommended || value.Recommended
-			continue
-		}
-		indexes[key] = len(result)
-		result = append(result, value)
+func (m *Model) applyProviderSaved(message providerSavedMsg) tea.Cmd {
+	m.picker.busy = false
+	m.picker.busyMessage = ""
+	if message.err != nil {
+		m.picker.errorMessage = safeError(message.err)
+		return nil
 	}
-	return result
+	m.clearProviderSecret()
+	if message.profile.RequiresCredential && !message.profile.CredentialConfigured {
+		m.beginProviderCredential(message.profile)
+		m.picker.errorMessage = "The API key was not stored. Enter a non-empty API key and try again."
+		return nil
+	}
+	m.picker.message = "Configuration saved."
+	return m.loadProviderModels(message.profile)
 }
 
-func profileCursor(values []session.ProviderProfile, id session.ProviderProfileID) int {
-	for index, value := range values {
-		if value.ID == id {
-			return index
-		}
+func (m *Model) applyProviderSelected(message providerSelectedMsg) tea.Cmd {
+	m.picker.busy = false
+	m.picker.busyMessage = ""
+	if message.err != nil {
+		m.picker.errorMessage = safeError(message.err)
+		return nil
 	}
-	return 0
+	m.snapshot.Session = message.session
+	m.picker = providerPicker{}
+	m.errorMessage = ""
+	m.status = "Ready"
+	return m.loadSnapshot()
 }
 
-func modelCursor(values []session.ModelOption, id string) int {
-	for index, value := range values {
-		if value.ID == id {
-			return index
-		}
+func (m *Model) handleProviderKey(message tea.KeyPressMsg) tea.Cmd {
+	key := message.Key()
+	if key.Mod&tea.ModCtrl != 0 && key.Code == 'c' {
+		return tea.Quit
 	}
-	return 0
+	if m.picker.busy {
+		return nil
+	}
+	if key.Code == tea.KeyEscape || key.Code == tea.KeyEsc {
+		if m.picker.stage != providerProfiles {
+			m.clearProviderSecret()
+			m.picker.stage = providerProfiles
+			m.picker.errorMessage = ""
+			return nil
+		}
+		if !m.picker.required {
+			m.picker = providerPicker{}
+		} else {
+			m.picker.errorMessage = "A working Provider and model must be selected before chatting."
+		}
+		return nil
+	}
+	switch m.picker.stage {
+	case providerProfiles:
+		return m.handleProviderProfilesKey(key)
+	case providerModels:
+		return m.handleProviderModelsKey(key)
+	case providerCredential:
+		return m.handleProviderCredentialKey(key)
+	case providerForm:
+		return m.handleProviderFormKey(key)
+	}
+	return nil
 }
 
-func listProviderProfilesCmd(ctx context.Context, controller ModelController, generation uint64) tea.Cmd {
+func (m *Model) handleProviderProfilesKey(key tea.Key) tea.Cmd {
+	switch key.Code {
+	case tea.KeyUp:
+		m.picker.cursor = max(0, m.picker.cursor-1)
+	case tea.KeyDown:
+		m.picker.cursor = min(max(0, len(m.picker.profiles)-1), m.picker.cursor+1)
+	case tea.KeyEnter:
+		if profile, ok := m.currentProviderProfile(); ok {
+			if profile.RequiresCredential && !profile.CredentialConfigured {
+				m.beginProviderCredential(profile)
+				return nil
+			}
+			return m.loadProviderModels(profile)
+		}
+	default:
+		switch strings.ToLower(key.Text) {
+		case "n":
+			m.beginProviderForm(codingagent.ProviderProfile{})
+		case "e":
+			if profile, ok := m.currentProviderProfile(); ok {
+				m.beginProviderForm(profile)
+			}
+		case "k":
+			if profile, ok := m.currentProviderProfile(); ok {
+				m.beginProviderCredential(profile)
+			}
+		case "r":
+			return m.loadProviderProfiles()
+		}
+	}
+	return nil
+}
+
+func (m *Model) handleProviderModelsKey(key tea.Key) tea.Cmd {
+	switch key.Code {
+	case tea.KeyUp:
+		m.picker.cursor = max(0, m.picker.cursor-1)
+	case tea.KeyDown:
+		m.picker.cursor = min(max(0, len(m.picker.models)-1), m.picker.cursor+1)
+	case tea.KeyEnter:
+		if len(m.picker.models) == 0 {
+			return nil
+		}
+		model := m.picker.models[m.picker.cursor]
+		client, ctx, sessionID, profileID := m.client, m.ctx, m.sessionID, m.picker.selectedProfile.ID
+		m.picker.busy = true
+		m.picker.busyMessage = "Checking API access for " + model.ID + "…"
+		m.picker.errorMessage = ""
+		return func() tea.Msg {
+			session, err := client.SelectProviderModel(ctx, sessionID, profileID, model.ID)
+			return providerSelectedMsg{session: session, err: err}
+		}
+	default:
+		switch strings.ToLower(key.Text) {
+		case "e":
+			m.beginProviderForm(m.picker.selectedProfile)
+		case "k":
+			m.beginProviderCredential(m.picker.selectedProfile)
+		}
+	}
+	return nil
+}
+
+func (m *Model) beginProviderForm(profile codingagent.ProviderProfile) {
+	form := providerFormState{id: profile.ID, kind: profile.Kind, display: profile.DisplayName, baseURL: profile.BaseURL, model: profile.DefaultModel}
+	if form.kind == "" {
+		form.kind, form.display, form.model = "openai", "OpenAI", "gpt-5.6-sol"
+	}
+	m.picker.form = form
+	m.picker.stage = providerForm
+	m.picker.selectedProfile = profile
+	m.picker.message = ""
+	m.picker.errorMessage = ""
+}
+
+func (m *Model) beginProviderCredential(profile codingagent.ProviderProfile) {
+	if !profile.RequiresCredential {
+		m.picker.errorMessage = profile.DisplayName + " does not use an API key."
+		return
+	}
+	m.clearProviderSecret()
+	m.picker.selectedProfile = profile
+	m.picker.form = providerFormState{
+		id: profile.ID, kind: profile.Kind, display: profile.DisplayName, baseURL: profile.BaseURL,
+		model: profile.DefaultModel, field: 4,
+	}
+	m.picker.stage = providerCredential
+	m.picker.message = ""
+	m.picker.errorMessage = ""
+}
+
+func (m *Model) handleProviderCredentialKey(key tea.Key) tea.Cmd {
+	if key.Code == tea.KeyEnter {
+		return m.saveProviderCredential()
+	}
+	form := &m.picker.form
+	value := []rune(m.providerFormValue())
+	switch key.Code {
+	case tea.KeyLeft:
+		form.cursor = max(0, form.cursor-1)
+	case tea.KeyRight:
+		form.cursor = min(len(value), form.cursor+1)
+	case tea.KeyHome:
+		form.cursor = 0
+	case tea.KeyEnd:
+		form.cursor = len(value)
+	case tea.KeyBackspace:
+		if form.cursor > 0 {
+			value = append(value[:form.cursor-1], value[form.cursor:]...)
+			form.cursor--
+			m.setProviderFormValue(value)
+		}
+	case tea.KeyDelete:
+		if form.cursor < len(value) {
+			value = append(value[:form.cursor], value[form.cursor+1:]...)
+			m.setProviderFormValue(value)
+		}
+	default:
+		if key.Text != "" && key.Mod&tea.ModCtrl == 0 {
+			m.insertProviderFormRunes([]rune(key.Text))
+		}
+	}
+	return nil
+}
+
+func (m *Model) handleProviderFormKey(key tea.Key) tea.Cmd {
+	form := &m.picker.form
+	if form.field == 0 {
+		if form.id == "" && (key.Code == tea.KeyLeft || key.Code == tea.KeyRight || key.Code == tea.KeyUp || key.Code == tea.KeyDown) {
+			m.cycleProviderKind(key.Code == tea.KeyRight || key.Code == tea.KeyDown)
+			return nil
+		}
+		if key.Code == tea.KeyEnter || key.Code == tea.KeyTab {
+			form.field++
+			form.cursor = len([]rune(m.providerFormValue()))
+		}
+		return nil
+	}
+	if key.Code == tea.KeyTab || key.Code == tea.KeyEnter {
+		if form.field == 4 {
+			return m.saveProviderForm()
+		}
+		form.field++
+		form.cursor = len([]rune(m.providerFormValue()))
+		return nil
+	}
+	value := []rune(m.providerFormValue())
+	switch key.Code {
+	case tea.KeyLeft:
+		form.cursor = max(0, form.cursor-1)
+	case tea.KeyRight:
+		form.cursor = min(len(value), form.cursor+1)
+	case tea.KeyHome:
+		form.cursor = 0
+	case tea.KeyEnd:
+		form.cursor = len(value)
+	case tea.KeyBackspace:
+		if form.cursor > 0 {
+			value = append(value[:form.cursor-1], value[form.cursor:]...)
+			form.cursor--
+			m.setProviderFormValue(value)
+		}
+	case tea.KeyDelete:
+		if form.cursor < len(value) {
+			value = append(value[:form.cursor], value[form.cursor+1:]...)
+			m.setProviderFormValue(value)
+		}
+	default:
+		if key.Text != "" && key.Mod&tea.ModCtrl == 0 {
+			m.insertProviderFormRunes([]rune(key.Text))
+		}
+	}
+	return nil
+}
+
+func (m *Model) pasteProviderInput(value string) {
+	if !m.picker.active || (m.picker.stage != providerForm && m.picker.stage != providerCredential) || m.picker.busy || m.picker.form.field == 0 {
+		return
+	}
+	m.insertProviderFormRunes([]rune(value))
+}
+
+func (m *Model) insertProviderFormRunes(inserted []rune) {
+	form := &m.picker.form
+	limit := 1024
+	if form.field == 4 {
+		limit = 4096
+	}
+	value := []rune(m.providerFormValue())
+	if len(value) >= limit {
+		return
+	}
+	if len(inserted) > limit-len(value) {
+		inserted = inserted[:limit-len(value)]
+	}
+	result := make([]rune, 0, len(value)+len(inserted))
+	result = append(result, value[:form.cursor]...)
+	result = append(result, inserted...)
+	result = append(result, value[form.cursor:]...)
+	form.cursor += len(inserted)
+	m.setProviderFormValue(result)
+}
+
+func (m *Model) providerFormValue() string {
+	switch m.picker.form.field {
+	case 0:
+		return m.picker.form.kind
+	case 1:
+		return m.picker.form.display
+	case 2:
+		return m.picker.form.baseURL
+	case 3:
+		return m.picker.form.model
+	default:
+		return string(m.picker.form.credential)
+	}
+}
+
+func (m *Model) setProviderFormValue(value []rune) {
+	switch m.picker.form.field {
+	case 1:
+		m.picker.form.display = string(value)
+	case 2:
+		m.picker.form.baseURL = string(value)
+	case 3:
+		m.picker.form.model = string(value)
+	case 4:
+		for index := range m.picker.form.credential {
+			m.picker.form.credential[index] = 0
+		}
+		m.picker.form.credential = append([]rune(nil), value...)
+	}
+}
+
+func (m *Model) cycleProviderKind(forward bool) {
+	kinds := []string{"openai", "deepseek", "ollama"}
+	index := 0
+	for candidate := range kinds {
+		if kinds[candidate] == m.picker.form.kind {
+			index = candidate
+			break
+		}
+	}
+	if forward {
+		index = (index + 1) % len(kinds)
+	} else {
+		index = (index + len(kinds) - 1) % len(kinds)
+	}
+	m.picker.form.kind = kinds[index]
+	switch kinds[index] {
+	case "openai":
+		m.picker.form.display, m.picker.form.model = "OpenAI", "gpt-5.6-sol"
+	case "deepseek":
+		m.picker.form.display, m.picker.form.model = "DeepSeek", "deepseek-v4-flash"
+	case "ollama":
+		m.picker.form.display, m.picker.form.model, m.picker.form.credential = "Ollama", "qwen-coder", nil
+	}
+}
+
+func (m *Model) saveProviderForm() tea.Cmd {
+	form := &m.picker.form
+	credential := []byte(string(form.credential))
+	request := codingagent.ConfigureProviderRequest{
+		ID: form.id, Kind: form.kind, DisplayName: strings.TrimSpace(form.display), BaseURL: strings.TrimSpace(form.baseURL),
+		DefaultModel: strings.TrimSpace(form.model), Credential: credential,
+	}
+	m.clearProviderSecret()
+	client, ctx := m.client, m.ctx
+	m.picker.busy = true
+	m.picker.busyMessage = "Saving Provider profile…"
+	m.picker.errorMessage = ""
 	return func() tea.Msg {
-		if controller == nil {
-			return providerProfilesLoadedMsg{generation: generation, message: "Provider setup is unavailable."}
+		profile, err := client.ConfigureProvider(ctx, request)
+		for index := range credential {
+			credential[index] = 0
 		}
-		profiles, err := controller.ListProviderProfiles(ctx)
-		return providerProfilesLoadedMsg{generation: generation, profiles: profiles, message: pickerErrorMessage(err)}
+		return providerSavedMsg{profile: profile, err: err}
 	}
 }
 
-func listModelsCmd(ctx context.Context, controller ModelController, profileID session.ProviderProfileID, generation uint64) tea.Cmd {
+func (m *Model) saveProviderCredential() tea.Cmd {
+	form := &m.picker.form
+	if len(form.credential) == 0 {
+		m.picker.errorMessage = "API key cannot be empty."
+		return nil
+	}
+	credential := []byte(string(form.credential))
+	request := codingagent.ConfigureProviderRequest{
+		ID: form.id, Kind: form.kind, DisplayName: form.display, BaseURL: form.baseURL,
+		DefaultModel: form.model, Credential: credential,
+	}
+	m.clearProviderSecret()
+	client, ctx := m.client, m.ctx
+	m.picker.busy = true
+	m.picker.busyMessage = "Saving API key…"
+	m.picker.errorMessage = ""
 	return func() tea.Msg {
-		if controller == nil {
-			return providerModelsLoadedMsg{generation: generation, message: "Provider setup is unavailable."}
+		profile, err := client.ConfigureProvider(ctx, request)
+		for index := range credential {
+			credential[index] = 0
 		}
-		models, err := controller.ListModels(ctx, profileID)
-		return providerModelsLoadedMsg{generation: generation, models: models, message: pickerErrorMessage(err)}
+		return providerSavedMsg{profile: profile, err: err}
 	}
 }
 
-func pickerErrorMessage(err error) string {
-	if err == nil {
-		return ""
+func (m *Model) clearProviderSecret() {
+	for index := range m.picker.form.credential {
+		m.picker.form.credential[index] = 0
 	}
-	if errors.Is(err, context.Canceled) {
-		return "Provider setup was cancelled."
+	m.picker.form.credential = nil
+}
+
+func (m *Model) currentProviderProfile() (codingagent.ProviderProfile, bool) {
+	if len(m.picker.profiles) == 0 || m.picker.cursor < 0 || m.picker.cursor >= len(m.picker.profiles) {
+		return codingagent.ProviderProfile{}, false
 	}
-	return SafeErrorMessage(err, "Provider setup could not be completed.")
+	return m.picker.profiles[m.picker.cursor], true
 }
 
-func wipeBytes(value []byte) {
-	for index := range value {
-		value[index] = 0
+func (m *Model) providerView(width, height int) tea.View {
+	lines := []string{truncateANSI(theme.header.Render("CodePilot")+theme.muted.Render("  Provider & model setup"), width), ""}
+	var viewCursor *tea.Cursor
+	switch m.picker.stage {
+	case providerProfiles:
+		lines = append(lines, theme.assistant.Render("Choose a Provider profile"))
+		if len(m.picker.profiles) == 0 && !m.picker.busy {
+			lines = append(lines, theme.muted.Render("  No profiles. Press n to create one."))
+		}
+		start, end := pickerWindow(m.picker.cursor, len(m.picker.profiles), max(1, height-10))
+		if start > 0 {
+			lines = append(lines, theme.muted.Render("  …"))
+		}
+		for index := start; index < end; index++ {
+			profile := m.picker.profiles[index]
+			marker := "  "
+			if index == m.picker.cursor {
+				marker = "❯ "
+			}
+			credential := ""
+			if profile.RequiresCredential && !profile.CredentialConfigured {
+				credential = "  credential required"
+			} else if profile.RequiresCredential {
+				credential = "  API key configured"
+			}
+			configuredModel := profile.DefaultModel
+			if profile.ID == m.snapshot.Session.ProviderProfileID && strings.TrimSpace(m.snapshot.Session.ModelID) != "" {
+				configuredModel = m.snapshot.Session.ModelID + "  current"
+			}
+			lines = append(lines, marker+profile.DisplayName+theme.muted.Render("  "+profile.Kind+"  "+configuredModel+credential))
+		}
+		if end < len(m.picker.profiles) {
+			lines = append(lines, theme.muted.Render("  …"))
+		}
+		lines = append(lines, "", theme.muted.Render("↑/↓ choose  Enter continue  k API key  e advanced  n new  r refresh  Esc close"))
+	case providerModels:
+		lines = append(lines, theme.assistant.Render("Choose a model for "+m.picker.selectedProfile.DisplayName))
+		start, end := pickerWindow(m.picker.cursor, len(m.picker.models), max(1, height-10))
+		if start > 0 {
+			lines = append(lines, theme.muted.Render("  …"))
+		}
+		for index := start; index < end; index++ {
+			model := m.picker.models[index]
+			marker := "  "
+			if index == m.picker.cursor {
+				marker = "❯ "
+			}
+			badges := ""
+			if model.Current {
+				badges += "  current"
+			} else if model.Configured {
+				badges += "  configured"
+			}
+			if !model.Available {
+				badges += "  saved"
+			}
+			lines = append(lines, marker+model.DisplayName+theme.muted.Render(badges))
+		}
+		if end < len(m.picker.models) {
+			lines = append(lines, theme.muted.Render("  …"))
+		}
+		lines = append(lines, "", theme.muted.Render("↑/↓ choose  Enter check access & select  k change API key  e advanced  Esc back"))
+	case providerCredential:
+		lines = append(lines, theme.assistant.Render("API key for "+m.picker.selectedProfile.DisplayName))
+		lines = append(lines, "", theme.muted.Render("  Provider: ")+m.picker.selectedProfile.DisplayName)
+		prefix := theme.muted.Render("❯ API key: ")
+		masked := []rune(strings.Repeat("•", len(m.picker.form.credential)))
+		viewport := renderInputViewport(masked, m.picker.form.cursor, max(1, width-ansi.StringWidth(prefix)))
+		cursorY := len(lines)
+		lines = append(lines, prefix+viewport.text)
+		if !m.picker.busy {
+			viewCursor = nativeTextCursor(ansi.StringWidth(prefix)+viewport.cursorOffset, cursorY)
+		}
+		if m.picker.selectedProfile.CredentialConfigured {
+			lines = append(lines, theme.muted.Render("  A key is already configured. Saving replaces it."))
+		}
+		lines = append(lines, "", theme.muted.Render("Enter save and load models  Esc back"))
+	case providerForm:
+		lines = append(lines, theme.assistant.Render("Provider profile"))
+		labels := []string{"Type", "Display name", "Base URL (blank = default)", "Default model", "API key (blank = keep current)"}
+		values := []string{m.picker.form.kind, m.picker.form.display, m.picker.form.baseURL, m.picker.form.model, strings.Repeat("•", len(m.picker.form.credential))}
+		for index, label := range labels {
+			marker := "  "
+			value := values[index]
+			cursor := 0
+			if index == m.picker.form.field {
+				marker = "❯ "
+				if index != 0 {
+					cursor = m.picker.form.cursor
+				}
+			}
+			prefix := theme.muted.Render(marker + label + ": ")
+			if index == m.picker.form.field {
+				viewport := renderInputViewport([]rune(value), cursor, max(1, width-ansi.StringWidth(prefix)))
+				cursorY := len(lines)
+				lines = append(lines, prefix+viewport.text)
+				if !m.picker.busy {
+					viewCursor = nativeTextCursor(ansi.StringWidth(prefix)+viewport.cursorOffset, cursorY)
+				}
+			} else {
+				lines = append(lines, prefix+value)
+			}
+		}
+		lines = append(lines, "", theme.muted.Render("Tab/Enter next  Enter on API key saves  Esc back; arrows change new profile type"))
 	}
-}
-
-type providerProfilesLoadedMsg struct {
-	generation uint64
-	profiles   []session.ProviderProfile
-	message    string
-}
-
-type providerConfiguredMsg struct {
-	generation uint64
-	profile    session.ProviderProfile
-	message    string
-}
-
-type providerModelsLoadedMsg struct {
-	generation uint64
-	models     []session.ModelOption
-	message    string
-}
-
-type modelSwitchedMsg struct {
-	generation uint64
-	message    string
+	if m.picker.busy {
+		lines = append(lines, "", theme.muted.Render(m.picker.busyMessage))
+	}
+	if m.picker.message != "" {
+		lines = append(lines, "", theme.warning.Render(m.picker.message))
+	}
+	if m.picker.errorMessage != "" {
+		lines = append(lines, "", theme.failure.Render(m.picker.errorMessage))
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	for index := range lines {
+		lines[index] = truncateANSI(lines[index], width)
+	}
+	view := tea.NewView(strings.Join(lines[:min(len(lines), height)], "\n"))
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeCellMotion
+	view.WindowTitle = "CodePilot Provider Setup"
+	view.BackgroundColor = lipgloss.Color("#111318")
+	view.ForegroundColor = lipgloss.Color("#E5E7EB")
+	if viewCursor != nil && viewCursor.Y < height {
+		view.Cursor = viewCursor
+	}
+	return view
 }
