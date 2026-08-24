@@ -111,9 +111,10 @@ func repositoryFingerprint(ctx context.Context, root string) (string, error) {
 	return "git-anchor-v1:" + format + ":" + anchor, nil
 }
 
-// VerifyRepositoryFingerprint checks that the candidate object database still
-// contains the registration anchor. New commits, branches and merges therefore
-// do not change workspace identity.
+// VerifyRepositoryFingerprint checks that the candidate history still contains
+// the registration anchor. New commits, branches and merges therefore do not
+// change workspace identity, while an amended or rebased history is rejected
+// even when Git has retained the old commit object in its local database.
 func VerifyRepositoryFingerprint(ctx context.Context, root, fingerprint string) error {
 	verifyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -128,6 +129,9 @@ func VerifyRepositoryFingerprint(ctx context.Context, root, fingerprint string) 
 	}
 	if _, err := gitOutput(ctx, root, "cat-file", "-e", anchor+"^{commit}"); err != nil {
 		return errors.New("Git history does not contain the stored workspace identity")
+	}
+	if _, err := gitOutput(ctx, root, "merge-base", "--is-ancestor", anchor, "HEAD"); err != nil {
+		return errors.New("Git history no longer contains the stored workspace identity")
 	}
 	return nil
 }
