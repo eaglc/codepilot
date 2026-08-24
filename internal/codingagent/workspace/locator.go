@@ -130,6 +130,10 @@ func VerifyRepositoryFingerprint(ctx context.Context, root, fingerprint string) 
 	if _, err := gitOutput(ctx, root, "cat-file", "-e", anchor+"^{commit}"); err != nil {
 		return errors.New("Git history does not contain the stored workspace identity")
 	}
+	currentRoot, err := gitOutput(ctx, root, "rev-list", "--max-parents=0", "--first-parent", "HEAD")
+	if err != nil || strings.TrimSpace(string(currentRoot)) != anchor {
+		return errors.New("Git history no longer contains the stored workspace identity")
+	}
 	if _, err := gitOutput(ctx, root, "merge-base", "--is-ancestor", anchor, "HEAD"); err != nil {
 		return errors.New("Git history no longer contains the stored workspace identity")
 	}
