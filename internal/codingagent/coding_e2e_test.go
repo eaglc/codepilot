@@ -267,9 +267,12 @@ func runE2ECommand(ctx context.Context, root string, command commandSpec) (strin
 
 func findPythonE2E(t *testing.T) commandSpec {
 	t.Helper()
-	candidates := []commandSpec{{name: "python", args: []string{"-m", "unittest", "-q"}}, {name: "python3", args: []string{"-m", "unittest", "-q"}}}
+	// Avoid creating bytecode for the intentionally broken fixture. The repair
+	// keeps the file size unchanged, so a same-second mtime can otherwise make
+	// Python reuse stale bytecode after the patch is applied.
+	candidates := []commandSpec{{name: "python", args: []string{"-B", "-m", "unittest", "-q"}}, {name: "python3", args: []string{"-B", "-m", "unittest", "-q"}}}
 	if runtime.GOOS == "windows" {
-		candidates = append(candidates, commandSpec{name: "py", args: []string{"-3", "-m", "unittest", "-q"}})
+		candidates = append(candidates, commandSpec{name: "py", args: []string{"-3", "-B", "-m", "unittest", "-q"}})
 	}
 	for _, candidate := range candidates {
 		if _, err := exec.LookPath(candidate.name); err == nil {
