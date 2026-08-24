@@ -296,8 +296,13 @@ func TestFormatSummaryInputGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read golden: %v", err)
 	}
-	if actual != strings.TrimSpace(string(expected)) {
-		t.Fatalf("summary input changed\n--- actual ---\n%s\n--- expected ---\n%s", actual, expected)
+	normalize := func(value string) string {
+		return strings.ReplaceAll(strings.TrimSpace(value), "\r\n", "\n")
+	}
+	actualNormalized := normalize(actual)
+	expectedNormalized := normalize(string(expected))
+	if actualNormalized != expectedNormalized {
+		t.Fatalf("summary input changed\n--- actual ---\n%s\n--- expected ---\n%s", actualNormalized, expectedNormalized)
 	}
 }
 
