@@ -90,6 +90,21 @@ func TestFactoryCreatesBoundedReadOnlyTools(t *testing.T) {
 	}
 }
 
+func TestFactoryRegistersToolResultReaderWithReadableArtifactStore(t *testing.T) {
+	registry, err := NewFactory(Options{Artifacts: &memoryArtifactStore{}}).CreateTools(context.Background(), codingagent.ToolScope{
+		SessionID: "session", WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create tools: %v", err)
+	}
+	for _, definition := range registry.Definitions() {
+		if definition.Name == "read_tool_result" {
+			return
+		}
+	}
+	t.Fatal("read_tool_result was not registered for a readable artifact store")
+}
+
 func TestEditFileUsesExactReplacementAndGeneratedDiff(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "main.go")

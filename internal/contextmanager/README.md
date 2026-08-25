@@ -8,7 +8,7 @@ fallbacks.
 ## Purpose
 
 A `Manager` runs an ordered pipeline of `Strategy` implementations. The concrete
-`CompactionStrategy` produces a `rolling-summary/v5` compaction; a
+`CompactionStrategy` produces a `rolling-summary/v6` compaction; a
 `ModelSummarizer` generates summaries via a (fixed or primary) model; and
 `ByteTokenizer` provides a conservative bootstrap token estimate. All of it is
 provider-neutral — it depends only on `llm` and injects `Summarizer` /
@@ -40,6 +40,13 @@ provider-neutral — it depends only on `llm` and injects `Summarizer` /
   messages after their coverage boundary are reconsidered.
 - Oversized old history is split on complete-turn boundaries, summarized in
   cached chunks, and merged hierarchically before the final summary is durable.
+- Chunk sizing counts the exact structured JSON request envelope sent to the
+  summarizer. Each generation has a bounded output budget so merge levels
+  shrink predictably.
+- Every summary-model call reports usage to the Agent runtime. Run token, output,
+  and cost limits are rechecked before the primary model is called.
+- Hard-limit trimming protects a generated summary ahead of ordinary historical
+  turns. A summary that still cannot fit is not persisted as authoritative.
 - Request-scoped ephemeral context remains visible to the primary model but is
   excluded from durable summary sources.
 - Any failure (summary generation, sanitizer, cache) falls back to whole-turn

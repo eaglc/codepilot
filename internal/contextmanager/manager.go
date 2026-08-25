@@ -22,6 +22,10 @@ type Message struct {
 	TurnID  string
 	Message llm.Message
 	Current bool
+	// DerivedSummary marks a generated history digest. Hard-limit trimming keeps
+	// it ahead of ordinary historical turns, but may still remove it when the
+	// current turn cannot otherwise fit.
+	DerivedSummary bool
 	// Ephemeral marks request-scoped context that must not become part of a
 	// durable conversation summary. It remains visible to the primary model.
 	Ephemeral bool
@@ -30,14 +34,23 @@ type Message struct {
 	SummaryFacts []SummaryFact
 }
 
+// CompactionBoundary identifies the history range selected for compaction.
+// It contains no generated summary text or Provider-specific data.
+type CompactionBoundary struct {
+	SourceDigest string
+	FromEntryID  string
+	ToEntryID    string
+}
+
 // Request contains the full candidate context before strategy processing.
 type Request struct {
-	Scope        Scope
-	SystemPrompt string
-	Messages     []Message
-	PriorSummary *Summary
-	Tools        []llm.ToolDefinition
-	Budget       Budget
+	Scope               Scope
+	SystemPrompt        string
+	Messages            []Message
+	PriorSummary        *Summary
+	Tools               []llm.ToolDefinition
+	Budget              Budget
+	OnCompactionStarted func(context.Context, CompactionBoundary) error
 }
 
 // Result contains the selected context and any durable summaries generated during processing.
@@ -45,6 +58,9 @@ type Result struct {
 	SystemPrompt string
 	Messages     []Message
 	Summaries    []Summary
+	// SummaryUsage contains one entry for every summary-model call made while
+	// producing this result. Cache hits do not add usage.
+	SummaryUsage []llm.Usage
 	Degradations []Degradation
 }
 
@@ -86,13 +102,19 @@ func (m *Manager) Process(ctx context.Context, request Request) (Result, error) 
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		result, err := strategy.Process(ctx, Request{Scope: request.Scope, SystemPrompt: current.SystemPrompt, Messages: current.Messages, PriorSummary: prior, Tools: cloneTools(request.Tools), Budget: request.Budget})
+		result, err := strategy.Process(ctx, Request{
+			Scope: request.Scope, SystemPrompt: current.SystemPrompt, Messages: current.Messages,
+			PriorSummary: prior, Tools: cloneTools(request.Tools), Budget: request.Budget,
+			OnCompactionStarted: request.OnCompactionStarted,
+		})
 		if err != nil {
-			return Result{}, fmt.Errorf("process model context strategy %d: %w", index+1, err)
+			current.SummaryUsage = append(current.SummaryUsage, result.SummaryUsage...)
+			return cloneResult(current), fmt.Errorf("process model context strategy %d: %w", index+1, err)
 		}
 		current.SystemPrompt = result.SystemPrompt
 		current.Messages = cloneMessages(result.Messages)
 		current.Summaries = append(current.Summaries, cloneSummaries(result.Summaries)...)
+		current.SummaryUsage = append(current.SummaryUsage, result.SummaryUsage...)
 		current.Degradations = append(current.Degradations, result.Degradations...)
 		prior = nil
 	}
@@ -103,7 +125,17 @@ func (m *Manager) Process(ctx context.Context, request Request) (Result, error) 
 		}
 		current.Messages = messages
 	}
-	return Result{SystemPrompt: current.SystemPrompt, Messages: cloneMessages(current.Messages), Summaries: cloneSummaries(current.Summaries), Degradations: append([]Degradation(nil), current.Degradations...)}, nil
+	return cloneResult(current), nil
+}
+
+func cloneResult(value Result) Result {
+	return Result{
+		SystemPrompt: value.SystemPrompt,
+		Messages:     cloneMessages(value.Messages),
+		Summaries:    cloneSummaries(value.Summaries),
+		SummaryUsage: append([]llm.Usage(nil), value.SummaryUsage...),
+		Degradations: append([]Degradation(nil), value.Degradations...),
+	}
 }
 
 func cloneSummaryPointer(value *Summary) *Summary {

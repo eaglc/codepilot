@@ -23,6 +23,18 @@ func (s *memoryArtifactStore) SaveArtifact(_ context.Context, artifact codingage
 	return codingagent.ArtifactRef{ID: fmt.Sprintf("sha256:test-%d", len(s.artifacts)), MediaType: artifact.MediaType, Size: int64(len(artifact.Data))}, nil
 }
 
+func (s *memoryArtifactStore) LoadArtifact(_ context.Context, reference codingagent.ArtifactRef) (codingagent.Artifact, error) {
+	var index int
+	if _, err := fmt.Sscanf(reference.ID, "sha256:test-%d", &index); err != nil || index <= 0 || index > len(s.artifacts) {
+		return codingagent.Artifact{}, fmt.Errorf("artifact not found")
+	}
+	artifact := s.artifacts[index-1]
+	if int64(len(artifact.Data)) != reference.Size || artifact.MediaType != reference.MediaType {
+		return codingagent.Artifact{}, fmt.Errorf("artifact reference mismatch")
+	}
+	return codingagent.Artifact{MediaType: artifact.MediaType, Data: append([]byte(nil), artifact.Data...)}, nil
+}
+
 func TestDetectCheckPlansUsesOnlyRecognizedProjectMarkers(t *testing.T) {
 	root := t.TempDir()
 	for name, content := range map[string]string{

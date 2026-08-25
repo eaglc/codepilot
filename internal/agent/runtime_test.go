@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -30,6 +31,40 @@ func (f fakeModelFactory) CreateModel(context.Context, llm.ModelRef) (llm.ChatMo
 type fakeModel struct {
 	responses []llm.Message
 	requests  []llm.ChatRequest
+}
+
+type summaryUsageStrategy struct {
+	usage llm.Usage
+	err   error
+}
+
+type eventCompactionStrategy struct{}
+
+func (eventCompactionStrategy) Process(ctx context.Context, request contextmanager.Request) (contextmanager.Result, error) {
+	boundary := contextmanager.CompactionBoundary{
+		SourceDigest: strings.Repeat("a", 64), FromEntryID: request.Messages[0].EntryID, ToEntryID: request.Messages[0].EntryID,
+	}
+	if request.OnCompactionStarted == nil {
+		return contextmanager.Result{}, errors.New("compaction start callback is missing")
+	}
+	if err := request.OnCompactionStarted(ctx, boundary); err != nil {
+		return contextmanager.Result{}, err
+	}
+	return contextmanager.Result{
+		SystemPrompt: request.SystemPrompt, Messages: request.Messages,
+		Summaries: []contextmanager.Summary{{
+			Text: "durable summary", CoversFromEntryID: boundary.FromEntryID, CoversToEntryID: boundary.ToEntryID,
+			SourceDigest: boundary.SourceDigest, Strategy: "test-summary", StrategyVersion: "v1",
+		}},
+	}, nil
+}
+
+func (s summaryUsageStrategy) Process(_ context.Context, request contextmanager.Request) (contextmanager.Result, error) {
+	return contextmanager.Result{
+		SystemPrompt: request.SystemPrompt,
+		Messages:     request.Messages,
+		SummaryUsage: []llm.Usage{s.usage},
+	}, s.err
 }
 
 func (m *fakeModel) Complete(context.Context, llm.ChatRequest) (llm.Message, error) {
@@ -138,6 +173,30 @@ type eventCollector struct{ events []Event }
 
 func (c *eventCollector) PublishAgentEvent(_ context.Context, event Event) error {
 	c.events = append(c.events, event)
+	return nil
+}
+
+type compactionEventCollector struct {
+	events             []Event
+	repository         agentsession.Repository
+	finishSawPersisted bool
+}
+
+func (c *compactionEventCollector) PublishAgentEvent(ctx context.Context, event Event) error {
+	c.events = append(c.events, event)
+	if event.Kind != EventCompactionFinished {
+		return nil
+	}
+	snapshot, err := c.repository.Load(ctx, event.SessionID)
+	if err != nil {
+		return err
+	}
+	for _, entry := range snapshot.Entries {
+		if entry.Type == agentsession.EntryCompaction && entry.Compaction != nil && entry.Compaction.SourceDigest == event.Compaction.SourceDigest {
+			c.finishSawPersisted = true
+			break
+		}
+	}
 	return nil
 }
 
@@ -426,6 +485,87 @@ func TestRuntimeEnforcesDurableUsageAndOutputBudgets(t *testing.T) {
 	}
 }
 
+func TestRuntimeChargesSummaryUsageBeforePrimaryModelCall(t *testing.T) {
+	repository := agentsession.NewMemoryRepository()
+	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-summary-budget"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	manager, err := contextmanager.NewManager(summaryUsageStrategy{usage: llm.Usage{InputTokens: 80, OutputTokens: 20, TotalTokens: 100, Cost: 0.5}})
+	if err != nil {
+		t.Fatalf("create context manager: %v", err)
+	}
+	model := &fakeModel{}
+	runtime, err := NewRuntime(Dependencies{Models: fakeModelFactory{model: model}, Contexts: manager, Sessions: repository, IDs: &sequenceIDs{}})
+	if err != nil {
+		t.Fatalf("create runtime: %v", err)
+	}
+	result, err := runtime.Run(context.Background(), RunRequest{
+		SessionID: "session-summary-budget", RunID: "run-summary-budget", UserEntryID: "user-summary-budget",
+		Model:       llm.ModelRef{Provider: "test", Model: "model"},
+		UserMessage: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "budget"}}},
+		Limits:      RunLimits{MaxTotalTokens: 100, MaxOutputTokens: 1000, MaxCost: 10},
+	}, &eventCollector{})
+	if err != nil {
+		t.Fatalf("run agent: %v", err)
+	}
+	if result.Status != RunLimitReached || result.Reason != "max_total_tokens" || len(model.requests) != 0 {
+		t.Fatalf("summary budget result=%#v model requests=%d", result, len(model.requests))
+	}
+	snapshot, err := repository.Load(context.Background(), "session-summary-budget")
+	if err != nil {
+		t.Fatalf("load session: %v", err)
+	}
+	var recorded bool
+	for _, record := range snapshot.Records {
+		if record.Type == agentsession.RecordUsage && record.Usage != nil && record.Usage.TotalTokens == 100 {
+			recorded = true
+		}
+	}
+	if !recorded {
+		t.Fatalf("summary usage was not durably recorded: %#v", snapshot.Records)
+	}
+}
+
+func TestRuntimeRecordsSummaryUsageWhenContextBuildFails(t *testing.T) {
+	repository := agentsession.NewMemoryRepository()
+	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-summary-failure"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	manager, err := contextmanager.NewManager(summaryUsageStrategy{
+		usage: llm.Usage{InputTokens: 40, OutputTokens: 10, TotalTokens: 50, Cost: 0.25},
+		err:   errors.New("context does not fit after summary"),
+	})
+	if err != nil {
+		t.Fatalf("create context manager: %v", err)
+	}
+	model := &fakeModel{}
+	runtime, err := NewRuntime(Dependencies{Models: fakeModelFactory{model: model}, Contexts: manager, Sessions: repository, IDs: &sequenceIDs{}})
+	if err != nil {
+		t.Fatalf("create runtime: %v", err)
+	}
+	result, runErr := runtime.Run(context.Background(), RunRequest{
+		SessionID: "session-summary-failure", RunID: "run-summary-failure", UserEntryID: "user-summary-failure",
+		Model:       llm.ModelRef{Provider: "test", Model: "model"},
+		UserMessage: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "too large"}}},
+	}, &eventCollector{})
+	if runErr == nil || result.Status != RunFailed || len(model.requests) != 0 {
+		t.Fatalf("failed summary result=%#v model requests=%d err=%v", result, len(model.requests), runErr)
+	}
+	snapshot, err := repository.Load(context.Background(), "session-summary-failure")
+	if err != nil {
+		t.Fatalf("load session: %v", err)
+	}
+	var recorded bool
+	for _, record := range snapshot.Records {
+		if record.Type == agentsession.RecordUsage && record.Usage != nil && record.Usage.TotalTokens == 50 {
+			recorded = true
+		}
+	}
+	if !recorded {
+		t.Fatalf("failed summary usage was not durably recorded: %#v", snapshot.Records)
+	}
+}
+
 func TestRuntimeEnforcesTotalToolCallBudget(t *testing.T) {
 	repository := agentsession.NewMemoryRepository()
 	_ = repository.Create(context.Background(), agentsession.Metadata{ID: "session-tools"})
@@ -443,6 +583,53 @@ func TestRuntimeEnforcesTotalToolCallBudget(t *testing.T) {
 	}, &eventCollector{})
 	if err != nil || result.Status != RunLimitReached || result.Reason != "max_tool_calls" || executable.calls != 1 {
 		t.Fatalf("tool budget result=%#v calls=%d err=%v", result, executable.calls, err)
+	}
+}
+
+func TestRuntimeFinishesCompactionOnlyAfterSummaryIsPersisted(t *testing.T) {
+	repository := agentsession.NewMemoryRepository()
+	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-compaction-events"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	manager, err := contextmanager.NewManager(eventCompactionStrategy{})
+	if err != nil {
+		t.Fatalf("create context manager: %v", err)
+	}
+	model := &fakeModel{responses: []llm.Message{{
+		Role: llm.RoleAssistant, Provider: "test", Model: "model", StopReason: llm.StopReasonStop,
+		Content: []llm.Content{{Type: llm.ContentText, Text: "done"}},
+	}}}
+	runtime, err := NewRuntime(Dependencies{
+		Models: fakeModelFactory{model: model}, Contexts: manager, Sessions: repository, IDs: &sequenceIDs{},
+	})
+	if err != nil {
+		t.Fatalf("create runtime: %v", err)
+	}
+	registry, err := tool.NewRegistry(&readTool{})
+	if err != nil {
+		t.Fatalf("create tools: %v", err)
+	}
+	events := &compactionEventCollector{repository: repository}
+	result, err := runtime.Run(context.Background(), RunRequest{
+		SessionID: "session-compaction-events", RunID: "run-compaction-events", UserEntryID: "user-compaction-events",
+		Model:       llm.ModelRef{Provider: "test", Model: "model"},
+		UserMessage: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "compact"}}},
+		Tools:       registry, Limits: RunLimits{MaxSteps: 1},
+	}, events)
+	if err != nil || result.Status != RunCompleted {
+		t.Fatalf("run agent: result=%#v err=%v", result, err)
+	}
+	started, finished := -1, -1
+	for index, event := range events.events {
+		switch event.Kind {
+		case EventCompactionStarted:
+			started = index
+		case EventCompactionFinished:
+			finished = index
+		}
+	}
+	if started < 0 || finished <= started || !events.finishSawPersisted {
+		t.Fatalf("compaction events=%#v finish_saw_persisted=%v", events.events, events.finishSawPersisted)
 	}
 }
 

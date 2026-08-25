@@ -359,12 +359,26 @@ func (r *Runtime) runSteps(ctx context.Context, request RunRequest, dispatcher *
 			return r.failRun(ctx, request, dispatcher, step-1, "publish_step_started", err)
 		}
 
-		contextResult, err := r.buildContext(ctx, request)
+		contextResult, err := r.buildContext(ctx, request, dispatcher)
 		if err != nil {
+			if usageErr := r.recordSummaryUsage(ctx, request, contextResult.SummaryUsage); usageErr != nil {
+				return r.failRun(ctx, request, dispatcher, step-1, "record_failed_summary_usage", usageErr)
+			}
 			return r.failRun(ctx, request, dispatcher, step-1, "build_context", err)
+		}
+		if err := r.recordSummaryUsage(ctx, request, contextResult.SummaryUsage); err != nil {
+			return r.failRun(ctx, request, dispatcher, step-1, "record_summary_usage", err)
 		}
 		if err := r.persistSummaries(ctx, request, contextResult.Summaries, dispatcher); err != nil {
 			return r.failRun(ctx, request, dispatcher, step-1, "persist_compaction", err)
+		}
+		if reason, err := r.runBudgetReason(ctx, request); err != nil {
+			return r.failRun(ctx, request, dispatcher, step-1, "inspect_summary_budget", err)
+		} else if reason != "" {
+			if err := r.finishRun(ctx, request, dispatcher, step-1, RunLimitReached, reason); err != nil {
+				return RunResult{}, err
+			}
+			return RunResult{RunID: request.RunID, Status: RunLimitReached, Steps: step - 1, Reason: reason}, nil
 		}
 		safeContext, err := r.sanitizeContextMessages(contextResult.Messages)
 		if err != nil {
@@ -609,7 +623,7 @@ func normalizeRetryLimits(limits RunLimits) RunLimits {
 	return limits
 }
 
-func (r *Runtime) buildContext(ctx context.Context, request RunRequest) (contextmanager.Result, error) {
+func (r *Runtime) buildContext(ctx context.Context, request RunRequest, dispatcher *eventDispatcher) (contextmanager.Result, error) {
 	snapshot, err := r.sessions.Load(ctx, request.SessionID)
 	if err != nil {
 		return contextmanager.Result{}, err
@@ -652,6 +666,11 @@ func (r *Runtime) buildContext(ctx context.Context, request RunRequest) (context
 	return r.contexts.Process(ctx, contextmanager.Request{
 		Scope:        contextmanager.Scope{SessionID: string(request.SessionID), RunID: string(request.RunID), Model: request.Model},
 		SystemPrompt: request.SystemPrompt, Messages: messages, PriorSummary: priorSummary, Tools: request.Tools.Definitions(), Budget: budget,
+		OnCompactionStarted: func(ctx context.Context, boundary contextmanager.CompactionBoundary) error {
+			return dispatcher.publish(ctx, Event{Kind: EventCompactionStarted, Compaction: &CompactionEvent{
+				SourceDigest: boundary.SourceDigest, FromEntryID: boundary.FromEntryID, ToEntryID: boundary.ToEntryID,
+			}})
+		},
 	})
 }
 
@@ -1148,6 +1167,16 @@ func (r *Runtime) persistToolResult(ctx context.Context, request RunRequest, dis
 	return dispatcher.publish(ctx, Event{Kind: EventToolFinished, Tool: &ToolEvent{CallID: pending.ToolCallID, Name: pending.ToolName, Status: string(result.Status), Summary: summary, Details: append(json.RawMessage(nil), result.Details...)}})
 }
 
+func (r *Runtime) recordSummaryUsage(ctx context.Context, request RunRequest, usages []llm.Usage) error {
+	for index := range usages {
+		usage := usages[index]
+		if err := r.appendRecord(ctx, request, agentsession.Record{Type: agentsession.RecordUsage, RunID: request.RunID, Usage: &usage}); err != nil {
+			return fmt.Errorf("record summary usage %d: %w", index+1, err)
+		}
+	}
+	return nil
+}
+
 func (r *Runtime) persistSummaries(ctx context.Context, request RunRequest, summaries []contextmanager.Summary, dispatcher *eventDispatcher) error {
 	if len(summaries) == 0 {
 		return nil
@@ -1174,9 +1203,6 @@ func (r *Runtime) persistSummaries(ctx context.Context, request RunRequest, summ
 		summary.Text = strings.TrimSpace(r.dataPolicy.SanitizeText(summary.Text))
 		if summary.Text == "" || contextmanager.ValidateSummaryFacts(summary.Text, summary.Facts) != nil {
 			return errors.New("persist context summary: data policy removed required summary facts")
-		}
-		if err := dispatcher.publish(ctx, Event{Kind: EventCompactionStarted, Compaction: &CompactionEvent{SourceDigest: summary.SourceDigest, FromEntryID: summary.CoversFromEntryID, ToEntryID: summary.CoversToEntryID}}); err != nil {
-			return err
 		}
 		entryID, err := r.nextID("entry")
 		if err != nil {

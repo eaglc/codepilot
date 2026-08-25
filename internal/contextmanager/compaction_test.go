@@ -19,6 +19,16 @@ type recordingSummarizer struct {
 	requests  []SummaryRequest
 	err       error
 	output    string
+	usage     *llm.Usage
+}
+
+type orderingSummarizer struct {
+	order *[]string
+}
+
+func (s orderingSummarizer) Summarize(context.Context, SummaryRequest) (SummaryOutput, error) {
+	*s.order = append(*s.order, "summarize")
+	return SummaryOutput{Text: "ordered summary"}, nil
 }
 
 type replacingTextSanitizer struct{}
@@ -58,7 +68,10 @@ func (eofSummaryStream) Close() error                   { return nil }
 
 func (s *recordingSummarizer) Summarize(_ context.Context, request SummaryRequest) (SummaryOutput, error) {
 	s.calls++
-	s.requests = append(s.requests, SummaryRequest{Scope: request.Scope, Messages: cloneMessages(request.Messages), SourceDigest: request.SourceDigest, Strategy: request.Strategy, Version: request.Version})
+	s.requests = append(s.requests, SummaryRequest{
+		Scope: request.Scope, Messages: cloneMessages(request.Messages), SourceDigest: request.SourceDigest,
+		Strategy: request.Strategy, Version: request.Version, MaxOutputTokens: request.MaxOutputTokens,
+	})
 	if s.err != nil {
 		return SummaryOutput{}, s.err
 	}
@@ -71,7 +84,12 @@ func (s *recordingSummarizer) Summarize(_ context.Context, request SummaryReques
 	if output == "" {
 		output = "durable summary preserving read_file"
 	}
-	return SummaryOutput{Text: output, Model: request.Scope.Model}, nil
+	var usage *llm.Usage
+	if s.usage != nil {
+		value := *s.usage
+		usage = &value
+	}
+	return SummaryOutput{Text: output, Model: request.Scope.Model, Usage: usage}, nil
 }
 
 func TestCompactionRollsDurableSummaryForwardWithoutResummarizingCoveredMessages(t *testing.T) {
@@ -118,12 +136,53 @@ func TestCompactionRollsDurableSummaryForwardWithoutResummarizingCoveredMessages
 	}
 }
 
+func TestCompactionNotifiesStartBeforeSummaryGeneration(t *testing.T) {
+	var order []string
+	strategy, err := NewCompactionStrategy(
+		Policy{RecentTurns: 1, SummarizeThreshold: 1, HardLimit: 10000},
+		ByteTokenizer{}, orderingSummarizer{order: &order}, NewMemorySummaryStore(),
+	)
+	if err != nil {
+		t.Fatalf("create strategy: %v", err)
+	}
+	messages := []Message{
+		{EntryID: "old-user", TurnID: "turn-1", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "old request"}}}},
+		{EntryID: "old-assistant", TurnID: "turn-1", Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "old answer"}}}},
+		{EntryID: "recent", TurnID: "turn-2", Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "recent answer"}}}},
+		{EntryID: "current", TurnID: "turn-3", Current: true, Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "continue"}}}},
+	}
+	result, err := strategy.Process(context.Background(), Request{
+		Scope: Scope{SessionID: "session"}, Messages: messages,
+		OnCompactionStarted: func(_ context.Context, boundary CompactionBoundary) error {
+			if boundary.SourceDigest == "" || boundary.FromEntryID != "old-user" || boundary.ToEntryID != "old-assistant" {
+				t.Fatalf("compaction boundary = %#v", boundary)
+			}
+			order = append(order, "started")
+			return nil
+		},
+	})
+	if err != nil || len(result.Summaries) != 1 {
+		t.Fatalf("compact context: result=%#v err=%v", result, err)
+	}
+	if len(order) != 2 || order[0] != "started" || order[1] != "summarize" {
+		t.Fatalf("compaction order = %#v", order)
+	}
+}
+
 func TestCompactionSegmentsLargeHistoryAndReusesFinalCache(t *testing.T) {
 	summarizer := &recordingSummarizer{output: "compact partial"}
 	oldOne := Message{EntryID: "u1", TurnID: "turn-1", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("a", 1800)}}}}
 	oldTwo := Message{EntryID: "u2", TurnID: "turn-2", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("b", 1800)}}}}
-	limit := contextTokens(ByteTokenizer{}, SummarySystemPrompt, []Message{oldOne}, nil) + 8
-	if contextTokens(ByteTokenizer{}, SummarySystemPrompt, []Message{oldOne, oldTwo}, nil) <= limit {
+	limit, err := summaryRequestTokens(ByteTokenizer{}, []Message{oldOne})
+	if err != nil {
+		t.Fatalf("count one summary request: %v", err)
+	}
+	limit += 8
+	twoTokens, err := summaryRequestTokens(ByteTokenizer{}, []Message{oldOne, oldTwo})
+	if err != nil {
+		t.Fatalf("count two summary requests: %v", err)
+	}
+	if twoTokens <= limit {
 		t.Fatal("test messages do not require segmentation")
 	}
 	store := NewMemorySummaryStore()
@@ -215,7 +274,7 @@ func TestModelSummarizerUsesFixedModelAndStructuredInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
-	if factory.created != fixed || model.request.Model != fixed || model.request.SystemPrompt != SummarySystemPrompt {
+	if factory.created != fixed || model.request.Model != fixed || model.request.SystemPrompt != SummarySystemPrompt || model.request.MaxOutputTokens != defaultSummaryMaxOutputTokens {
 		t.Fatalf("model request = %#v, created = %#v", model.request, factory.created)
 	}
 	if output.Text != "summary text" || output.Usage == nil || output.Usage.InputTokens != 10 {
@@ -223,6 +282,24 @@ func TestModelSummarizerUsesFixedModelAndStructuredInput(t *testing.T) {
 	}
 	if got := model.request.Messages[0].Content[0].Text; !strings.Contains(got, `"entry_id": "u1"`) || !strings.Contains(got, `"trust": "untrusted_conversation_data"`) || !strings.Contains(got, "hello") {
 		t.Fatalf("summary input = %q", got)
+	}
+}
+
+func TestModelSummarizerHonorsSmallerRequestedOutputLimit(t *testing.T) {
+	model := &summaryModel{}
+	summarizer, err := NewModelSummarizer(&summaryModelFactory{model: model}, nil)
+	if err != nil {
+		t.Fatalf("create summarizer: %v", err)
+	}
+	_, err = summarizer.Summarize(context.Background(), SummaryRequest{
+		Scope: Scope{Model: llm.ModelRef{Provider: "primary", Model: "model"}}, MaxOutputTokens: 512,
+		Messages: []Message{{EntryID: "u1", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "hello"}}}}},
+	})
+	if err != nil {
+		t.Fatalf("summarize: %v", err)
+	}
+	if model.request.MaxOutputTokens != 512 {
+		t.Fatalf("max output tokens = %d, want 512", model.request.MaxOutputTokens)
 	}
 }
 
@@ -306,6 +383,182 @@ func TestHardLimitDropsWholeTurns(t *testing.T) {
 	}
 	if len(result) != 1 || result[0].EntryID != "u2" {
 		t.Fatalf("hard-limit result split a turn: %#v", result)
+	}
+}
+
+func TestHardLimitPreservesSummaryBeforeOrdinaryHistory(t *testing.T) {
+	summary := Message{
+		EntryID: "context-summary:digest", TurnID: "context-summary:digest", DerivedSummary: true,
+		Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "compact history"}}},
+	}
+	tail := Message{
+		EntryID: "tail", TurnID: "turn-2",
+		Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("t", 300)}}},
+	}
+	current := Message{
+		EntryID: "current", TurnID: "turn-3", Current: true,
+		Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "continue"}}},
+	}
+	limit := contextTokens(ByteTokenizer{}, "", []Message{summary, current}, nil) + 1
+	result, err := fitHardLimit(ByteTokenizer{}, "", []Message{summary, tail, current}, nil, limit)
+	if err != nil {
+		t.Fatalf("fit hard limit: %v", err)
+	}
+	if len(result) != 2 || result[0].EntryID != summary.EntryID || result[1].EntryID != current.EntryID {
+		t.Fatalf("hard-limit result did not protect summary: %#v", result)
+	}
+}
+
+func TestCompactionDoesNotAuthorizeSummaryRemovedByHardLimit(t *testing.T) {
+	old := Message{EntryID: "old", TurnID: "turn-1", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "old history"}}}}
+	current := Message{EntryID: "current", TurnID: "turn-3", Current: true, Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("c", 3000)}}}}
+	digest, err := sourceDigest([]Message{old})
+	if err != nil {
+		t.Fatalf("digest old history: %v", err)
+	}
+	generated, err := summaryContextMessage(Summary{
+		Text: strings.Repeat("s", 400), CoversFromEntryID: old.EntryID, CoversToEntryID: old.EntryID, SourceDigest: digest,
+	})
+	if err != nil {
+		t.Fatalf("format generated summary: %v", err)
+	}
+	hardLimit := contextTokens(ByteTokenizer{}, "", []Message{generated, current}, nil) - 1
+	if contextTokens(ByteTokenizer{}, "", []Message{current}, nil) > hardLimit {
+		t.Fatal("test current turn does not fit independently")
+	}
+	strategy, err := NewCompactionStrategy(
+		Policy{RecentTurns: 1, SummarizeThreshold: 1, HardLimit: hardLimit}, ByteTokenizer{},
+		&recordingSummarizer{output: strings.Repeat("s", 400), usage: &llm.Usage{InputTokens: 100, OutputTokens: 100, TotalTokens: 200}},
+		NewMemorySummaryStore(),
+	)
+	if err != nil {
+		t.Fatalf("create strategy: %v", err)
+	}
+	result, err := strategy.Process(context.Background(), Request{Scope: Scope{SessionID: "session"}, Messages: []Message{
+		old,
+		{EntryID: "tail", TurnID: "turn-2", Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "recent history"}}}},
+		current,
+	}})
+	if err != nil {
+		t.Fatalf("compact context: %v", err)
+	}
+	if len(result.Summaries) != 0 || len(result.SummaryUsage) != 1 || len(result.Messages) != 1 || result.Messages[0].EntryID != "current" {
+		t.Fatalf("removed summary became authoritative: %#v", result)
+	}
+	if len(result.Degradations) != 1 || result.Degradations[0].Kind != "summary_hard_trimmed" {
+		t.Fatalf("summary removal degradation = %#v", result.Degradations)
+	}
+}
+
+func TestSummaryChunkBudgetCountsFormattedRequestEnvelope(t *testing.T) {
+	first := Message{EntryID: "first-entry", TurnID: "turn-1", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("a", 200)}}}}
+	second := Message{EntryID: "second-entry", TurnID: "turn-2", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("b", 200)}}}}
+	oneTokens, err := summaryRequestTokens(ByteTokenizer{}, []Message{first})
+	if err != nil {
+		t.Fatalf("count one summary request: %v", err)
+	}
+	rawTokens := contextTokens(ByteTokenizer{}, SummarySystemPrompt, []Message{first, second}, nil)
+	formattedTokens, err := summaryRequestTokens(ByteTokenizer{}, []Message{first, second})
+	if err != nil {
+		t.Fatalf("count formatted summary request: %v", err)
+	}
+	if formattedTokens <= rawTokens || oneTokens >= formattedTokens {
+		t.Fatalf("unexpected token estimates: one=%d raw=%d formatted=%d", oneTokens, rawTokens, formattedTokens)
+	}
+	limit := formattedTokens - 1
+	if limit < oneTokens {
+		limit = oneTokens
+	}
+	chunks, err := splitSummaryChunks(ByteTokenizer{}, []Message{first, second}, limit)
+	if err != nil {
+		t.Fatalf("split summary chunks: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("formatted envelope was not included in chunk budget: %#v", chunks)
+	}
+}
+
+func TestCompactionReportsEveryHierarchyModelUsage(t *testing.T) {
+	summarizer := &recordingSummarizer{output: "compact partial", usage: &llm.Usage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12, Cost: 0.01}}
+	oldOne := Message{EntryID: "u1", TurnID: "turn-1", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("a", 1800)}}}}
+	oldTwo := Message{EntryID: "u2", TurnID: "turn-2", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("b", 1800)}}}}
+	limit, err := summaryRequestTokens(ByteTokenizer{}, []Message{oldOne})
+	if err != nil {
+		t.Fatalf("count one summary request: %v", err)
+	}
+	strategy, err := NewCompactionStrategy(Policy{RecentTurns: 1, SummarizeThreshold: 1, HardLimit: limit + 8}, ByteTokenizer{}, summarizer, NewMemorySummaryStore())
+	if err != nil {
+		t.Fatalf("create strategy: %v", err)
+	}
+	result, err := strategy.Process(context.Background(), Request{Scope: Scope{SessionID: "usage"}, Messages: []Message{
+		oldOne, oldTwo,
+		{EntryID: "recent", TurnID: "turn-3", Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "recent"}}}},
+		{EntryID: "current", TurnID: "turn-4", Current: true, Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "continue"}}}},
+	}})
+	if err != nil {
+		t.Fatalf("compact context: %v", err)
+	}
+	if summarizer.calls != 3 || len(result.SummaryUsage) != 3 {
+		t.Fatalf("summary usage calls=%d usages=%#v", summarizer.calls, result.SummaryUsage)
+	}
+}
+
+func TestCompactionMergesSummaryChunksAcrossMultipleLevels(t *testing.T) {
+	var old []Message
+	for index := 0; index < 12; index++ {
+		old = append(old, Message{
+			EntryID: "old-" + string(rune('a'+index)), TurnID: "turn-" + string(rune('a'+index)),
+			Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat(string(rune('a'+index)), 4000)}}},
+		})
+	}
+	limit, err := summaryRequestTokens(ByteTokenizer{}, old[:1])
+	if err != nil {
+		t.Fatalf("count one summary request: %v", err)
+	}
+	limit += 8
+	chunks, err := splitSummaryChunks(ByteTokenizer{}, old, limit)
+	if err != nil {
+		t.Fatalf("split original chunks: %v", err)
+	}
+	outputSize := 0
+	for size := 1; size <= 2000; size++ {
+		partials := make([]Summary, len(chunks))
+		for index := range partials {
+			partials[index] = Summary{
+				Kind: SummaryKindChunk, Text: strings.Repeat("s", size),
+				CoversFromEntryID: old[index].EntryID, CoversToEntryID: old[index].EntryID,
+				SourceDigest: strings.Repeat(string(rune('a'+index)), 64),
+			}
+		}
+		mergeMessages, err := summaryMessages(partials)
+		if err != nil {
+			t.Fatalf("format partial summaries: %v", err)
+		}
+		mergeChunks, err := splitSummaryChunks(ByteTokenizer{}, mergeMessages, limit)
+		if err == nil && len(mergeChunks) > 1 && len(mergeChunks) < len(chunks) {
+			outputSize = size
+			break
+		}
+	}
+	if outputSize == 0 {
+		t.Fatal("could not construct a converging multi-level summary fixture")
+	}
+	summarizer := &recordingSummarizer{output: strings.Repeat("s", outputSize)}
+	strategy, err := NewCompactionStrategy(Policy{RecentTurns: 1, SummarizeThreshold: 1, HardLimit: limit}, ByteTokenizer{}, summarizer, NewMemorySummaryStore())
+	if err != nil {
+		t.Fatalf("create strategy: %v", err)
+	}
+	messages := append([]Message(nil), old...)
+	messages = append(messages,
+		Message{EntryID: "recent", TurnID: "turn-recent", Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "recent"}}}},
+		Message{EntryID: "current", TurnID: "turn-current", Current: true, Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "continue"}}}},
+	)
+	result, err := strategy.Process(context.Background(), Request{Scope: Scope{SessionID: "multi-level"}, Messages: messages})
+	if err != nil {
+		t.Fatalf("compact multi-level context: %v", err)
+	}
+	if len(result.Summaries) != 1 || summarizer.calls <= len(chunks)+1 {
+		t.Fatalf("hierarchy did not use an intermediate merge level: chunks=%d calls=%d result=%#v", len(chunks), summarizer.calls, result)
 	}
 }
 

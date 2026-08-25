@@ -52,7 +52,7 @@ type ToolEvent struct {
 	Details json.RawMessage
 }
 
-// CompactionEvent identifies a durable summary without exposing summary prompts to observers.
+// CompactionEvent identifies the selected history range without exposing summary prompts to observers.
 type CompactionEvent struct {
 	SourceDigest string
 	FromEntryID  string

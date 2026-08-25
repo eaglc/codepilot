@@ -171,6 +171,9 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 		&listCheckPlansTool{plans: plans},
 		&runChecksTool{root: root, plans: plans, displayLimit: options.MaxCheckDisplay, outputLimit: options.MaxCheckOutput, timeout: options.CheckTimeout, artifacts: options.Artifacts, security: security},
 	}
+	if artifactReader, ok := options.Artifacts.(codingagent.ArtifactReader); ok {
+		executables = append(executables, &readToolResultTool{artifacts: artifactReader})
+	}
 	if options.Languages != nil {
 		profile, detectErr := options.Languages.Detect(ctx, root)
 		if detectErr != nil {
@@ -192,7 +195,9 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 	for index := range executables {
 		executables[index] = withPermissionBoundary(executables[index], scope.PermissionMode, scope.PermissionGrants)
 		executables[index] = withSecurityBoundary(executables[index], security)
-		executables[index] = withArtifactBoundary(executables[index], options.Artifacts, options.ArtifactThreshold, options.ArtifactPreview)
+		if executables[index].Definition().Name != "read_tool_result" {
+			executables[index] = withArtifactBoundary(executables[index], options.Artifacts, options.ArtifactThreshold, options.ArtifactPreview)
+		}
 	}
 	return tool.NewRegistry(executables...)
 }

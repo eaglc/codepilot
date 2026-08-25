@@ -7,12 +7,12 @@ The workspace-scoped Coding Agent tool set (package `codingtools`).
 `Factory` builds a per-worktree `tool.Registry` of read-only file/Git inspection
 tools, exact-match `edit_file`, whole-file `replace_file`, and validated `apply_patch` edit tools, trusted check-plan execution, and
 LSP-backed navigation tools. Every tool is uniformly wrapped by a security
-boundary (sensitive-path approval/redaction) and an artifact boundary
-(large-result externalization).
+boundary (sensitive-path approval/redaction); result-producing tools also use
+an artifact boundary for large-result externalization.
 
 ## Tool set
 
-`read_file`, `list_files`, `search_code`, `git_status`, `git_diff`, `git_log`,
+`read_file`, `read_tool_result`, `list_files`, `search_code`, `git_status`, `git_diff`, `git_log`,
 `git_branches`, `git_show_commit`, `edit_file`, `replace_file`, `apply_patch`, `list_check_plans`, `run_checks`,
 `find_definition`, `find_references`, `get_diagnostics`, `document_symbols`.
 
@@ -38,6 +38,8 @@ boundary (sensitive-path approval/redaction) and an artifact boundary
 
 Sensitive-path reads use the separate security boundary: explicit reads require
 one-time approval and remain redacted, while recursive search is denied.
+Large tool results expose a content-addressed reference; `read_tool_result`
+resolves that reference through the artifact reader in bounded UTF-8 chunks.
 
 - `apply_patch` validates via `git apply --check` plus before/after digests to
   reject worktree drift, and binds approval to an integrity digest.

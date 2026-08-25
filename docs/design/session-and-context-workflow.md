@@ -217,7 +217,7 @@ Snapshot = ProjectSnapshot(product, durable, lane, runtimeState, revision)
 4. 若能拿到模型能力（`ModelCatalog.DescribeModel`），用 `BudgetForModel` 把「context window − max output − 5% 安全边距」换算成输入预算；摘要水位 = 预算的 80%。
 5. 交给 `contextmanager.Process`（策略管线）。
 
-### 5.2 滚动摘要 `CompactionStrategy`（`rolling-summary/v4`）
+### 5.2 滚动摘要 `CompactionStrategy`（`rolling-summary/v6`）
 
 ```text
 如果 总 token ≤ SummarizeThreshold   → 原样返回（不压缩）
@@ -226,14 +226,16 @@ Snapshot = ProjectSnapshot(product, durable, lane, runtimeState, revision)
   保留最近 RecentTurns 个完整 turn 作为「尾巴」（tail）
   更早的 turn 归为 old：
     digest = sourceDigest(old)                       ← 摘要缓存键的一部分
-    key = hash(sessionID, digest, "rolling-summary", "v4")
+    key = hash(sessionID, digest, "rolling-summary", "v6", kind)
     若缓存命中 → 复用（即使主模型已切换，因为键不含模型）
     否则 → 调用 Summarizer（主模型或独立摘要模型）生成摘要
+            ├─ 按实际结构化 JSON 请求大小分块，chunk 超限时层级 merge
+            ├─ 每次生成设置输出 token 上限并汇总 usage
             └─ 摘要先过 sanitizer 脱敏，再校验「事实一致性」（ValidateSummaryFacts）
                └─ 失败 → 降级为 safeTrim（安全裁剪最老 turn，不写摘要）
     生成 summary message（Role=user，标记为「不可信派生上下文」）
   最终上下文 = [summary message] + [tail] + [current]
-  再走 fitHardLimit 兜底硬上限
+  再走 fitHardLimit 兜底硬上限（优先保留摘要，先裁普通历史 turn）
 ```
 
 几个要点：
@@ -241,6 +243,8 @@ Snapshot = ProjectSnapshot(product, durable, lane, runtimeState, revision)
 - **摘要绝不写进 system prompt**。它以 `role=user` 的「不可信派生上下文」身份加入历史，system prompt 保持不变——这是防 prompt injection 的关键（仓库内容/摘要不能改变工具、权限、模型或策略）。
 - **摘要缓存是 provider-neutral 的**：键由 `session + source digest + strategy + version` 组成，不含当前模型，所以从模型 A 切到 B 时同一段历史复用同一份摘要；`Summary.Model` 只记录「当时由哪个模型生成」供审计。
 - 摘要生成后**双写**：`SummaryStore`（`context-summaries/<sha256>.json`，做缓存）+ journal 里的 `entry compaction`（做 durable 权威）。缓存丢失不致命，下次重新摘要即可。
+- chunk/merge/final 的每次真实模型调用都会产生独立 usage record，并在调用主模型前重新检查 RunLimits；缓存命中不重复计费。
+- 若最终摘要在硬上限裁剪后仍无法与当前 turn 共存，该摘要只保留为可重建缓存，不写权威 `entry compaction`，避免覆盖边界跳过原文后又丢失摘要。
 - **硬上限不拆散 tool call/result**：`fitHardLimit` 以完整 Turn 为单位丢弃最老的 turn；若当前 turn 本身就超限，返回 `CurrentTurnTooLargeError`，由既有 operation 失败路径投影到会话，而不是发一个孤立的 tool result。
 
 ### 5.3 工具结果外置（Artifact，另一层「上下文」约束）

@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/eaglc/codepilot/internal/llm"
 )
 
 const (
 	compactionStrategy        = "rolling-summary"
-	compactionStrategyVersion = "v5"
+	compactionStrategyVersion = "v6"
 	maxSummaryMergeLevels     = 8
 )
 
@@ -146,7 +147,7 @@ func (s *CompactionStrategy) Process(ctx context.Context, request Request) (Resu
 	if request.PriorSummary != nil {
 		priorMessage, err := summaryContextMessage(*request.PriorSummary)
 		if err != nil {
-			return s.safeTrim(request, tail, ephemeral, currentIndex, policy, "Stored summary could not be isolated as untrusted context data; oldest complete turns were safely trimmed.", nil)
+			return s.safeTrim(request, tail, ephemeral, currentIndex, policy, "Stored summary could not be isolated as untrusted context data; oldest complete turns were safely trimmed.", nil, nil)
 		}
 		old = append([]Message{priorMessage}, old...)
 		fromEntryID = request.PriorSummary.CoversFromEntryID
@@ -156,39 +157,51 @@ func (s *CompactionStrategy) Process(ctx context.Context, request Request) (Resu
 	if err != nil {
 		return Result{}, err
 	}
+	if request.OnCompactionStarted != nil {
+		boundary := CompactionBoundary{SourceDigest: digest, FromEntryID: fromEntryID, ToEntryID: newOld[len(newOld)-1].EntryID}
+		if err := request.OnCompactionStarted(ctx, boundary); err != nil {
+			return Result{}, fmt.Errorf("publish context compaction start: %w", err)
+		}
+	}
 	key := typedSummaryKey(request.Scope.SessionID, digest, compactionStrategy, compactionStrategyVersion, SummaryKindFinal)
 	summary, found, err := s.store.LoadSummary(ctx, key)
 	var degradations []Degradation
+	var summaryUsage []llm.Usage
 	if err != nil {
 		found = false
 		degradations = append(degradations, Degradation{Kind: "summary_cache_unavailable", Reason: "Stored summary could not be loaded; a new summary was attempted."})
 	}
 	if !found {
-		summary, err = s.summarizeHierarchy(ctx, request.Scope, old, facts, fromEntryID, newOld[len(newOld)-1].EntryID, digest, policy.HardLimit, &degradations)
+		summary, err = s.summarizeHierarchy(ctx, request.Scope, old, facts, fromEntryID, newOld[len(newOld)-1].EntryID, digest, policy.HardLimit, &degradations, &summaryUsage)
 		if err != nil {
-			return s.safeTrim(request, tail, ephemeral, currentIndex, policy, "Summary generation failed or omitted required facts; oldest complete turns were safely trimmed.", degradations)
+			return s.safeTrim(request, tail, ephemeral, currentIndex, policy, "Summary generation failed or omitted required facts; oldest complete turns were safely trimmed.", degradations, summaryUsage)
 		}
 	} else {
 		summary.Text = strings.TrimSpace(s.sanitizer.SanitizeText(summary.Text))
 		if summary.Kind != "" && summary.Kind != SummaryKindFinal || summary.SourceDigest != digest || summary.Text == "" || ValidateSummaryFacts(summary.Text, facts) != nil {
-			return s.safeTrim(request, tail, ephemeral, currentIndex, policy, "Stored summary failed sanitization or fact validation; oldest complete turns were safely trimmed.", degradations)
+			return s.safeTrim(request, tail, ephemeral, currentIndex, policy, "Stored summary failed sanitization or fact validation; oldest complete turns were safely trimmed.", degradations, nil)
 		}
 	}
 	summaryMessage, err := summaryContextMessage(summary)
 	if err != nil {
-		return s.safeTrim(request, tail, ephemeral, currentIndex, policy, "Stored summary could not be isolated as untrusted context data; oldest complete turns were safely trimmed.", degradations)
+		return s.safeTrim(request, tail, ephemeral, currentIndex, policy, "Stored summary could not be isolated as untrusted context data; oldest complete turns were safely trimmed.", degradations, nil)
 	}
 	messages := append([]Message{summaryMessage}, cloneMessages(tail)...)
 	messages = append(messages, cloneMessages(ephemeral)...)
 	messages = append(messages, request.Messages[currentIndex])
 	messages, err = fitHardLimit(s.tokenizer, request.SystemPrompt, messages, request.Tools, policy.HardLimit)
 	if err != nil {
-		return Result{}, err
+		return Result{SummaryUsage: append([]llm.Usage(nil), summaryUsage...)}, err
 	}
-	return Result{SystemPrompt: request.SystemPrompt, Messages: messages, Summaries: []Summary{summary}, Degradations: degradations}, nil
+	retained := containsMessageEntry(messages, summaryMessage.EntryID)
+	if !retained {
+		degradations = append(degradations, Degradation{Kind: "summary_hard_trimmed", Reason: "The generated summary could not fit beside the current turn and was not made authoritative."})
+		return Result{SystemPrompt: request.SystemPrompt, Messages: messages, SummaryUsage: summaryUsage, Degradations: degradations}, nil
+	}
+	return Result{SystemPrompt: request.SystemPrompt, Messages: messages, Summaries: []Summary{summary}, SummaryUsage: summaryUsage, Degradations: degradations}, nil
 }
 
-func (s *CompactionStrategy) safeTrim(request Request, tail, ephemeral []Message, currentIndex int, policy Policy, reason string, existing []Degradation) (Result, error) {
+func (s *CompactionStrategy) safeTrim(request Request, tail, ephemeral []Message, currentIndex int, policy Policy, reason string, existing []Degradation, summaryUsage []llm.Usage) (Result, error) {
 	var messages []Message
 	if request.PriorSummary != nil {
 		if prior, err := summaryContextMessage(*request.PriorSummary); err == nil {
@@ -200,11 +213,11 @@ func (s *CompactionStrategy) safeTrim(request Request, tail, ephemeral []Message
 	messages = append(messages, request.Messages[currentIndex])
 	messages, err := fitHardLimit(s.tokenizer, request.SystemPrompt, messages, request.Tools, policy.HardLimit)
 	if err != nil {
-		return Result{}, err
+		return Result{SummaryUsage: append([]llm.Usage(nil), summaryUsage...)}, err
 	}
 	degradations := append([]Degradation(nil), existing...)
 	degradations = append(degradations, Degradation{Kind: "summary_safe_trim", Reason: reason})
-	return Result{SystemPrompt: request.SystemPrompt, Messages: messages, Degradations: degradations}, nil
+	return Result{SystemPrompt: request.SystemPrompt, Messages: messages, SummaryUsage: append([]llm.Usage(nil), summaryUsage...), Degradations: degradations}, nil
 }
 
 func contextWithPriorSummary(prior *Summary, messages []Message) ([]Message, error) {
@@ -219,13 +232,13 @@ func contextWithPriorSummary(prior *Summary, messages []Message) ([]Message, err
 	return append([]Message{message}, result...), nil
 }
 
-func (s *CompactionStrategy) summarizeHierarchy(ctx context.Context, scope Scope, messages []Message, facts []SummaryFact, fromEntryID, toEntryID, digest string, limit int, degradations *[]Degradation) (Summary, error) {
+func (s *CompactionStrategy) summarizeHierarchy(ctx context.Context, scope Scope, messages []Message, facts []SummaryFact, fromEntryID, toEntryID, digest string, limit int, degradations *[]Degradation, usages *[]llm.Usage) (Summary, error) {
 	chunks, err := splitSummaryChunks(s.tokenizer, messages, limit)
 	if err != nil {
 		return Summary{}, err
 	}
 	if len(chunks) == 1 {
-		return s.loadOrCreateSummary(ctx, scope, chunks[0], facts, fromEntryID, toEntryID, digest, SummaryKindFinal, degradations)
+		return s.loadOrCreateSummary(ctx, scope, chunks[0], facts, fromEntryID, toEntryID, digest, SummaryKindFinal, limit, degradations, usages)
 	}
 	partials := make([]Summary, 0, len(chunks))
 	for _, chunk := range chunks {
@@ -234,7 +247,7 @@ func (s *CompactionStrategy) summarizeHierarchy(ctx context.Context, scope Scope
 			return Summary{}, err
 		}
 		chunkFacts := ExtractSummaryFacts(chunk)
-		partial, err := s.loadOrCreateSummary(ctx, scope, chunk, chunkFacts, chunk[0].EntryID, chunk[len(chunk)-1].EntryID, chunkDigest, SummaryKindChunk, degradations)
+		partial, err := s.loadOrCreateSummary(ctx, scope, chunk, chunkFacts, chunk[0].EntryID, chunk[len(chunk)-1].EntryID, chunkDigest, SummaryKindChunk, limit, degradations, usages)
 		if err != nil {
 			return Summary{}, err
 		}
@@ -253,7 +266,7 @@ func (s *CompactionStrategy) summarizeHierarchy(ctx context.Context, scope Scope
 			return Summary{}, err
 		}
 		if len(mergeChunks) == 1 {
-			return s.loadOrCreateSummary(ctx, scope, mergeChunks[0], facts, fromEntryID, toEntryID, digest, SummaryKindFinal, degradations)
+			return s.loadOrCreateSummary(ctx, scope, mergeChunks[0], facts, fromEntryID, toEntryID, digest, SummaryKindFinal, limit, degradations, usages)
 		}
 		if len(mergeChunks) >= len(partials) {
 			return Summary{}, errors.New("summarize context: intermediate summaries did not fit a smaller merge level")
@@ -265,7 +278,7 @@ func (s *CompactionStrategy) summarizeHierarchy(ctx context.Context, scope Scope
 				return Summary{}, err
 			}
 			chunkFacts := ExtractSummaryFacts(chunk)
-			merged, err := s.loadOrCreateSummary(ctx, scope, chunk, chunkFacts, chunk[0].EntryID, chunk[len(chunk)-1].EntryID, chunkDigest, SummaryKindMerge, degradations)
+			merged, err := s.loadOrCreateSummary(ctx, scope, chunk, chunkFacts, chunk[0].EntryID, chunk[len(chunk)-1].EntryID, chunkDigest, SummaryKindMerge, limit, degradations, usages)
 			if err != nil {
 				return Summary{}, err
 			}
@@ -276,23 +289,30 @@ func (s *CompactionStrategy) summarizeHierarchy(ctx context.Context, scope Scope
 	return Summary{}, errors.New("summarize context: no final summary was produced")
 }
 
-func (s *CompactionStrategy) loadOrCreateSummary(ctx context.Context, scope Scope, messages []Message, facts []SummaryFact, fromEntryID, toEntryID, digest string, kind SummaryKind, degradations *[]Degradation) (Summary, error) {
+func (s *CompactionStrategy) loadOrCreateSummary(ctx context.Context, scope Scope, messages []Message, facts []SummaryFact, fromEntryID, toEntryID, digest string, kind SummaryKind, limit int, degradations *[]Degradation, usages *[]llm.Usage) (Summary, error) {
 	key := typedSummaryKey(scope.SessionID, digest, compactionStrategy, compactionStrategyVersion, kind)
+	maxOutputTokens := summaryOutputLimit(limit)
 	if cached, found, err := s.store.LoadSummary(ctx, key); err == nil && found {
 		cached.Text = strings.TrimSpace(s.sanitizer.SanitizeText(cached.Text))
-		if cached.SourceDigest == digest && cached.Text != "" && ValidateSummaryFacts(cached.Text, facts) == nil {
+		if cached.SourceDigest == digest && cached.Text != "" && s.tokenizer.CountText(cached.Text) <= maxOutputTokens && ValidateSummaryFacts(cached.Text, facts) == nil {
 			return cached, nil
 		}
 	} else if err != nil {
 		*degradations = append(*degradations, Degradation{Kind: "summary_cache_unavailable", Reason: "An intermediate summary cache entry could not be loaded; it was regenerated."})
 	}
-	output, err := s.summarizer.Summarize(ctx, SummaryRequest{Scope: scope, Messages: cloneMessages(messages), SourceDigest: digest, Strategy: compactionStrategy, Version: compactionStrategyVersion})
+	output, err := s.summarizer.Summarize(ctx, SummaryRequest{Scope: scope, Messages: cloneMessages(messages), SourceDigest: digest, Strategy: compactionStrategy, Version: compactionStrategyVersion, MaxOutputTokens: maxOutputTokens})
+	if output.Usage != nil {
+		*usages = append(*usages, *output.Usage)
+	}
 	if err != nil {
 		return Summary{}, err
 	}
 	output.Text = strings.TrimSpace(s.sanitizer.SanitizeText(output.Text))
 	if output.Text == "" {
 		return Summary{}, errors.New("summarize context: empty summary")
+	}
+	if s.tokenizer.CountText(output.Text) > maxOutputTokens {
+		return Summary{}, errors.New("summarize context: generated summary exceeded its output budget")
 	}
 	if err := ValidateSummaryFacts(output.Text, facts); err != nil {
 		return Summary{}, err
@@ -304,6 +324,14 @@ func (s *CompactionStrategy) loadOrCreateSummary(ctx context.Context, scope Scop
 	return summary, nil
 }
 
+func summaryOutputLimit(inputLimit int) int {
+	limit := inputLimit / 8
+	if limit < 1 {
+		limit = 1
+	}
+	return effectiveSummaryMaxOutputTokens(limit)
+}
+
 func splitSummaryChunks(tokenizer Tokenizer, messages []Message, limit int) ([][]Message, error) {
 	if len(messages) == 0 {
 		return nil, errors.New("summarize context: source messages are empty")
@@ -313,19 +341,35 @@ func splitSummaryChunks(tokenizer Tokenizer, messages []Message, limit int) ([][
 	var current []Message
 	for _, turn := range turns {
 		candidate := append(cloneMessages(current), turn.messages...)
-		if len(current) != 0 && contextTokens(tokenizer, SummarySystemPrompt, candidate, nil) > limit {
+		candidateTokens, err := summaryRequestTokens(tokenizer, candidate)
+		if err != nil {
+			return nil, err
+		}
+		if len(current) != 0 && candidateTokens > limit {
 			chunks = append(chunks, current)
 			current = nil
 		}
-		if contextTokens(tokenizer, SummarySystemPrompt, turn.messages, nil) > limit {
+		turnTokens, err := summaryRequestTokens(tokenizer, turn.messages)
+		if err != nil {
+			return nil, err
+		}
+		if turnTokens > limit {
 			if len(turn.messages) == 1 {
 				return nil, errors.New("summarize context: one source message exceeds the summary input limit")
 			}
 			for _, message := range turn.messages {
-				if contextTokens(tokenizer, SummarySystemPrompt, []Message{message}, nil) > limit {
+				messageTokens, err := summaryRequestTokens(tokenizer, []Message{message})
+				if err != nil {
+					return nil, err
+				}
+				if messageTokens > limit {
 					return nil, errors.New("summarize context: one source message exceeds the summary input limit")
 				}
-				if len(current) != 0 && contextTokens(tokenizer, SummarySystemPrompt, append(cloneMessages(current), message), nil) > limit {
+				combinedTokens, err := summaryRequestTokens(tokenizer, append(cloneMessages(current), message))
+				if err != nil {
+					return nil, err
+				}
+				if len(current) != 0 && combinedTokens > limit {
 					chunks = append(chunks, current)
 					current = nil
 				}
@@ -339,6 +383,18 @@ func splitSummaryChunks(tokenizer Tokenizer, messages []Message, limit int) ([][
 		chunks = append(chunks, current)
 	}
 	return chunks, nil
+}
+
+func summaryRequestTokens(tokenizer Tokenizer, messages []Message) (int, error) {
+	input, err := FormatSummaryInput(messages)
+	if err != nil {
+		return 0, err
+	}
+	requestMessage := llm.Message{
+		Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: input}},
+		Timestamp: time.Unix(0, 123456789).UTC(),
+	}
+	return tokenizer.CountText(SummarySystemPrompt) + tokenizer.CountMessage(requestMessage), nil
 }
 
 func summaryMessages(values []Summary) ([]Message, error) {
@@ -445,21 +501,51 @@ func fitHardLimit(tokenizer Tokenizer, systemPrompt string, messages []Message, 
 	result := cloneMessages(messages)
 	currentTurnID := result[len(result)-1].TurnID
 	for len(result) > 1 && contextTokens(tokenizer, systemPrompt, result, tools) > limit {
-		if currentTurnID != "" && result[0].TurnID == currentTurnID {
+		start, end, found := oldestDroppableTurn(result, currentTurnID, false)
+		if !found {
+			start, end, found = oldestDroppableTurn(result, currentTurnID, true)
+		}
+		if !found {
 			break
 		}
-		turnID := result[0].TurnID
-		cut := 1
-		if turnID != "" {
-			for cut < len(result)-1 && result[cut].TurnID == turnID {
-				cut++
-			}
-		}
-		result = result[cut:]
+		result = append(result[:start], result[end:]...)
 	}
 	used := contextTokens(tokenizer, systemPrompt, result, tools)
 	if used > limit {
 		return nil, &CurrentTurnTooLargeError{Tokens: used, Limit: limit}
 	}
 	return cloneMessages(result), nil
+}
+
+func oldestDroppableTurn(messages []Message, currentTurnID string, allowSummary bool) (int, int, bool) {
+	for start := 0; start < len(messages)-1; {
+		turnID := messages[start].TurnID
+		end := start + 1
+		if turnID != "" {
+			for end < len(messages)-1 && messages[end].TurnID == turnID {
+				end++
+			}
+		}
+		if currentTurnID != "" && turnID == currentTurnID {
+			return 0, 0, false
+		}
+		derivedSummary := false
+		for index := start; index < end; index++ {
+			derivedSummary = derivedSummary || messages[index].DerivedSummary
+		}
+		if allowSummary || !derivedSummary {
+			return start, end, true
+		}
+		start = end
+	}
+	return 0, 0, false
+}
+
+func containsMessageEntry(messages []Message, entryID string) bool {
+	for _, message := range messages {
+		if message.EntryID == entryID {
+			return true
+		}
+	}
+	return false
 }

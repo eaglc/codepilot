@@ -75,3 +75,52 @@ func TestArtifactBoundaryPreservesReadRangePreview(t *testing.T) {
 		t.Fatalf("artifact read preview = %#v err=%v", details, err)
 	}
 }
+
+func TestReadToolResultLoadsCompleteExternalizedResultInChunks(t *testing.T) {
+	store := &memoryArtifactStore{}
+	original := "begin-" + strings.Repeat("世界", 400) + "-end"
+	boundary := artifactBoundary{store: store, threshold: 128, preview: 32}
+	externalized := boundary.externalize(context.Background(), tool.Call{ID: "call-large", Name: "large"}, tool.Result{
+		Status: tool.ResultCompleted, Content: []llm.Content{{Type: llm.ContentText, Text: original}}, Details: json.RawMessage(`{"detail":"complete metadata"}`),
+	})
+	var externalizedDetails artifactResultDetails
+	if err := json.Unmarshal(externalized.Details, &externalizedDetails); err != nil {
+		t.Fatalf("decode externalized details: %v", err)
+	}
+	if !strings.Contains(externalized.Content[0].Text, "Use read_tool_result") {
+		t.Fatalf("externalized result did not explain recovery: %q", externalized.Content[0].Text)
+	}
+	reader := &readToolResultTool{artifacts: store}
+	offset := 0
+	var chunks strings.Builder
+	for attempts := 0; attempts < 20; attempts++ {
+		arguments, _ := json.Marshal(map[string]any{
+			"artifact_id": externalizedDetails.Artifact.ID, "artifact_size": externalizedDetails.Artifact.Size,
+			"offset": offset, "max_bytes": 256,
+		})
+		result, err := reader.Execute(context.Background(), tool.Call{ID: "read-result", Name: "read_tool_result", Arguments: arguments}, nil)
+		if err != nil || result.Status != tool.ResultCompleted {
+			t.Fatalf("read result chunk: result=%#v err=%v", result, err)
+		}
+		var details toolResultChunkDetails
+		if err := json.Unmarshal(result.Details, &details); err != nil {
+			t.Fatalf("decode chunk details: %v", err)
+		}
+		marker := strings.LastIndex(result.Content[0].Text, "\n\n[Tool result bytes ")
+		if marker < 0 {
+			t.Fatalf("chunk marker missing: %q", result.Content[0].Text)
+		}
+		chunks.WriteString(result.Content[0].Text[:marker])
+		if details.Complete {
+			if !strings.Contains(chunks.String(), original) || !strings.Contains(chunks.String(), `Details: {"detail":"complete metadata"}`) {
+				t.Fatalf("reconstructed result is incomplete: %q", chunks.String())
+			}
+			return
+		}
+		if details.NextOffset <= offset {
+			t.Fatalf("chunk did not advance: %#v", details)
+		}
+		offset = details.NextOffset
+	}
+	t.Fatal("complete result required too many chunks")
+}

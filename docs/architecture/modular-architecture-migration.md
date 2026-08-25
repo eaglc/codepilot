@@ -768,7 +768,7 @@ Coding `language/lsp` 已具备明确契约、可运行实现和离线协议测�
 - 裁剪以完整 `RunID/TurnID` 为单位，hard limit 不会拆开 tool call 与 tool result。
 - 摘要缓存键由 session、源消息 digest、strategy 和 strategy version 组成，不包含当前主模型。因此主模型从 A 切到 B 时，相同源历史会复用已有摘要；`Summary.Model` 只记录当时由哪个模型生成，供审计使用。
 - 已实现 `ModelSummarizer`。可以使用当前主模型，也可以固定一个独立摘要模型。
-- `rolling-summary/v4` 不再把模型生成摘要拼入 system prompt。摘要先经过产品注入的 text sanitizer 再写 cache/journal，使用时作为 `trust=untrusted_derived_context` 的 user-role 历史消息；Coding system prompt 保持不变，v3 cache identity 不会被复用。
+- `rolling-summary/v6` 不再把模型生成摘要拼入 system prompt。摘要先经过产品注入的 text sanitizer 再写 cache/journal，使用时作为 `trust=untrusted_derived_context` 的 user-role 历史消息；Coding system prompt 保持不变，旧版本 cache identity 不会被复用。分块按真实 JSON 请求包络计量，每次摘要生成都有输出上限并进入 Run usage 预算。
 
 #### Agent Loop、会话与恢复
 
@@ -862,7 +862,7 @@ Coding `language/lsp` 已具备明确契约、可运行实现和离线协议测�
 3. 裁剪只删除最老的完整 Turn。同一活动 `RunID/TurnID` 下的 assistant tool-call、tool-result 和当前消息构成不可拆分保护块；保护块自身超限时返回带 used/limit 的 `CurrentTurnTooLargeError`，由既有 durable operation failure 投影到会话，不会发送孤立 tool-result。
 4. Coding ToolFactory 在通用 Tool 执行边界统一检查规范化 `tool.Result`。超过 64 KiB 的纯文本 Result（含命令输出和 Diff）把完整 `{version,tool_name,call_id,result}` 保存为最大 32 MiB 的 SHA-256 Artifact；模型/journal 只保留 16 KiB 预览、typed detail/diff 和 path-free ref。Wrapper 同时覆盖 Execute/Resume，跳过 interrupt；存储失败保留原 Result，绝不重跑副作用 Tool。
 
-摘要策略现为 `rolling-summary/v4`。摘要输入继续包含 user/assistant/tool 的完整语义结构；生成后从原消息确定性提取 tool name、artifact SHA-256 和 changed-file 事实，任何遗漏都拒绝持久化。摘要模型错误、空输出、事实遗漏、脱敏破坏必要事实或旧缓存校验失败时，系统回退为最老完整 Turn 的安全裁剪，原 journal 保持不变，下次仍可重新摘要。strategy version 参与 cache key，v3 缓存不会被 v4 复用；输入 JSON 格式、信任隔离和事实接受/拒绝集都有测试与 golden fixture。最重要的变化是摘要不再提升到 system prompt，而以明确标记的 user-role 派生历史加入上下文。
+摘要策略现为 `rolling-summary/v6`。摘要输入继续包含 user/assistant/tool 的完整语义结构；分块预算按实际结构化 JSON 请求包络计算，chunk summary 可继续分层 merge，每次生成都有收敛用输出上限。所有真实摘要调用的 token/cost usage 会在主模型调用前写入 Run 预算。生成后从原消息确定性提取 tool name、artifact SHA-256 和 changed-file 事实，任何遗漏都拒绝持久化。摘要模型错误、空输出、事实遗漏、脱敏破坏必要事实或旧缓存校验失败时，系统回退为最老完整 Turn 的安全裁剪。硬裁剪优先保留摘要；仍无法放入上下文的摘要不会写成权威 compaction，原 journal 下次仍可重新摘要。strategy version 参与 cache key，旧版本缓存不会复用；输入 JSON 格式、信任隔离和事实接受/拒绝集都有测试与 golden fixture。摘要不提升到 system prompt，而以明确标记的 user-role 派生历史加入上下文。
 
 Agent Session 归档时，文件 Repository 在 product/agent lifecycle 变更前创建确定性、内容寻址的 `tar+gzip` 冷副本。副本精确包含当时的 `session.json` 与 `journal.jsonl`，读取时校验 SHA-256/size；在线 journal 不旋转、不截断、不删除，归档后仍可追加、恢复和重新摘要。这里的“冷存储”是审计副本策略，不是磁盘回收策略。
 
