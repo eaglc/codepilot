@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -617,9 +618,13 @@ func (r *Runtime) buildContext(ctx context.Context, request RunRequest) (context
 	if err != nil {
 		return contextmanager.Result{}, err
 	}
+	priorSummary, coveredThrough := latestBranchCompaction(entries)
 	var messages []contextmanager.Message
-	for _, entry := range entries {
+	for index, entry := range entries {
 		if entry.Type != agentsession.EntryMessage || entry.Message == nil {
+			continue
+		}
+		if coveredThrough >= 0 && index <= coveredThrough {
 			continue
 		}
 		messages = append(messages, contextmanager.Message{EntryID: string(entry.ID), TurnID: string(entry.RunID), Message: entry.Message.Clone()})
@@ -633,7 +638,7 @@ func (r *Runtime) buildContext(ctx context.Context, request RunRequest) (context
 		messages = messages[:len(messages)-1]
 		for index, message := range request.UntrustedContext {
 			messages = append(messages, contextmanager.Message{
-				EntryID: fmt.Sprintf("untrusted-context:%s:%d", request.RunID, index+1), TurnID: string(request.RunID), Message: message.Clone(),
+				EntryID: fmt.Sprintf("untrusted-context:%s:%d", request.RunID, index+1), TurnID: string(request.RunID), Message: message.Clone(), Ephemeral: true,
 			})
 		}
 		messages = append(messages, current)
@@ -646,8 +651,81 @@ func (r *Runtime) buildContext(ctx context.Context, request RunRequest) (context
 	}
 	return r.contexts.Process(ctx, contextmanager.Request{
 		Scope:        contextmanager.Scope{SessionID: string(request.SessionID), RunID: string(request.RunID), Model: request.Model},
-		SystemPrompt: request.SystemPrompt, Messages: messages, Tools: request.Tools.Definitions(), Budget: budget,
+		SystemPrompt: request.SystemPrompt, Messages: messages, PriorSummary: priorSummary, Tools: request.Tools.Definitions(), Budget: budget,
 	})
+}
+
+func latestBranchCompaction(entries []agentsession.Entry) (*contextmanager.Summary, int) {
+	firstMessage := -1
+	messagePositions := make(map[agentsession.EntryID]int)
+	for index, entry := range entries {
+		if entry.Type == agentsession.EntryMessage && entry.Message != nil {
+			if firstMessage == -1 {
+				firstMessage = index
+			}
+			messagePositions[entry.ID] = index
+		}
+	}
+	if firstMessage == -1 {
+		return nil, -1
+	}
+	var selected *agentsession.Compaction
+	coveredThrough := -1
+	for index, entry := range entries {
+		compaction := entry.Compaction
+		if entry.Type != agentsession.EntryCompaction || compaction == nil {
+			continue
+		}
+		from, fromFound := messagePositions[compaction.CoversFromEntryID]
+		to, toFound := messagePositions[compaction.CoversToEntryID]
+		if !fromFound || !toFound || from != firstMessage || to < from || to >= index || to <= coveredThrough {
+			continue
+		}
+		value := *compaction
+		selected = &value
+		coveredThrough = to
+	}
+	if selected == nil {
+		return nil, -1
+	}
+	facts := make([]contextmanager.SummaryFact, 0, len(selected.Facts))
+	for _, fact := range selected.Facts {
+		facts = append(facts, contextmanager.SummaryFact{Kind: fact.Kind, Value: fact.Value})
+	}
+	var coveredMessages []contextmanager.Message
+	for index := firstMessage; index <= coveredThrough; index++ {
+		entry := entries[index]
+		if entry.Type == agentsession.EntryMessage && entry.Message != nil {
+			coveredMessages = append(coveredMessages, contextmanager.Message{EntryID: string(entry.ID), TurnID: string(entry.RunID), Message: entry.Message.Clone()})
+		}
+	}
+	facts = mergeContextSummaryFacts(facts, contextmanager.ExtractSummaryFacts(coveredMessages))
+	return &contextmanager.Summary{
+		Kind: contextmanager.SummaryKindFinal, Text: selected.Summary,
+		CoversFromEntryID: string(selected.CoversFromEntryID), CoversToEntryID: string(selected.CoversToEntryID),
+		SourceDigest: selected.SourceDigest, Strategy: selected.Strategy, StrategyVersion: selected.StrategyVersion,
+		Model: selected.SummaryModel, Usage: selected.Usage, Facts: facts,
+	}, coveredThrough
+}
+
+func mergeContextSummaryFacts(groups ...[]contextmanager.SummaryFact) []contextmanager.SummaryFact {
+	unique := make(map[contextmanager.SummaryFact]struct{})
+	for _, group := range groups {
+		for _, fact := range group {
+			unique[fact] = struct{}{}
+		}
+	}
+	result := make([]contextmanager.SummaryFact, 0, len(unique))
+	for fact := range unique {
+		result = append(result, fact)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		if result[left].Kind == result[right].Kind {
+			return result[left].Value < result[right].Value
+		}
+		return result[left].Kind < result[right].Kind
+	})
+	return result
 }
 
 func (r *Runtime) streamAssistantWithRetry(ctx context.Context, run RunRequest, model llm.ChatModel, request llm.ChatRequest, dispatcher *eventDispatcher) (llm.Message, error) {
@@ -1078,8 +1156,12 @@ func (r *Runtime) persistSummaries(ctx context.Context, request RunRequest, summ
 	if err != nil {
 		return err
 	}
+	branch, err := agentsession.BranchEntries(snapshot, request.Lane)
+	if err != nil {
+		return err
+	}
 	existing := make(map[string]struct{})
-	for _, entry := range snapshot.Entries {
+	for _, entry := range branch {
 		if entry.Compaction != nil {
 			existing[entry.Compaction.SourceDigest+"\x00"+entry.Compaction.StrategyVersion] = struct{}{}
 		}
@@ -1102,7 +1184,7 @@ func (r *Runtime) persistSummaries(ctx context.Context, request RunRequest, summ
 		}
 		_, err = r.sessions.AppendEntry(ctx, request.SessionID, request.Lane, agentsession.Entry{
 			ID: agentsession.EntryID(entryID), RunID: request.RunID, Type: agentsession.EntryCompaction,
-			Compaction: &agentsession.Compaction{Summary: summary.Text, CoversFromEntryID: agentsession.EntryID(summary.CoversFromEntryID), CoversToEntryID: agentsession.EntryID(summary.CoversToEntryID), SourceDigest: summary.SourceDigest, Strategy: summary.Strategy, StrategyVersion: summary.StrategyVersion, SummaryModel: summary.Model, Usage: summary.Usage},
+			Compaction: &agentsession.Compaction{Summary: summary.Text, CoversFromEntryID: agentsession.EntryID(summary.CoversFromEntryID), CoversToEntryID: agentsession.EntryID(summary.CoversToEntryID), SourceDigest: summary.SourceDigest, Strategy: summary.Strategy, StrategyVersion: summary.StrategyVersion, SummaryModel: summary.Model, Usage: summary.Usage, Facts: compactionFacts(summary.Facts)},
 		})
 		if err != nil {
 			return err
@@ -1113,6 +1195,14 @@ func (r *Runtime) persistSummaries(ctx context.Context, request RunRequest, summ
 		}
 	}
 	return nil
+}
+
+func compactionFacts(facts []contextmanager.SummaryFact) []agentsession.CompactionFact {
+	result := make([]agentsession.CompactionFact, len(facts))
+	for index, fact := range facts {
+		result[index] = agentsession.CompactionFact{Kind: fact.Kind, Value: fact.Value}
+	}
+	return result
 }
 
 func (r *Runtime) sanitizeContextMessages(messages []contextmanager.Message) ([]contextmanager.Message, error) {

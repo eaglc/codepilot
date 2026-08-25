@@ -560,6 +560,25 @@ func TestRuntimeCentrallyPersistsToolActivity(t *testing.T) {
 	}
 }
 
+func TestLatestBranchCompactionRestoresAuthoritativeSummaryAndFacts(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	entries := []agentsession.Entry{
+		{ID: "u1", Sequence: 1, Type: agentsession.EntryMessage, Message: &llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "inspect"}}}},
+		{ID: "tool", Sequence: 2, ParentID: "u1", Type: agentsession.EntryMessage, Message: &llm.Message{Role: llm.RoleTool, ToolCallID: "call", ToolName: "read_file", Content: []llm.Content{{Type: llm.ContentText, Text: "stored sha256:" + digest}}}},
+		{ID: "summary", Sequence: 3, ParentID: "tool", Type: agentsession.EntryCompaction, Compaction: &agentsession.Compaction{
+			Summary: "read_file stored sha256:" + digest, CoversFromEntryID: "u1", CoversToEntryID: "tool", SourceDigest: "source", Strategy: "rolling-summary", StrategyVersion: "v4",
+		}},
+		{ID: "current", Sequence: 4, ParentID: "summary", Type: agentsession.EntryMessage, Message: &llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "continue"}}}},
+	}
+	summary, coveredThrough := latestBranchCompaction(entries)
+	if summary == nil || coveredThrough != 1 || summary.CoversFromEntryID != "u1" || summary.CoversToEntryID != "tool" {
+		t.Fatalf("summary=%#v coveredThrough=%d", summary, coveredThrough)
+	}
+	if len(summary.Facts) != 2 {
+		t.Fatalf("facts were not recovered from authoritative source entries: %#v", summary.Facts)
+	}
+}
+
 func TestRuntimeDataPolicyProtectsJournalContextEventsAndSplitStreams(t *testing.T) {
 	repository := agentsession.NewMemoryRepository()
 	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-policy"}); err != nil {

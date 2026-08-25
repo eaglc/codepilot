@@ -22,6 +22,12 @@ type Message struct {
 	TurnID  string
 	Message llm.Message
 	Current bool
+	// Ephemeral marks request-scoped context that must not become part of a
+	// durable conversation summary. It remains visible to the primary model.
+	Ephemeral bool
+	// SummaryFacts carries durable facts when this message represents a prior
+	// derived summary, so hierarchical merges can validate every level.
+	SummaryFacts []SummaryFact
 }
 
 // Request contains the full candidate context before strategy processing.
@@ -29,6 +35,7 @@ type Request struct {
 	Scope        Scope
 	SystemPrompt string
 	Messages     []Message
+	PriorSummary *Summary
 	Tools        []llm.ToolDefinition
 	Budget       Budget
 }
@@ -74,11 +81,12 @@ func (m *Manager) Process(ctx context.Context, request Request) (Result, error) 
 		return Result{}, errors.New("process model context: manager is nil")
 	}
 	current := Result{SystemPrompt: request.SystemPrompt, Messages: cloneMessages(request.Messages)}
+	prior := cloneSummaryPointer(request.PriorSummary)
 	for index, strategy := range m.strategies {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		result, err := strategy.Process(ctx, Request{Scope: request.Scope, SystemPrompt: current.SystemPrompt, Messages: current.Messages, Tools: cloneTools(request.Tools), Budget: request.Budget})
+		result, err := strategy.Process(ctx, Request{Scope: request.Scope, SystemPrompt: current.SystemPrompt, Messages: current.Messages, PriorSummary: prior, Tools: cloneTools(request.Tools), Budget: request.Budget})
 		if err != nil {
 			return Result{}, fmt.Errorf("process model context strategy %d: %w", index+1, err)
 		}
@@ -86,8 +94,24 @@ func (m *Manager) Process(ctx context.Context, request Request) (Result, error) 
 		current.Messages = cloneMessages(result.Messages)
 		current.Summaries = append(current.Summaries, cloneSummaries(result.Summaries)...)
 		current.Degradations = append(current.Degradations, result.Degradations...)
+		prior = nil
+	}
+	if len(m.strategies) == 0 && prior != nil {
+		messages, err := contextWithPriorSummary(prior, current.Messages)
+		if err != nil {
+			return Result{}, err
+		}
+		current.Messages = messages
 	}
 	return Result{SystemPrompt: current.SystemPrompt, Messages: cloneMessages(current.Messages), Summaries: cloneSummaries(current.Summaries), Degradations: append([]Degradation(nil), current.Degradations...)}, nil
+}
+
+func cloneSummaryPointer(value *Summary) *Summary {
+	if value == nil {
+		return nil
+	}
+	clone := cloneSummary(*value)
+	return &clone
 }
 
 func cloneTools(tools []llm.ToolDefinition) []llm.ToolDefinition {
@@ -104,6 +128,7 @@ func cloneMessages(messages []Message) []Message {
 	for index, message := range messages {
 		clones[index] = message
 		clones[index].Message = message.Message.Clone()
+		clones[index].SummaryFacts = append([]SummaryFact(nil), message.SummaryFacts...)
 	}
 	return clones
 }

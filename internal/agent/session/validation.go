@@ -41,6 +41,11 @@ func (e Entry) Validate() error {
 		if e.Compaction == nil || e.Compaction.Summary == "" || e.Compaction.CoversFromEntryID == "" || e.Compaction.CoversToEntryID == "" || e.Compaction.SourceDigest == "" || e.Compaction.Strategy == "" || e.Compaction.StrategyVersion == "" {
 			return fmt.Errorf("validate compaction entry %q: compaction metadata is incomplete", e.ID)
 		}
+		for _, fact := range e.Compaction.Facts {
+			if fact.Kind == "" || fact.Value == "" {
+				return fmt.Errorf("validate compaction entry %q: compaction fact is incomplete", e.ID)
+			}
+		}
 		if len(e.Compaction.Details) != 0 && !json.Valid(e.Compaction.Details) {
 			return fmt.Errorf("validate compaction entry %q: details are not valid JSON", e.ID)
 		}

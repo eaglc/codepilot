@@ -16,6 +16,7 @@ import (
 type recordingSummarizer struct {
 	calls     int
 	formatted string
+	requests  []SummaryRequest
 	err       error
 	output    string
 }
@@ -57,6 +58,7 @@ func (eofSummaryStream) Close() error                   { return nil }
 
 func (s *recordingSummarizer) Summarize(_ context.Context, request SummaryRequest) (SummaryOutput, error) {
 	s.calls++
+	s.requests = append(s.requests, SummaryRequest{Scope: request.Scope, Messages: cloneMessages(request.Messages), SourceDigest: request.SourceDigest, Strategy: request.Strategy, Version: request.Version})
 	if s.err != nil {
 		return SummaryOutput{}, s.err
 	}
@@ -70,6 +72,99 @@ func (s *recordingSummarizer) Summarize(_ context.Context, request SummaryReques
 		output = "durable summary preserving read_file"
 	}
 	return SummaryOutput{Text: output, Model: request.Scope.Model}, nil
+}
+
+func TestCompactionRollsDurableSummaryForwardWithoutResummarizingCoveredMessages(t *testing.T) {
+	summarizer := &recordingSummarizer{output: "rolled summary preserving read_file"}
+	strategy, err := NewCompactionStrategy(Policy{RecentTurns: 1, SummarizeThreshold: 1, HardLimit: 10000}, ByteTokenizer{}, summarizer, NewMemorySummaryStore())
+	if err != nil {
+		t.Fatalf("create strategy: %v", err)
+	}
+	prior := &Summary{
+		Kind: SummaryKindFinal, Text: "prior durable summary", CoversFromEntryID: "u1", CoversToEntryID: "a1",
+		SourceDigest: "prior-digest", Strategy: compactionStrategy, StrategyVersion: "v4", Facts: []SummaryFact{{Kind: "tool", Value: "read_file"}},
+	}
+	messages := []Message{
+		{EntryID: "u2", TurnID: "turn-2", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "older delta"}}}},
+		{EntryID: "a2", TurnID: "turn-2", Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "delta answer"}}}},
+		{EntryID: "recent", TurnID: "turn-3", Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "recent"}}}},
+		{EntryID: "guidance", TurnID: "turn-4", Ephemeral: true, Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "repository guidance"}}}},
+		{EntryID: "current", TurnID: "turn-4", Current: true, Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "continue"}}}},
+	}
+	result, err := strategy.Process(context.Background(), Request{Scope: Scope{SessionID: "session"}, Messages: messages, PriorSummary: prior})
+	if err != nil {
+		t.Fatalf("roll summary: %v", err)
+	}
+	if summarizer.calls != 1 || len(summarizer.requests[0].Messages) != 3 {
+		t.Fatalf("summary calls=%d input=%#v", summarizer.calls, summarizer.requests)
+	}
+	input := summarizer.requests[0].Messages
+	if !strings.HasPrefix(input[0].EntryID, "context-summary:") || input[1].EntryID != "u2" || input[2].EntryID != "a2" {
+		t.Fatalf("rolling summary input = %#v", input)
+	}
+	if len(input[0].SummaryFacts) != 1 || input[0].SummaryFacts[0].Value != "read_file" {
+		t.Fatalf("prior summary facts were not propagated: %#v", input[0].SummaryFacts)
+	}
+	if result.Summaries[0].CoversFromEntryID != "u1" || result.Summaries[0].CoversToEntryID != "a2" {
+		t.Fatalf("rolling coverage = %#v", result.Summaries[0])
+	}
+	for _, message := range summarizer.requests[0].Messages {
+		if message.EntryID == "guidance" {
+			t.Fatal("ephemeral context entered the durable summary")
+		}
+	}
+	if len(result.Messages) != 4 || result.Messages[2].EntryID != "guidance" || result.Messages[3].EntryID != "current" {
+		t.Fatalf("visible rolling context = %#v", result.Messages)
+	}
+}
+
+func TestCompactionSegmentsLargeHistoryAndReusesFinalCache(t *testing.T) {
+	summarizer := &recordingSummarizer{output: "compact partial"}
+	oldOne := Message{EntryID: "u1", TurnID: "turn-1", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("a", 1800)}}}}
+	oldTwo := Message{EntryID: "u2", TurnID: "turn-2", Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.Repeat("b", 1800)}}}}
+	limit := contextTokens(ByteTokenizer{}, SummarySystemPrompt, []Message{oldOne}, nil) + 8
+	if contextTokens(ByteTokenizer{}, SummarySystemPrompt, []Message{oldOne, oldTwo}, nil) <= limit {
+		t.Fatal("test messages do not require segmentation")
+	}
+	store := NewMemorySummaryStore()
+	strategy, err := NewCompactionStrategy(Policy{RecentTurns: 1, SummarizeThreshold: 1, HardLimit: limit}, ByteTokenizer{}, summarizer, store)
+	if err != nil {
+		t.Fatalf("create strategy: %v", err)
+	}
+	messages := []Message{
+		oldOne,
+		oldTwo,
+		{EntryID: "recent", TurnID: "turn-3", Message: llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "recent"}}}},
+		{EntryID: "current", TurnID: "turn-4", Current: true, Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "continue"}}}},
+	}
+	request := Request{Scope: Scope{SessionID: "session"}, Messages: messages}
+	first, err := strategy.Process(context.Background(), request)
+	if err != nil {
+		t.Fatalf("segment summary: %v", err)
+	}
+	if summarizer.calls != 3 || len(first.Summaries) != 1 || first.Summaries[0].Kind != SummaryKindFinal {
+		t.Fatalf("hierarchical result=%#v calls=%d", first, summarizer.calls)
+	}
+	if _, err := strategy.Process(context.Background(), request); err != nil {
+		t.Fatalf("reuse final summary: %v", err)
+	}
+	if summarizer.calls != 3 {
+		t.Fatalf("final summary cache miss: calls=%d", summarizer.calls)
+	}
+}
+
+func TestManagerKeepsPriorSummaryWithoutStrategies(t *testing.T) {
+	manager, err := NewManager()
+	if err != nil {
+		t.Fatalf("create manager: %v", err)
+	}
+	result, err := manager.Process(context.Background(), Request{
+		PriorSummary: &Summary{Text: "durable history", SourceDigest: "digest", CoversFromEntryID: "u1", CoversToEntryID: "a1"},
+		Messages:     []Message{{EntryID: "current", Current: true, Message: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "continue"}}}}},
+	})
+	if err != nil || len(result.Messages) != 2 || !strings.HasPrefix(result.Messages[0].EntryID, "context-summary:") {
+		t.Fatalf("manager result=%#v err=%v", result, err)
+	}
 }
 
 func TestCompactionIncludesToolsAndReusesSummaryAcrossModelSwitch(t *testing.T) {

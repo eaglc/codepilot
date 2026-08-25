@@ -16,6 +16,7 @@ func (entry Entry) Clone() Entry {
 	}
 	if entry.Compaction != nil {
 		value := *entry.Compaction
+		value.Facts = append([]CompactionFact(nil), entry.Compaction.Facts...)
 		value.Details = append([]byte(nil), entry.Compaction.Details...)
 		if entry.Compaction.Usage != nil {
 			usage := *entry.Compaction.Usage

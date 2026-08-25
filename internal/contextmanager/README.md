@@ -8,7 +8,7 @@ fallbacks.
 ## Purpose
 
 A `Manager` runs an ordered pipeline of `Strategy` implementations. The concrete
-`CompactionStrategy` produces a `rolling-summary/v4` compaction; a
+`CompactionStrategy` produces a `rolling-summary/v5` compaction; a
 `ModelSummarizer` generates summaries via a (fixed or primary) model; and
 `ByteTokenizer` provides a conservative bootstrap token estimate. All of it is
 provider-neutral — it depends only on `llm` and injects `Summarizer` /
@@ -36,6 +36,12 @@ provider-neutral — it depends only on `llm` and injects `Summarizer` /
   the trusted system prompt, to defend against prompt injection.
 - Fact-consistency checks require tool names, artifact `sha256:` refs, and changed
   file paths to survive verbatim before a summary is reused.
+- Durable `EntryCompaction` summaries seed the next rolling generation; only
+  messages after their coverage boundary are reconsidered.
+- Oversized old history is split on complete-turn boundaries, summarized in
+  cached chunks, and merged hierarchically before the final summary is durable.
+- Request-scoped ephemeral context remains visible to the primary model but is
+  excluded from durable summary sources.
 - Any failure (summary generation, sanitizer, cache) falls back to whole-turn
   `safeTrim` with a recorded `Degradation`, never a hard error.
 

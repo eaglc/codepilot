@@ -51,16 +51,24 @@ const (
 
 // Compaction stores a durable, model-neutral summary and its exact source boundary.
 type Compaction struct {
-	Summary             string          `json:"summary"`
-	CoversFromEntryID   EntryID         `json:"covers_from_entry_id"`
-	CoversToEntryID     EntryID         `json:"covers_to_entry_id"`
-	RetainedFromEntryID EntryID         `json:"retained_from_entry_id,omitempty"`
-	SourceDigest        string          `json:"source_digest"`
-	Strategy            string          `json:"strategy"`
-	StrategyVersion     string          `json:"strategy_version"`
-	SummaryModel        llm.ModelRef    `json:"summary_model"`
-	Usage               *llm.Usage      `json:"usage,omitempty"`
-	Details             json.RawMessage `json:"details,omitempty"`
+	Summary             string           `json:"summary"`
+	CoversFromEntryID   EntryID          `json:"covers_from_entry_id"`
+	CoversToEntryID     EntryID          `json:"covers_to_entry_id"`
+	RetainedFromEntryID EntryID          `json:"retained_from_entry_id,omitempty"`
+	SourceDigest        string           `json:"source_digest"`
+	Strategy            string           `json:"strategy"`
+	StrategyVersion     string           `json:"strategy_version"`
+	SummaryModel        llm.ModelRef     `json:"summary_model"`
+	Usage               *llm.Usage       `json:"usage,omitempty"`
+	Facts               []CompactionFact `json:"facts,omitempty"`
+	Details             json.RawMessage  `json:"details,omitempty"`
+}
+
+// CompactionFact is a stable source-derived value retained across rolling
+// summary generations.
+type CompactionFact struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
 }
 
 // BranchSummary stores a summary of history left behind during navigation.
