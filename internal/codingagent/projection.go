@@ -90,6 +90,60 @@ func ProjectSnapshot(product Session, durable agentsession.Snapshot, lane agents
 	return snapshot, nil
 }
 
+// ProjectSnapshotWithTurns adds explicit Product Turn/Run relationships while
+// preserving legacy Agent-only history when no Product Turn exists.
+func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, lane agentsession.Lane, state RuntimeState, revision uint64, turns []Turn) (Snapshot, error) {
+	snapshot, err := ProjectSnapshot(product, durable, lane, state, revision)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	runTurns := make(map[agentsession.RunID]TurnID)
+	runProfiles := make(map[agentsession.RunID]CapabilityProfile)
+	runPhases := make(map[agentsession.RunID]TurnPhase)
+	runStatuses := make(map[agentsession.RunID]TurnStatus)
+	for _, turn := range turns {
+		for _, binding := range turn.Runs {
+			runTurns[binding.RunID] = turn.ID
+			runProfiles[binding.RunID] = binding.Profile
+			runPhases[binding.RunID] = binding.Phase
+			runStatuses[binding.RunID] = turn.Status
+		}
+		if turn.Status == TurnPending || turn.Status == TurnRunning || turn.Status == TurnInterrupted {
+			value := TurnSnapshot{ID: turn.ID, Phase: turn.Phase, Status: turn.Status, Strategy: turn.Strategy, RunCount: len(turn.Runs), Revision: turn.Revision}
+			snapshot.ActiveTurn = &value
+		}
+	}
+	for index := range snapshot.Transcript {
+		runID := agentsession.RunID(snapshot.Transcript[index].TurnID)
+		if turnID, found := runTurns[runID]; found {
+			snapshot.Transcript[index].TurnID = turnID
+		}
+	}
+	for index := range snapshot.PendingInterrupts {
+		runID := agentsession.RunID(snapshot.PendingInterrupts[index].TurnID)
+		snapshot.PendingInterrupts[index].RunID = RunID(runID)
+		if turnID, found := runTurns[runID]; found {
+			snapshot.PendingInterrupts[index].TurnID = turnID
+		}
+	}
+	for index := range snapshot.RecoveryActions {
+		runID := agentsession.RunID(snapshot.RecoveryActions[index].TurnID)
+		snapshot.RecoveryActions[index].RunID = RunID(runID)
+		if turnID, found := runTurns[runID]; found {
+			snapshot.RecoveryActions[index].TurnID = turnID
+		}
+	}
+	runID := agentsession.RunID(snapshot.Metrics.LatestTurnID)
+	snapshot.Metrics.LatestRunID = RunID(runID)
+	if turnID, found := runTurns[runID]; found {
+		snapshot.Metrics.LatestTurnID = turnID
+		snapshot.Metrics.LatestPhase = runPhases[runID]
+		snapshot.Metrics.LatestProfile = runProfiles[runID]
+		snapshot.Metrics.LatestTurnStatus = runStatuses[runID]
+	}
+	return snapshot, nil
+}
+
 func projectSessionMetrics(entries []agentsession.Entry, records []agentsession.Record) SessionMetrics {
 	metrics := SessionMetrics{}
 	runs := make(map[agentsession.RunID]struct{})

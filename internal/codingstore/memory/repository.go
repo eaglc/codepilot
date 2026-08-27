@@ -20,6 +20,7 @@ type Repository struct {
 	workspaces map[codingagent.WorkspaceID]codingagent.Workspace
 	worktrees  map[codingagent.WorktreeID]codingagent.Worktree
 	intents    map[codingagent.SessionCreationIntentID]codingagent.SessionCreationIntent
+	turns      map[codingagent.TurnID]codingagent.Turn
 }
 
 // NewRepository creates an empty product repository.
@@ -27,7 +28,94 @@ func NewRepository() *Repository {
 	return &Repository{
 		sessions: make(map[codingagent.SessionID]codingagent.Session), workspaces: make(map[codingagent.WorkspaceID]codingagent.Workspace),
 		worktrees: make(map[codingagent.WorktreeID]codingagent.Worktree), intents: make(map[codingagent.SessionCreationIntentID]codingagent.SessionCreationIntent),
+		turns: make(map[codingagent.TurnID]codingagent.Turn),
 	}
+}
+
+// CreateTurn stores a new Product Turn with its initial revision.
+func (r *Repository) CreateTurn(ctx context.Context, value codingagent.Turn) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := codingagent.ValidateTurn(value); err != nil {
+		return fmt.Errorf("create Coding turn: %w", err)
+	}
+	if value.Revision != 1 {
+		return fmt.Errorf("create Coding turn %q: initial revision must be 1", value.ID)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.turns[value.ID]; exists {
+		return fmt.Errorf("create Coding turn %q: already exists", value.ID)
+	}
+	if _, exists := r.sessions[value.SessionID]; !exists {
+		return fmt.Errorf("create Coding turn %q: session %q not found", value.ID, value.SessionID)
+	}
+	r.turns[value.ID] = cloneTurn(value)
+	return nil
+}
+
+// LoadTurn returns one Product Turn by stable identity.
+func (r *Repository) LoadTurn(ctx context.Context, id codingagent.TurnID) (codingagent.Turn, error) {
+	if err := ctx.Err(); err != nil {
+		return codingagent.Turn{}, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	value, exists := r.turns[id]
+	if !exists {
+		return codingagent.Turn{}, fmt.Errorf("load Coding turn %q: %w", id, codingagent.ErrTurnNotFound)
+	}
+	return cloneTurn(value), nil
+}
+
+// ListTurns returns Product Turns for one session in creation order.
+func (r *Repository) ListTurns(ctx context.Context, sessionID codingagent.SessionID) ([]codingagent.Turn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	values := make([]codingagent.Turn, 0)
+	for _, value := range r.turns {
+		if value.SessionID == sessionID {
+			values = append(values, cloneTurn(value))
+		}
+	}
+	sort.Slice(values, func(left, right int) bool {
+		if values[left].CreatedAt.Equal(values[right].CreatedAt) {
+			return values[left].ID < values[right].ID
+		}
+		return values[left].CreatedAt.Before(values[right].CreatedAt)
+	})
+	return values, nil
+}
+
+// SaveTurn atomically replaces a Product Turn at the expected revision.
+func (r *Repository) SaveTurn(ctx context.Context, value codingagent.Turn, expectedRevision uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := codingagent.ValidateTurn(value); err != nil {
+		return fmt.Errorf("save Coding turn: %w", err)
+	}
+	if value.Revision != expectedRevision+1 {
+		return fmt.Errorf("save Coding turn %q: next revision is invalid", value.ID)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	previous, exists := r.turns[value.ID]
+	if !exists {
+		return fmt.Errorf("save Coding turn %q: %w", value.ID, codingagent.ErrTurnNotFound)
+	}
+	if previous.Revision != expectedRevision {
+		return fmt.Errorf("save Coding turn %q: expected revision %d, found %d: %w", value.ID, expectedRevision, previous.Revision, codingagent.ErrTurnConflict)
+	}
+	if err := codingagent.ValidateTurnTransition(previous, value); err != nil {
+		return fmt.Errorf("save Coding turn %q: %w", value.ID, err)
+	}
+	r.turns[value.ID] = cloneTurn(value)
+	return nil
 }
 
 // SaveWorkspace stores a logical Coding workspace.
@@ -309,5 +397,10 @@ func cloneSession(value codingagent.Session) codingagent.Session {
 		value.PermissionGrants[index].Paths = append([]string(nil), value.PermissionGrants[index].Paths...)
 	}
 	value.SensitivePaths = append([]string(nil), value.SensitivePaths...)
+	return value
+}
+
+func cloneTurn(value codingagent.Turn) codingagent.Turn {
+	value.Runs = append([]codingagent.RunBinding(nil), value.Runs...)
 	return value
 }

@@ -60,6 +60,104 @@ func TestRepositoryPersistsProductBindingsAcrossRestart(t *testing.T) {
 	if err := reopened.SaveSession(context.Background(), loaded); err == nil {
 		t.Fatal("expected immutable binding error")
 	}
+	turn := codingagent.Turn{
+		ID: "turn-1", SessionID: session.ID, RequestText: "inspect", Phase: codingagent.TurnPhaseDirect,
+		Status: codingagent.TurnPending, Strategy: codingagent.ExecutionSingle, Revision: 1,
+		Runs:      []codingagent.RunBinding{{RunID: "run-1", UserEntryID: "entry-1", Phase: codingagent.TurnPhaseDirect, Profile: codingagent.CapabilityDirect, Status: codingagent.RunBindingPending}},
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := reopened.CreateTurn(context.Background(), turn); err != nil {
+		t.Fatalf("create turn: %v", err)
+	}
+	metadataPath, err := reopened.sessionMetadataPath(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(metadataPath); err != nil {
+		t.Fatalf("session metadata missing from aggregate directory: %v", err)
+	}
+	turn.Runs[0].Status = codingagent.RunBindingRunning
+	turn.Runs[0].StartedAt = now
+	turn.Status = codingagent.TurnRunning
+	turn.Revision = 2
+	if err := reopened.SaveTurn(context.Background(), turn, 1); err != nil {
+		t.Fatalf("save turn: %v", err)
+	}
+	turnsPath, err := reopened.turnsPath(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(turnsPath); err != nil {
+		t.Fatalf("session turn journal missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "coding-turns")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy per-turn directory exists: %v", err)
+	}
+	journal, err := os.OpenFile(turnsPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.WriteString(`{"version":1,"kind":"saved"`); err != nil {
+		_ = journal.Close()
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	finishedAt := now.Add(time.Second)
+	turn.Runs[0].Status = codingagent.RunBindingCompleted
+	turn.Runs[0].FinishedAt = finishedAt
+	turn.Status = codingagent.TurnCompleted
+	turn.UpdatedAt = finishedAt
+	turn.CompletedAt = finishedAt
+	turn.Revision = 3
+	if err := reopened.SaveTurn(context.Background(), turn, 2); err != nil {
+		t.Fatalf("save after truncated tail: %v", err)
+	}
+	replayed, err := OpenRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turns, err := replayed.ListTurns(context.Background(), session.ID)
+	if err != nil || len(turns) != 1 || turns[0].Revision != 3 || turns[0].Status != codingagent.TurnCompleted {
+		t.Fatalf("replayed turns = %#v, %v", turns, err)
+	}
+}
+
+func TestRepositoryMigratesLegacyFlatSessionMetadata(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	legacyDirectory := filepath.Join(root, "coding-sessions")
+	if err := os.MkdirAll(legacyDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	legacy := codingagent.Session{
+		ID: "legacy-session", AgentSessionID: "legacy-agent", WorkspaceID: "legacy-workspace", WorktreeID: "legacy-worktree",
+		ProviderProfileID: "profile", ModelID: "model", PermissionMode: codingagent.PermissionAsk,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	legacyPath := filepath.Join(legacyDirectory, string(legacy.ID)+".json")
+	if err := writeEnvelope(legacyPath, legacy); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := NewRepository(root)
+	if err != nil {
+		t.Fatalf("migrate repository: %v", err)
+	}
+	loaded, err := repository.LoadSession(context.Background(), legacy.ID)
+	if err != nil || !reflect.DeepEqual(loaded, legacy) {
+		t.Fatalf("migrated session = %#v, %v", loaded, err)
+	}
+	metadataPath, err := repository.sessionMetadataPath(legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(metadataPath); err != nil {
+		t.Fatalf("migrated metadata missing: %v", err)
+	}
+	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy metadata remains after migration: %v", err)
+	}
 }
 
 func TestRepositoryRelocatesWorktreeExplicitlyAndIdempotently(t *testing.T) {

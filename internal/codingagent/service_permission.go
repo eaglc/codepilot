@@ -16,12 +16,12 @@ const (
 	maxPermissionGrants    = 1024
 )
 
-func deriveSessionGrant(product Session, durable agentsession.Snapshot, request ResumeTurnRequest, now time.Time) (PermissionGrant, error) {
+func deriveSessionGrant(product Session, durable agentsession.Snapshot, request ResumeTurnRequest, runID agentsession.RunID, now time.Time) (PermissionGrant, error) {
 	state := agentsession.AnalyzeRecovery(durable)
 	var pending *agentsession.PendingInterrupt
 	for index := range state.PendingInterrupts {
 		candidate := &state.PendingInterrupts[index]
-		if candidate.RunID == agentsession.RunID(request.TurnID) && candidate.InterruptID == request.InterruptID {
+		if candidate.RunID == runID && candidate.InterruptID == request.InterruptID {
 			pending = candidate
 			break
 		}

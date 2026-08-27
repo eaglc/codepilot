@@ -54,7 +54,7 @@ func TestCreateSessionPersistsIntentBeforeCrossRepositoryFailure(t *testing.T) {
 		t.Fatalf("create Agent runtime: %v", err)
 	}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: productStore,
 		Agent: runtime, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: &productEvents{},
 	})
 	if err != nil {

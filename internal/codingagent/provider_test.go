@@ -45,7 +45,7 @@ func TestSelectProviderModelValidatesPersistsAndPublishesProductEvent(t *testing
 	providers := &selectionProviderManager{}
 	events := &productEvents{}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: productStore,
 		Agent: runtime, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: events, Providers: providers,
 	})
 	if err != nil {

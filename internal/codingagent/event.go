@@ -18,6 +18,12 @@ type SessionID string
 // TurnID identifies one complete user-triggered Coding Agent turn.
 type TurnID string
 
+// RunID identifies one generic execution bound to a Product Turn.
+type RunID string
+
+// NodeID identifies an optional Workflow node without exposing Workflow internals.
+type NodeID string
+
 // EventKind identifies the stable event protocol exposed to UI, CLI, and future RPC adapters.
 type EventKind string
 
@@ -139,6 +145,8 @@ type Event struct {
 	SnapshotRevision uint64
 	SessionID        SessionID
 	TurnID           TurnID
+	RunID            RunID
+	NodeID           NodeID
 	Timestamp        time.Time
 	Kind             EventKind
 	Payload          EventPayload
@@ -158,21 +166,27 @@ type RevisionSource interface {
 type AgentEventAdapter struct {
 	mu        sync.Mutex
 	sessionID SessionID
+	turnID    TurnID
+	runID     RunID
+	nodeID    NodeID
 	sink      EventSink
 	revisions RevisionSource
 	sequence  uint64
 }
 
 // NewAgentEventAdapter creates an isolated Agent-to-product event boundary.
-func NewAgentEventAdapter(sessionID SessionID, sink EventSink, revisions RevisionSource) (*AgentEventAdapter, error) {
-	if sessionID == "" || sink == nil {
-		return nil, fmt.Errorf("create coding event adapter: session id and sink are required")
+func NewAgentEventAdapter(sessionID SessionID, turnID TurnID, runID RunID, nodeID NodeID, sink EventSink, revisions RevisionSource) (*AgentEventAdapter, error) {
+	if sessionID == "" || turnID == "" || runID == "" || sink == nil {
+		return nil, fmt.Errorf("create coding event adapter: session, turn, run, and sink are required")
 	}
-	return &AgentEventAdapter{sessionID: sessionID, sink: sink, revisions: revisions}, nil
+	return &AgentEventAdapter{sessionID: sessionID, turnID: turnID, runID: runID, nodeID: nodeID, sink: sink, revisions: revisions}, nil
 }
 
 // PublishAgentEvent implements agent.EventSink without forwarding Agent or LLM event objects.
 func (a *AgentEventAdapter) PublishAgentEvent(ctx context.Context, source agent.Event) error {
+	if source.RunID != "" && RunID(source.RunID) != a.runID {
+		return fmt.Errorf("publish coding event: Agent run %q does not match bound run %q", source.RunID, a.runID)
+	}
 	event, publish := a.translate(source)
 	if !publish {
 		return nil
@@ -183,7 +197,9 @@ func (a *AgentEventAdapter) PublishAgentEvent(ctx context.Context, source agent.
 	a.mu.Unlock()
 	event.ID = "product:" + source.ID
 	event.SessionID = a.sessionID
-	event.TurnID = TurnID(source.RunID)
+	event.TurnID = a.turnID
+	event.RunID = a.runID
+	event.NodeID = a.nodeID
 	event.Timestamp = source.Timestamp
 	if a.revisions != nil {
 		revision, err := a.revisions.CurrentRevision(ctx, a.sessionID)

@@ -130,6 +130,35 @@ func (approvalToolFactory) CreateTools(context.Context, codingagent.ToolScope) (
 	return tool.NewRegistry(approvalTool{})
 }
 
+type handoffControlTool struct{}
+
+func (handoffControlTool) Definition() llm.ToolDefinition {
+	return llm.ToolDefinition{Name: "handoff_control", Description: "request a product control transition", InputSchema: json.RawMessage(`{"type":"object"}`)}
+}
+
+func (handoffControlTool) ReplayPolicy() tool.ReplayPolicy { return tool.ReplayNever }
+
+func (handoffControlTool) ControlPolicy() tool.ControlPolicy {
+	return tool.ControlPolicy{Exclusive: true, HandoffAfterResolution: true}
+}
+
+func (handoffControlTool) Execute(context.Context, tool.Call, tool.ProgressSink) (tool.Result, error) {
+	return tool.Result{
+		Status: tool.ResultInterrupted, Content: []llm.Content{{Type: llm.ContentText, Text: "control approval required"}},
+		Interrupt: &tool.Interrupt{ID: "control-product-1", Kind: "control"},
+	}, nil
+}
+
+func (handoffControlTool) Resume(_ context.Context, _ tool.Call, _ tool.Interrupt, resolution tool.Result, _ tool.ProgressSink) (tool.Result, error) {
+	return resolution, nil
+}
+
+type handoffToolFactory struct{}
+
+func (handoffToolFactory) CreateTools(context.Context, codingagent.ToolScope) (*tool.Registry, error) {
+	return tool.NewRegistry(handoffControlTool{})
+}
+
 type grantAwarePatchTool struct {
 	owner   *grantAwareToolFactory
 	granted bool
@@ -180,6 +209,22 @@ func (f recoveryToolFactory) CreateTools(context.Context, codingagent.ToolScope)
 	return tool.NewRegistry(f.executable)
 }
 
+type gapAgentRunner struct{ runs int }
+
+func (r *gapAgentRunner) Run(_ context.Context, request agent.RunRequest, _ agent.EventSink) (agent.RunResult, error) {
+	r.runs++
+	message := finalAssistant()
+	return agent.RunResult{RunID: request.RunID, Status: agent.RunCompleted, FinalMessage: &message}, nil
+}
+
+func (*gapAgentRunner) Resume(context.Context, agent.ResumeRequest, agent.EventSink) (agent.RunResult, error) {
+	return agent.RunResult{}, nil
+}
+
+func (*gapAgentRunner) Recover(context.Context, agent.RecoverRequest, agent.EventSink) (agent.RunResult, error) {
+	return agent.RunResult{}, nil
+}
+
 func TestServiceComposesGenericAgentIntoProductSnapshotAndEvents(t *testing.T) {
 	productStore := codingmemory.NewRepository()
 	seedMemoryWorktree(t, productStore, "workspace-1", "worktree-1")
@@ -194,7 +239,7 @@ func TestServiceComposesGenericAgentIntoProductSnapshotAndEvents(t *testing.T) {
 	}
 	events := &productEvents{}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: productStore,
 		Agent: runtime, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: events,
 	})
 	if err != nil {
@@ -231,6 +276,211 @@ func TestServiceComposesGenericAgentIntoProductSnapshotAndEvents(t *testing.T) {
 	}
 }
 
+func TestServiceProductTurnFeatureFlagRestoresLegacyDirectPath(t *testing.T) {
+	productStore := codingmemory.NewRepository()
+	seedMemoryWorktree(t, productStore, "workspace-legacy", "worktree-legacy")
+	agentSessions := agentsession.NewMemoryRepository()
+	contexts, _ := contextmanager.NewManager()
+	runtime, _ := agent.NewRuntime(agent.Dependencies{Models: finalModelFactory{}, Contexts: contexts, Sessions: agentSessions})
+	features := codingagent.DefaultFeatureFlags()
+	features.ProductTurns = false
+	service, err := codingagent.NewService(codingagent.Dependencies{
+		Sessions: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Agent: runtime, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: &productEvents{}, Features: &features,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(context.Background(), codingagent.Session{
+		ID: "coding-legacy", AgentSessionID: "agent-legacy", WorkspaceID: "workspace-legacy", WorktreeID: "worktree-legacy",
+		ProviderProfileID: "profile", ModelID: "model", PermissionMode: codingagent.PermissionAsk,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.StartTurn(context.Background(), codingagent.TurnRequest{SessionID: session.ID, Text: "inspect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TurnID == "" || result.TurnID != codingagent.TurnID(result.RunID) {
+		t.Fatalf("legacy identities = %#v", result)
+	}
+	turns, err := productStore.ListTurns(context.Background(), session.ID)
+	if err != nil || len(turns) != 0 {
+		t.Fatalf("disabled Product Turns persisted data: %#v, %v", turns, err)
+	}
+	snapshot, err := service.Snapshot(context.Background(), session.ID)
+	if err != nil || snapshot.ActiveTurn != nil || len(snapshot.Transcript) != 2 {
+		t.Fatalf("legacy snapshot = %#v, %v", snapshot, err)
+	}
+}
+
+func TestServiceContinuesTwoRunsInOneProductTurnWithoutSyntheticUserMessage(t *testing.T) {
+	productStore := codingmemory.NewRepository()
+	seedMemoryWorktree(t, productStore, "workspace-handoff", "worktree-handoff")
+	agentSessions := agentsession.NewMemoryRepository()
+	contexts, _ := contextmanager.NewManager()
+	model := &sequentialModel{responses: []llm.Message{
+		{Role: llm.RoleAssistant, StopReason: llm.StopReasonToolUse, Content: []llm.Content{{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "control-call", Name: "handoff_control", Arguments: json.RawMessage(`{}`)}}}},
+		{Role: llm.RoleAssistant, StopReason: llm.StopReasonStop, Content: []llm.Content{{Type: llm.ContentText, Text: "continued"}}},
+	}}
+	runtime, err := agent.NewRuntime(agent.Dependencies{Models: sequentialModelFactory{model: model}, Contexts: contexts, Sessions: agentSessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := &productEvents{}
+	service, err := codingagent.NewService(codingagent.Dependencies{
+		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Agent: runtime, Tools: handoffToolFactory{}, Prompts: staticPrompt{}, Events: events,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(context.Background(), codingagent.Session{
+		ID: "coding-handoff", AgentSessionID: "agent-handoff", WorkspaceID: "workspace-handoff", WorktreeID: "worktree-handoff",
+		ProviderProfileID: "profile", ModelID: "model", PermissionMode: codingagent.PermissionAsk,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.StartTurn(context.Background(), codingagent.TurnRequest{SessionID: session.ID, Text: "one request"})
+	if err != nil || first.Status != string(agent.RunInterrupted) || first.TurnID == codingagent.TurnID(first.RunID) {
+		t.Fatalf("first Run = %#v, %v", first, err)
+	}
+	handoff, err := service.ResumeTurn(context.Background(), codingagent.ResumeTurnRequest{
+		SessionID: session.ID, TurnID: first.TurnID, InterruptID: first.InterruptID, Decision: codingagent.ResolutionApproved,
+	})
+	if err != nil || handoff.Status != string(agent.RunHandedOff) || handoff.RunID != first.RunID {
+		t.Fatalf("handoff = %#v, %v", handoff, err)
+	}
+	continued, err := service.ContinueTurn(context.Background(), session.ID, first.TurnID)
+	if err != nil || continued.Status != string(agent.RunCompleted) || continued.RunID == first.RunID {
+		t.Fatalf("continued Run = %#v, %v", continued, err)
+	}
+	turn, err := productStore.LoadTurn(context.Background(), first.TurnID)
+	if err != nil || turn.Status != codingagent.TurnCompleted || len(turn.Runs) != 2 || turn.Runs[0].Status != codingagent.RunBindingHandedOff || turn.Runs[1].Status != codingagent.RunBindingCompleted {
+		t.Fatalf("Product Turn = %#v, %v", turn, err)
+	}
+	durable, err := agentSessions.Load(context.Background(), session.AgentSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userMessages := 0
+	for _, entry := range durable.Entries {
+		if entry.Message != nil && entry.Message.Role == llm.RoleUser {
+			userMessages++
+		}
+	}
+	if userMessages != 1 {
+		t.Fatalf("user messages = %d, entries=%#v", userMessages, durable.Entries)
+	}
+	snapshot, err := service.Snapshot(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Metrics.LatestTurnID != first.TurnID || snapshot.Metrics.LatestRunID != continued.RunID || snapshot.Metrics.LatestPhase != codingagent.TurnPhaseDirect || snapshot.Metrics.LatestProfile != codingagent.CapabilityDirect || snapshot.Metrics.LatestTurnStatus != codingagent.TurnCompleted {
+		t.Fatalf("phase-aware metrics = %#v", snapshot.Metrics)
+	}
+	for _, item := range snapshot.Transcript {
+		if item.TurnID != first.TurnID {
+			t.Fatalf("transcript Turn binding = %#v", snapshot.Transcript)
+		}
+	}
+	for _, event := range events.values {
+		if event.TurnID != first.TurnID || (event.RunID != first.RunID && event.RunID != continued.RunID) {
+			t.Fatalf("event identity = %#v", event)
+		}
+	}
+}
+
+func TestRecoveryCoordinatorClosesProductTurnCrashGapsExactlyOnce(t *testing.T) {
+	newFixture := func(t *testing.T, suffix string) (*codingagent.Service, *codingmemory.Repository, agentsession.Repository, *gapAgentRunner, codingagent.Session) {
+		t.Helper()
+		products := codingmemory.NewRepository()
+		seedMemoryWorktree(t, products, codingagent.WorkspaceID("workspace-"+suffix), codingagent.WorktreeID("worktree-"+suffix))
+		agentSessions := agentsession.NewMemoryRepository()
+		runner := &gapAgentRunner{}
+		service, err := codingagent.NewService(codingagent.Dependencies{
+			Sessions: products, Turns: products, AgentSessions: agentSessions, Worktrees: products,
+			Agent: runner, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: &productEvents{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, err := service.CreateSession(context.Background(), codingagent.Session{
+			ID: codingagent.SessionID("coding-" + suffix), AgentSessionID: agentsession.ID("agent-" + suffix),
+			WorkspaceID: codingagent.WorkspaceID("workspace-" + suffix), WorktreeID: codingagent.WorktreeID("worktree-" + suffix),
+			ProviderProfileID: "profile", ModelID: "model", PermissionMode: codingagent.PermissionAsk,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return service, products, agentSessions, runner, session
+	}
+	createPending := func(t *testing.T, products *codingmemory.Repository, session codingagent.Session, suffix string) codingagent.Turn {
+		t.Helper()
+		now := time.Now().UTC()
+		turn := codingagent.Turn{
+			ID: codingagent.TurnID("turn-" + suffix), SessionID: session.ID, RequestText: "recover request",
+			Phase: codingagent.TurnPhaseDirect, Status: codingagent.TurnPending, Strategy: codingagent.ExecutionSingle, Revision: 1,
+			Runs:      []codingagent.RunBinding{{RunID: agentsession.RunID("run-" + suffix), UserEntryID: agentsession.EntryID("entry-" + suffix), Phase: codingagent.TurnPhaseDirect, Profile: codingagent.CapabilityDirect, Status: codingagent.RunBindingPending}},
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := products.CreateTurn(context.Background(), turn); err != nil {
+			t.Fatal(err)
+		}
+		return turn
+	}
+	markRunning := func(t *testing.T, products *codingmemory.Repository, turn codingagent.Turn) codingagent.Turn {
+		t.Helper()
+		turn.Runs[0].Status = codingagent.RunBindingRunning
+		turn.Runs[0].StartedAt = turn.CreatedAt
+		turn.Status = codingagent.TurnRunning
+		turn.Revision = 2
+		if err := products.SaveTurn(context.Background(), turn, 1); err != nil {
+			t.Fatal(err)
+		}
+		return turn
+	}
+
+	for _, boundary := range []string{"created", "bound"} {
+		t.Run(boundary, func(t *testing.T) {
+			service, products, _, runner, session := newFixture(t, boundary)
+			turn := createPending(t, products, session, boundary)
+			if boundary == "bound" {
+				turn = markRunning(t, products, turn)
+			}
+			completed, err := service.RecoverAutomatically(context.Background(), session.ID)
+			if err != nil || completed != 1 || runner.runs != 1 {
+				t.Fatalf("first recovery = %d runs=%d err=%v", completed, runner.runs, err)
+			}
+			completed, err = service.RecoverAutomatically(context.Background(), session.ID)
+			if err != nil || completed != 0 || runner.runs != 1 {
+				t.Fatalf("repeat recovery = %d runs=%d err=%v", completed, runner.runs, err)
+			}
+			loaded, err := products.LoadTurn(context.Background(), turn.ID)
+			if err != nil || loaded.Status != codingagent.TurnCompleted {
+				t.Fatalf("recovered Turn = %#v, %v", loaded, err)
+			}
+		})
+	}
+
+	t.Run("agent terminal before Product Turn terminal", func(t *testing.T) {
+		service, products, agentSessions, runner, session := newFixture(t, "terminal")
+		turn := markRunning(t, products, createPending(t, products, session, "terminal"))
+		appendAgentRecord(t, agentSessions, session.AgentSessionID, agentsession.Record{ID: "started", Type: agentsession.RecordOperationStarted, RunID: turn.Runs[0].RunID, Operation: &agentsession.OperationData{Intent: agentsession.OperationRun}})
+		appendAgentRecord(t, agentSessions, session.AgentSessionID, agentsession.Record{ID: "finished", Type: agentsession.RecordOperationFinished, RunID: turn.Runs[0].RunID, Operation: &agentsession.OperationData{Intent: agentsession.OperationRun, Outcome: string(agent.RunCompleted)}})
+		completed, err := service.RecoverAutomatically(context.Background(), session.ID)
+		if err != nil || completed != 1 || runner.runs != 0 {
+			t.Fatalf("terminal reconciliation = %d runs=%d err=%v", completed, runner.runs, err)
+		}
+		loaded, err := products.LoadTurn(context.Background(), turn.ID)
+		if err != nil || loaded.Status != codingagent.TurnCompleted || loaded.Runs[0].Status != codingagent.RunBindingCompleted {
+			t.Fatalf("terminal Turn = %#v, %v", loaded, err)
+		}
+	})
+}
+
 func TestServiceCancelTurnOwnsCancellationAndAgentPersistsAbortedTerminal(t *testing.T) {
 	productStore := codingmemory.NewRepository()
 	seedMemoryWorktree(t, productStore, "workspace-cancel", "worktree-cancel")
@@ -243,7 +493,7 @@ func TestServiceCancelTurnOwnsCancellationAndAgentPersistsAbortedTerminal(t *tes
 	}
 	events := &productEvents{}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: productStore,
 		Agent: runtime, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: events,
 	})
 	if err != nil {
@@ -321,7 +571,7 @@ func TestRecoveryCoordinatorReplaysOnlySafeToolAndProjectsManualContinuation(t *
 	}
 	executable := &recoveryReadTool{}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: productStore,
 		Agent: runtime, Tools: recoveryToolFactory{executable: executable}, Prompts: staticPrompt{}, Events: &productEvents{},
 	})
 	if err != nil {
@@ -406,7 +656,7 @@ func TestServiceProjectsAndResolvesInterruptWithoutExposingToolResult(t *testing
 		t.Fatalf("create Agent runtime: %v", err)
 	}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: productStore,
 		Agent: runtime, Tools: approvalToolFactory{}, Prompts: staticPrompt{}, Events: &productEvents{},
 	})
 	if err != nil {
@@ -472,7 +722,7 @@ func TestServiceSessionGrantIsDerivedFromPendingJournalPersistedAndReused(t *tes
 	}
 	factory := &grantAwareToolFactory{}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, AgentSessions: agentSessions, Worktrees: productStore,
+		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: productStore,
 		Agent: runtime, Tools: factory, Prompts: staticPrompt{}, Events: &productEvents{},
 	})
 	if err != nil {

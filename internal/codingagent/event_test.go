@@ -18,15 +18,15 @@ func (c *productEventCollector) PublishCodingEvent(_ context.Context, event Even
 
 func TestAgentEventAdapterWhitelistsAssistantAndToolFields(t *testing.T) {
 	collector := &productEventCollector{}
-	adapter, err := NewAgentEventAdapter("coding-session-1", collector, nil)
+	adapter, err := NewAgentEventAdapter("coding-session-1", "turn-1", "run-1", "", collector, nil)
 	if err != nil {
 		t.Fatalf("create adapter: %v", err)
 	}
 	timestamp := time.Now().UTC()
 	inputs := []agent.Event{
-		{ID: "a1", SessionID: "agent-session-1", RunID: agentsession.RunID("turn-1"), Timestamp: timestamp, Kind: agent.EventAssistantTextDelta, Assistant: &agent.AssistantEvent{Text: "hello"}},
-		{ID: "a2", SessionID: "agent-session-1", RunID: agentsession.RunID("turn-1"), Timestamp: timestamp, Kind: agent.EventAssistantThinkingChanged, Assistant: &agent.AssistantEvent{Text: "private reasoning", ThinkingActive: true}},
-		{ID: "a3", SessionID: "agent-session-1", RunID: agentsession.RunID("turn-1"), Timestamp: timestamp, Kind: agent.EventToolStarted, Tool: &agent.ToolEvent{CallID: "call-1", Name: "read_file", Status: "running", Summary: "reading"}},
+		{ID: "a1", SessionID: "agent-session-1", RunID: agentsession.RunID("run-1"), Timestamp: timestamp, Kind: agent.EventAssistantTextDelta, Assistant: &agent.AssistantEvent{Text: "hello"}},
+		{ID: "a2", SessionID: "agent-session-1", RunID: agentsession.RunID("run-1"), Timestamp: timestamp, Kind: agent.EventAssistantThinkingChanged, Assistant: &agent.AssistantEvent{Text: "private reasoning", ThinkingActive: true}},
+		{ID: "a3", SessionID: "agent-session-1", RunID: agentsession.RunID("run-1"), Timestamp: timestamp, Kind: agent.EventToolStarted, Tool: &agent.ToolEvent{CallID: "call-1", Name: "read_file", Status: "running", Summary: "reading"}},
 	}
 	for _, input := range inputs {
 		if err := adapter.PublishAgentEvent(context.Background(), input); err != nil {
@@ -48,17 +48,32 @@ func TestAgentEventAdapterWhitelistsAssistantAndToolFields(t *testing.T) {
 	if tool := collector.events[2].Payload.Tool; tool == nil || tool.CallID != "call-1" || tool.Name != "read_file" {
 		t.Fatalf("tool activity = %#v", collector.events[2])
 	}
+	if collector.events[0].TurnID != "turn-1" || collector.events[0].RunID != "run-1" {
+		t.Fatalf("explicit event binding = %#v", collector.events[0])
+	}
+}
+
+func TestAgentEventAdapterRejectsMismatchedRun(t *testing.T) {
+	collector := &productEventCollector{}
+	adapter, err := NewAgentEventAdapter("coding-session-1", "turn-1", "run-1", "node-1", collector, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = adapter.PublishAgentEvent(context.Background(), agent.Event{ID: "event", RunID: "run-2", Kind: agent.EventRunStarted, Timestamp: time.Now().UTC()})
+	if err == nil {
+		t.Fatal("mismatched run was accepted")
+	}
 }
 
 func TestAgentEventAdapterMapsApprovalInterruptsToProductEvents(t *testing.T) {
 	collector := &productEventCollector{}
-	adapter, err := NewAgentEventAdapter("coding-session-1", collector, nil)
+	adapter, err := NewAgentEventAdapter("coding-session-1", "turn-1", "run-1", "", collector, nil)
 	if err != nil {
 		t.Fatalf("create adapter: %v", err)
 	}
 	inputs := []agent.Event{
-		{ID: "a1", RunID: "turn-1", Timestamp: time.Now().UTC(), Kind: agent.EventRunInterrupted, Interrupt: &agent.InterruptEvent{ID: "approval-1", Kind: "approval"}},
-		{ID: "a2", RunID: "turn-1", Timestamp: time.Now().UTC(), Kind: agent.EventRunResumed, Interrupt: &agent.InterruptEvent{ID: "approval-1", Kind: "approval", Decision: "completed"}},
+		{ID: "a1", RunID: "run-1", Timestamp: time.Now().UTC(), Kind: agent.EventRunInterrupted, Interrupt: &agent.InterruptEvent{ID: "approval-1", Kind: "approval"}},
+		{ID: "a2", RunID: "run-1", Timestamp: time.Now().UTC(), Kind: agent.EventRunResumed, Interrupt: &agent.InterruptEvent{ID: "approval-1", Kind: "approval", Decision: "completed"}},
 	}
 	for _, input := range inputs {
 		if err := adapter.PublishAgentEvent(context.Background(), input); err != nil {
@@ -75,8 +90,8 @@ func TestAgentEventAdapterMapsApprovalInterruptsToProductEvents(t *testing.T) {
 
 func TestAgentEventAdapterMapsRetryWithoutProviderDetails(t *testing.T) {
 	collector := &productEventCollector{}
-	adapter, _ := NewAgentEventAdapter("coding-session-1", collector, nil)
-	input := agent.Event{ID: "retry", RunID: "turn-1", Timestamp: time.Now().UTC(), Kind: agent.EventRetryScheduled, Retry: &agent.RetryEvent{Attempt: 2, Delay: 500 * time.Millisecond, Reason: "rate_limited"}}
+	adapter, _ := NewAgentEventAdapter("coding-session-1", "turn-1", "run-1", "", collector, nil)
+	input := agent.Event{ID: "retry", RunID: "run-1", Timestamp: time.Now().UTC(), Kind: agent.EventRetryScheduled, Retry: &agent.RetryEvent{Attempt: 2, Delay: 500 * time.Millisecond, Reason: "rate_limited"}}
 	if err := adapter.PublishAgentEvent(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}

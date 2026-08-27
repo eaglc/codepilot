@@ -122,6 +122,23 @@ type interruptTool struct {
 	resumes int
 }
 
+type handoffTool struct{ resumes int }
+
+func (*handoffTool) Definition() llm.ToolDefinition {
+	return llm.ToolDefinition{Name: "handoff", Description: "control handoff", InputSchema: json.RawMessage(`{"type":"object"}`)}
+}
+func (*handoffTool) ReplayPolicy() tool.ReplayPolicy { return tool.ReplayNever }
+func (*handoffTool) Execute(context.Context, tool.Call, tool.ProgressSink) (tool.Result, error) {
+	return tool.Result{Status: tool.ResultInterrupted, Content: []llm.Content{{Type: llm.ContentText, Text: "waiting"}}, Interrupt: &tool.Interrupt{ID: "handoff-1", Kind: "control"}}, nil
+}
+func (t *handoffTool) Resume(_ context.Context, _ tool.Call, _ tool.Interrupt, resolution tool.Result, _ tool.ProgressSink) (tool.Result, error) {
+	t.resumes++
+	return resolution, nil
+}
+func (*handoffTool) ControlPolicy() tool.ControlPolicy {
+	return tool.ControlPolicy{Exclusive: true, HandoffAfterResolution: true}
+}
+
 func (*interruptTool) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{Name: "request_approval", Description: "request approval", InputSchema: json.RawMessage(`{"type":"object"}`)}
 }
@@ -1123,6 +1140,77 @@ func appendRecoveryRecord(t *testing.T, repository agentsession.Repository, reco
 	t.Helper()
 	if _, err := repository.AppendRecord(context.Background(), "session-recovery", agentsession.MainLane, record); err != nil {
 		t.Fatalf("append recovery record %q: %v", record.ID, err)
+	}
+}
+
+func TestRuntimeRejectsExclusiveControlMixedWithOtherCalls(t *testing.T) {
+	repository := agentsession.NewMemoryRepository()
+	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-exclusive"}); err != nil {
+		t.Fatal(err)
+	}
+	manager, _ := contextmanager.NewManager()
+	model := &fakeModel{responses: []llm.Message{{Role: llm.RoleAssistant, StopReason: llm.StopReasonToolUse, Content: []llm.Content{
+		{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "control", Name: "handoff", Arguments: json.RawMessage(`{}`)}},
+		{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "read", Name: "read_file", Arguments: json.RawMessage(`{}`)}},
+	}}}}
+	handoff := &handoffTool{}
+	read := &readTool{}
+	registry, _ := tool.NewRegistry(handoff, read)
+	runtime, _ := NewRuntime(Dependencies{Models: fakeModelFactory{model: model}, Contexts: manager, Sessions: repository, IDs: &sequenceIDs{}})
+	result, err := runtime.Run(context.Background(), RunRequest{SessionID: "session-exclusive", RunID: "run-exclusive", UserEntryID: "user-exclusive", Model: llm.ModelRef{Provider: "test", Model: "model"}, UserMessage: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "control"}}}, Tools: registry}, &eventCollector{})
+	if err == nil || result.Status != RunFailed || handoff.resumes != 0 || read.calls != 0 {
+		t.Fatalf("mixed control result=%#v err=%v handoff=%d read=%d", result, err, handoff.resumes, read.calls)
+	}
+}
+
+func TestRuntimeControlResolutionHandsOffWithoutAnotherModelStep(t *testing.T) {
+	repository := agentsession.NewMemoryRepository()
+	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-handoff"}); err != nil {
+		t.Fatal(err)
+	}
+	manager, _ := contextmanager.NewManager()
+	model := &fakeModel{responses: []llm.Message{{Role: llm.RoleAssistant, StopReason: llm.StopReasonToolUse, Content: []llm.Content{{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "control", Name: "handoff", Arguments: json.RawMessage(`{}`)}}}}}}
+	handoff := &handoffTool{}
+	registry, _ := tool.NewRegistry(handoff)
+	runtime, _ := NewRuntime(Dependencies{Models: fakeModelFactory{model: model}, Contexts: manager, Sessions: repository, IDs: &sequenceIDs{}})
+	first, err := runtime.Run(context.Background(), RunRequest{SessionID: "session-handoff", RunID: "run-handoff", UserEntryID: "user-handoff", Model: llm.ModelRef{Provider: "test", Model: "model"}, UserMessage: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "control"}}}, Tools: registry}, &eventCollector{})
+	if err != nil || first.Status != RunInterrupted {
+		t.Fatalf("initial handoff result=%#v err=%v", first, err)
+	}
+	resumed, err := runtime.Resume(context.Background(), ResumeRequest{SessionID: "session-handoff", RunID: "run-handoff", InterruptID: "handoff-1", Resolution: tool.Result{Status: tool.ResultCompleted, Content: []llm.Content{{Type: llm.ContentText, Text: "approved"}}}, Model: llm.ModelRef{Provider: "test", Model: "model"}, Tools: registry}, &eventCollector{})
+	if err != nil || resumed.Status != RunHandedOff || handoff.resumes != 1 || len(model.requests) != 1 {
+		t.Fatalf("resumed handoff result=%#v err=%v resumes=%d model_requests=%d", resumed, err, handoff.resumes, len(model.requests))
+	}
+}
+
+func TestRuntimeContinueDoesNotAppendSyntheticUserMessage(t *testing.T) {
+	repository := agentsession.NewMemoryRepository()
+	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-continue"}); err != nil {
+		t.Fatal(err)
+	}
+	manager, _ := contextmanager.NewManager()
+	model := &fakeModel{responses: []llm.Message{
+		{Role: llm.RoleAssistant, StopReason: llm.StopReasonStop, Content: []llm.Content{{Type: llm.ContentText, Text: "first"}}},
+		{Role: llm.RoleAssistant, StopReason: llm.StopReasonStop, Content: []llm.Content{{Type: llm.ContentText, Text: "second"}}},
+	}}
+	runtime, _ := NewRuntime(Dependencies{Models: fakeModelFactory{model: model}, Contexts: manager, Sessions: repository, IDs: &sequenceIDs{}})
+	_, err := runtime.Run(context.Background(), RunRequest{SessionID: "session-continue", RunID: "run-1", UserEntryID: "user-1", Model: llm.ModelRef{Provider: "test", Model: "model"}, UserMessage: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "request"}}}}, &eventCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runtime.Continue(context.Background(), ContinueRequest{SessionID: "session-continue", RunID: "run-2", Model: llm.ModelRef{Provider: "test", Model: "model"}}, &eventCollector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _ := repository.Load(context.Background(), "session-continue")
+	var users int
+	for _, entry := range snapshot.Entries {
+		if entry.Message != nil && entry.Message.Role == llm.RoleUser {
+			users++
+		}
+	}
+	if users != 1 {
+		t.Fatalf("synthetic user messages = %d, entries=%#v", users, snapshot.Entries)
 	}
 }
 

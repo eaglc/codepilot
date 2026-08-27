@@ -64,6 +64,19 @@ func (r *Registry) Lookup(name string) (Tool, bool) {
 	return executable, exists
 }
 
+// ControlPolicy returns trusted orchestration metadata for a registered Tool.
+func (r *Registry) ControlPolicy(name string) (ControlPolicy, bool) {
+	executable, exists := r.Lookup(name)
+	if !exists {
+		return ControlPolicy{}, false
+	}
+	control, ok := executable.(ControlTool)
+	if !ok {
+		return ControlPolicy{}, false
+	}
+	return control.ControlPolicy(), true
+}
+
 // Execute validates and dispatches a call without emitting activities or writing storage.
 func (r *Registry) Execute(ctx context.Context, call Call, progress ProgressSink) (Result, error) {
 	if err := ctx.Err(); err != nil {

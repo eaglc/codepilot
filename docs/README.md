@@ -4,6 +4,10 @@
 
 ## 当前有效文档
 
+### 产品需求
+
+- [Plan 模式、子 Agent 与 Workflow 产品需求](design/plan-mode-and-multi-agent-requirements.md)：后续 Plan、Workflow 和多 Agent 能力的权威需求基线，定义产品语义、用户交互、能力边界和验收标准。
+
 ### 架构
 
 - [模块化架构基线与迁移计划](architecture/modular-architecture-migration.md)：当前 `internal` 分层、依赖方向、迁移边界和已落地能力的权威说明。
@@ -11,7 +15,7 @@
 ### 路线图
 
 - [产品补全路线图](roadmap/product-completion-roadmap.md)：当前产品实现状态、已完成阶段和发布前剩余事项。
-- [Plan 模式与多 Agent 演进规划](roadmap/plan-mode-and-multi-agent-roadmap.md)：P3/P4 及后续发展方向，包含设计方案、执行步骤和验收标准。
+- [Plan、Workflow 与多 Agent 可持续交付方案](roadmap/plan-workflow-multi-agent-delivery-plan.md)：依据产品需求基线制定的分阶段设计、具体改造步骤、设计原因和验收门槛。
 
 ### 设计
 
@@ -34,3 +38,5 @@
 ## 历史归档
 
 `archive/` 中的文件用于追溯决策和迁移背景，包括旧版 PRD、单体架构详细设计、早期功能路线、改进清单、架构评审报告和迁移前上下文分析。归档文件可以帮助理解历史，但不代表当前实现。
+
+[旧版 Plan 模式与多 Agent 演进规划](roadmap/plan-mode-and-multi-agent-roadmap.md)保留用于追溯早期技术方案，已经被新的产品需求基线取代，不作为后续实现依据。

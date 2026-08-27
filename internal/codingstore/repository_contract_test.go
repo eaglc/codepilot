@@ -14,6 +14,7 @@ import (
 type repository interface {
 	codingagent.WorkspaceRepository
 	codingagent.SessionRepository
+	codingagent.TurnRepository
 }
 
 func TestRepositoriesEnforceTheSamePersistenceContract(t *testing.T) {
@@ -102,6 +103,40 @@ func testRepositoryContract(t *testing.T, repository repository) {
 	}
 	if err := repository.CreateSession(ctx, session); err != nil {
 		t.Fatalf("CreateSession: %v", err)
+	}
+	turn := codingagent.Turn{
+		ID: "turn", SessionID: session.ID, RequestText: "request", Phase: codingagent.TurnPhaseDirect,
+		Status: codingagent.TurnPending, Strategy: codingagent.ExecutionSingle, Revision: 1,
+		Runs:      []codingagent.RunBinding{{RunID: "run", UserEntryID: "entry", Phase: codingagent.TurnPhaseDirect, Profile: codingagent.CapabilityDirect, Status: codingagent.RunBindingPending}},
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := repository.CreateTurn(ctx, turn); err != nil {
+		t.Fatalf("CreateTurn: %v", err)
+	}
+	secondSession := session
+	secondSession.ID = "session-2"
+	secondSession.AgentSessionID = "agent-2"
+	if err := repository.CreateSession(ctx, secondSession); err != nil {
+		t.Fatalf("CreateSession second: %v", err)
+	}
+	duplicateTurn := turn
+	duplicateTurn.SessionID = secondSession.ID
+	if err := repository.CreateTurn(ctx, duplicateTurn); err == nil {
+		t.Fatal("CreateTurn accepted a globally duplicated TurnID")
+	}
+	loadedTurn, err := repository.LoadTurn(ctx, turn.ID)
+	if err != nil || loadedTurn.ID != turn.ID {
+		t.Fatalf("LoadTurn = %#v, %v", loadedTurn, err)
+	}
+	turn.Runs[0].Status = codingagent.RunBindingRunning
+	turn.Runs[0].StartedAt = now
+	turn.Status = codingagent.TurnRunning
+	turn.Revision = 2
+	if err := repository.SaveTurn(ctx, turn, 1); err != nil {
+		t.Fatalf("SaveTurn: %v", err)
+	}
+	if err := repository.SaveTurn(ctx, turn, 1); err == nil {
+		t.Fatal("SaveTurn accepted a stale revision")
 	}
 	changedSession := session
 	changedSession.WorktreeID = "another"

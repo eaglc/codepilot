@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/eaglc/codepilot/internal/agent"
 	agentsession "github.com/eaglc/codepilot/internal/agent/session"
@@ -25,7 +26,29 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoverTurnRequest) (
 	operation := s.operationLock(request.SessionID)
 	operation.Lock()
 	defer operation.Unlock()
-	environment, err := s.prepareRecovery(ctx, request.SessionID)
+	turn := Turn{}
+	legacy := !s.features.ProductTurns
+	if !legacy {
+		turn, err = s.deps.Turns.LoadTurn(ctx, request.TurnID)
+		legacy = errors.Is(err, ErrTurnNotFound)
+	}
+	if err != nil && !legacy {
+		return TurnResult{}, fmt.Errorf("recover Coding Agent turn: load Product Turn: %w", err)
+	}
+	if legacy {
+		turn = Turn{ID: request.TurnID, SessionID: request.SessionID}
+	}
+	if !legacy && turn.SessionID != request.SessionID {
+		return TurnResult{}, errors.New("recover Coding Agent turn: Product Turn belongs to another session")
+	}
+	binding, found := turn.ActiveRun()
+	if legacy {
+		binding, found = RunBinding{RunID: agentsession.RunID(request.TurnID)}, true
+	}
+	if !found {
+		return TurnResult{}, errors.New("recover Coding Agent turn: Product Turn has no active Run")
+	}
+	environment, err := s.prepareRecovery(ctx, request.SessionID, turn.ID, binding.RunID)
 	if err != nil {
 		return TurnResult{}, err
 	}
@@ -34,16 +57,28 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoverTurnRequest) (
 	defer finishActive()
 	result, recoverErr := s.deps.Agent.Recover(runCtx, agent.RecoverRequest{
 		SessionID: environment.product.AgentSessionID, Lane: sessionLane(environment.product),
-		RunID: agentsession.RunID(request.TurnID), ActionID: request.ActionID, Decision: decision, ContinueRun: true,
+		RunID: binding.RunID, ActionID: request.ActionID, Decision: decision, ContinueRun: true,
 		SystemPrompt:     environment.systemPrompt,
 		Model:            llm.ModelRef{Provider: environment.product.ProviderProfileID, Model: environment.product.ModelID},
 		UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
 	}, environment.events)
-	s.refreshRecoveryState(ctx, environment.product)
+	if result.RunID == "" {
+		result.RunID = binding.RunID
+	}
+	var finishErr error
+	if legacy {
+		s.refreshRecoveryState(ctx, environment.product)
+	} else {
+		turn, finishErr = s.finishProductRun(context.WithoutCancel(ctx), turn, result, recoverErr)
+		s.setState(environment.product.ID, runtimeStateForTurn(turn))
+	}
 	touchErr := s.touchSession(context.WithoutCancel(ctx), environment.product)
-	productResult := productTurnResult(result)
+	productResult := productTurnResult(turn.ID, result)
 	if recoverErr != nil {
 		return productResult, fmt.Errorf("recover Coding Agent turn: %w", recoverErr)
+	}
+	if finishErr != nil {
+		return productResult, fmt.Errorf("recover Coding Agent turn: persist Product Turn: %w", finishErr)
 	}
 	if touchErr != nil {
 		return productResult, fmt.Errorf("recover Coding Agent turn: update product session: %w", touchErr)
@@ -62,13 +97,19 @@ func (s *Service) RecoverAutomatically(ctx context.Context, sessionID SessionID)
 	operation := s.operationLock(sessionID)
 	operation.Lock()
 	defer operation.Unlock()
-	environment, err := s.prepareRecovery(ctx, sessionID)
+	product, err := s.deps.Sessions.LoadSession(ctx, sessionID)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("coordinate Coding Agent recovery: load session: %w", err)
 	}
 	completed := 0
+	if s.features.ProductTurns {
+		completed, err = s.reconcileProductTurns(ctx, product)
+		if err != nil {
+			return completed, err
+		}
+	}
 	for completed < 32 {
-		durable, err := s.deps.AgentSessions.Load(ctx, environment.product.AgentSessionID)
+		durable, err := s.deps.AgentSessions.Load(ctx, product.AgentSessionID)
 		if err != nil {
 			return completed, fmt.Errorf("coordinate Coding Agent recovery: load Agent session: %w", err)
 		}
@@ -83,11 +124,26 @@ func (s *Service) RecoverAutomatically(ctx context.Context, sessionID SessionID)
 		if action == nil {
 			s.setState(sessionID, recoveryState(plan, agentsession.AnalyzeRecovery(durable)))
 			if completed != 0 {
-				if err := s.touchSession(ctx, environment.product); err != nil {
+				if err := s.touchSession(ctx, product); err != nil {
 					return completed, fmt.Errorf("coordinate Coding Agent recovery: update product session: %w", err)
 				}
 			}
 			return completed, nil
+		}
+		turn, found := Turn{}, false
+		if s.features.ProductTurns {
+			turn, found, err = s.turnForRun(ctx, sessionID, action.RunID)
+			if err != nil {
+				return completed, fmt.Errorf("coordinate Coding Agent recovery: resolve Product Turn: %w", err)
+			}
+		}
+		turnID := TurnID(action.RunID)
+		if found {
+			turnID = turn.ID
+		}
+		environment, err := s.prepareRecovery(ctx, sessionID, turnID, action.RunID)
+		if err != nil {
+			return completed, err
 		}
 		s.setState(sessionID, RuntimeRunning)
 		result, err := s.deps.Agent.Recover(ctx, agent.RecoverRequest{
@@ -96,9 +152,19 @@ func (s *Service) RecoverAutomatically(ctx context.Context, sessionID SessionID)
 			Model:            llm.ModelRef{Provider: environment.product.ProviderProfileID, Model: environment.product.ModelID},
 			UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
 		}, environment.events)
+		if result.RunID == "" {
+			result.RunID = action.RunID
+		}
 		if err != nil {
 			s.setState(sessionID, RuntimeInterrupted)
 			return completed, fmt.Errorf("coordinate Coding Agent recovery action %q: %w", action.ID, err)
+		}
+		if found {
+			turn, finishErr := s.finishProductRun(context.WithoutCancel(ctx), turn, result, nil)
+			if finishErr != nil {
+				return completed, fmt.Errorf("coordinate Coding Agent recovery action %q: persist Product Turn: %w", action.ID, finishErr)
+			}
+			s.setState(sessionID, runtimeStateForTurn(turn))
 		}
 		completed++
 		if result.Interrupt != nil {
@@ -110,6 +176,101 @@ func (s *Service) RecoverAutomatically(ctx context.Context, sessionID SessionID)
 	return completed, errors.New("coordinate Coding Agent recovery: action limit exceeded")
 }
 
+// reconcileProductTurns closes durable gaps around the Product Turn boundary.
+// A pending binding with no Agent operation is safe to replay with its original
+// RunID/UserEntryID; a finished Agent operation is projected without rerunning
+// any model or Tool side effect.
+func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (int, error) {
+	turns, err := s.deps.Turns.ListTurns(ctx, product.ID)
+	if err != nil {
+		return 0, fmt.Errorf("coordinate Coding Agent recovery: list Product Turns: %w", err)
+	}
+	durable, err := s.deps.AgentSessions.Load(ctx, product.AgentSessionID)
+	if err != nil {
+		return 0, fmt.Errorf("coordinate Coding Agent recovery: load Agent session: %w", err)
+	}
+	globalRecovery := agentsession.AnalyzeRecovery(durable)
+	if len(globalRecovery.PendingRuns) != 0 || len(globalRecovery.PendingInterrupts) != 0 || len(globalRecovery.PendingTools) != 0 {
+		return 0, nil
+	}
+	completed := 0
+	for _, turn := range turns {
+		binding, active := turn.ActiveRun()
+		if !active {
+			continue
+		}
+		started, finished, outcome := runTerminalFacts(durable, binding.RunID)
+		if finished {
+			status := agent.RunCompleted
+			if outcome == string(agent.RunAborted) {
+				status = agent.RunAborted
+			} else if outcome == string(agent.RunFailed) {
+				status = agent.RunFailed
+			}
+			updated, saveErr := s.finishProductRun(ctx, turn, agent.RunResult{RunID: binding.RunID, Status: status, Reason: "recovered_terminal"}, nil)
+			if saveErr != nil {
+				return completed, fmt.Errorf("coordinate Coding Agent recovery: reconcile Product Turn %q: %w", turn.ID, saveErr)
+			}
+			s.setState(product.ID, runtimeStateForTurn(updated))
+			completed++
+			continue
+		}
+		if started {
+			continue
+		}
+		if binding.Status != RunBindingPending && binding.Status != RunBindingRunning {
+			continue
+		}
+		environment, envErr := s.prepareRunEnvironment(ctx, product, turn.ID, RunID(binding.RunID), "")
+		if envErr != nil {
+			return completed, fmt.Errorf("coordinate Coding Agent recovery: prepare Product Turn %q: %w", turn.ID, envErr)
+		}
+		if binding.Status == RunBindingPending {
+			turn, envErr = s.markRunStarted(ctx, turn, binding.RunID, time.Now().UTC())
+			if envErr != nil {
+				return completed, fmt.Errorf("coordinate Coding Agent recovery: bind Product Turn %q: %w", turn.ID, envErr)
+			}
+		}
+		result, runErr := s.deps.Agent.Run(ctx, agent.RunRequest{
+			SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: binding.RunID, UserEntryID: binding.UserEntryID,
+			SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
+			UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: turn.RequestText}}, Timestamp: turn.CreatedAt},
+			UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
+		}, environment.events)
+		if result.RunID == "" {
+			result.RunID = binding.RunID
+		}
+		updated, saveErr := s.finishProductRun(context.WithoutCancel(ctx), turn, result, runErr)
+		if saveErr != nil {
+			return completed, fmt.Errorf("coordinate Coding Agent recovery: finish Product Turn %q: %w", turn.ID, saveErr)
+		}
+		s.setState(product.ID, runtimeStateForTurn(updated))
+		completed++
+		if runErr != nil || result.Status == agent.RunInterrupted {
+			return completed, nil
+		}
+	}
+	return completed, nil
+}
+
+func runTerminalFacts(snapshot agentsession.Snapshot, runID agentsession.RunID) (started, finished bool, outcome string) {
+	for _, record := range snapshot.Records {
+		if record.RunID != runID {
+			continue
+		}
+		switch record.Type {
+		case agentsession.RecordOperationStarted:
+			started = true
+		case agentsession.RecordOperationFinished:
+			finished = true
+			if record.Operation != nil {
+				outcome = record.Operation.Outcome
+			}
+		}
+	}
+	return started, finished, outcome
+}
+
 type recoveryEnvironment struct {
 	product          Session
 	tools            *tool.Registry
@@ -118,41 +279,16 @@ type recoveryEnvironment struct {
 	events           *AgentEventAdapter
 }
 
-func (s *Service) prepareRecovery(ctx context.Context, sessionID SessionID) (recoveryEnvironment, error) {
+func (s *Service) prepareRecovery(ctx context.Context, sessionID SessionID, turnID TurnID, runID agentsession.RunID) (recoveryEnvironment, error) {
 	product, err := s.deps.Sessions.LoadSession(ctx, sessionID)
 	if err != nil {
 		return recoveryEnvironment{}, fmt.Errorf("prepare Coding Agent recovery: load session: %w", err)
 	}
-	worktree, err := s.deps.Worktrees.LoadWorktree(ctx, product.WorktreeID)
-	if err != nil {
-		return recoveryEnvironment{}, fmt.Errorf("prepare Coding Agent recovery: load worktree: %w", err)
-	}
-	tools, err := s.deps.Tools.CreateTools(ctx, ToolScope{
-		SessionID: product.ID, WorkspaceID: product.WorkspaceID, WorktreeID: product.WorktreeID,
-		WorktreeRoot: worktree.Root, PermissionMode: product.PermissionMode, PermissionGrants: clonePermissionGrants(product.PermissionGrants), SensitivePaths: append([]string(nil), product.SensitivePaths...),
-	})
-	if err != nil {
-		return recoveryEnvironment{}, fmt.Errorf("prepare Coding Agent recovery: create tools: %w", err)
-	}
-	definitions := tools.Definitions()
-	names := make([]string, len(definitions))
-	for index, definition := range definitions {
-		names[index] = definition.Name
-	}
-	promptScope := PromptScope{
-		WorkspaceID: product.WorkspaceID, WorktreeID: product.WorktreeID, WorktreeRoot: worktree.Root,
-		ToolNames: names, SensitivePaths: append([]string(nil), product.SensitivePaths...),
-	}
-	systemPrompt, untrustedContext, err := buildPromptContext(ctx, s.deps.Prompts, promptScope)
-	if err != nil {
-		return recoveryEnvironment{}, fmt.Errorf("prepare Coding Agent recovery: build prompt: %w", err)
-	}
-	revisions := durableRevisionSource{repository: s.deps.AgentSessions, agentSessionID: product.AgentSessionID}
-	events, err := NewAgentEventAdapter(product.ID, s.deps.Events, revisions)
+	environment, err := s.prepareRunEnvironment(ctx, product, turnID, RunID(runID), "")
 	if err != nil {
 		return recoveryEnvironment{}, err
 	}
-	return recoveryEnvironment{product: product, tools: tools, systemPrompt: systemPrompt, untrustedContext: untrustedContext, events: events}, nil
+	return recoveryEnvironment{product: product, tools: environment.tools, systemPrompt: environment.systemPrompt, untrustedContext: environment.untrustedContext, events: environment.events}, nil
 }
 
 func (s *Service) refreshRecoveryState(ctx context.Context, product Session) {
@@ -189,15 +325,28 @@ func agentRecoveryDecision(value RecoveryDecision) (agentsession.RecoveryDecisio
 	}
 }
 
-func productTurnResult(result agent.RunResult) TurnResult {
+func productTurnResult(turnID TurnID, result agent.RunResult) TurnResult {
 	response := ""
 	if result.FinalMessage != nil {
 		response = visibleText(*result.FinalMessage)
 	}
-	product := TurnResult{TurnID: TurnID(result.RunID), Status: string(result.Status), Response: response, Steps: result.Steps, Reason: result.Reason}
+	product := TurnResult{TurnID: turnID, RunID: RunID(result.RunID), Status: string(result.Status), Response: response, Steps: result.Steps, Reason: result.Reason}
 	if result.Interrupt != nil {
 		product.InterruptID = result.Interrupt.ID
 		product.InterruptKind = result.Interrupt.Kind
 	}
 	return product
+}
+
+func (s *Service) turnForRun(ctx context.Context, sessionID SessionID, runID agentsession.RunID) (Turn, bool, error) {
+	turns, err := s.deps.Turns.ListTurns(ctx, sessionID)
+	if err != nil {
+		return Turn{}, false, err
+	}
+	for _, turn := range turns {
+		if _, found := turn.Run(runID); found {
+			return turn, true, nil
+		}
+	}
+	return Turn{}, false, nil
 }

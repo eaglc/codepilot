@@ -58,6 +58,7 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	trustWorkspace := flags.Bool("trust-workspace", false, "trust a new worktree without an interactive confirmation")
 	relocateWorktree := flags.String("relocate-worktree", "", "explicitly relocate an unavailable stored worktree ID to --workspace")
 	skipRelocation := flags.Bool("skip-relocation", false, "open --workspace as a new binding instead of a detected relocation")
+	disableProductTurns := flags.Bool("disable-product-turns", false, "disable Product Turn persistence and use the legacy Direct execution path")
 	if err := flags.Parse(arguments); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -85,18 +86,19 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	// Preserve the original reader so Bubble Tea can recognize an *os.File and
 	// use native Windows console input for arrows and other special keys.
 	options := app.Options{
-		WorkingDirectory: workingDirectory,
-		ConfigDir:        strings.TrimSpace(*configDir),
-		StateDir:         strings.TrimSpace(*stateDir),
-		ProviderProfile:  strings.TrimSpace(*providerProfile),
-		Model:            strings.TrimSpace(*modelID),
-		Permission:       strings.TrimSpace(*permission),
-		SensitivePaths:   append([]string(nil), sensitivePaths...),
-		TrustWorkspace:   *trustWorkspace,
-		RelocateWorktree: codingagent.WorktreeID(strings.TrimSpace(*relocateWorktree)),
-		SkipRelocation:   *skipRelocation,
-		Input:            stdin,
-		Output:           stdout,
+		WorkingDirectory:    workingDirectory,
+		ConfigDir:           strings.TrimSpace(*configDir),
+		StateDir:            strings.TrimSpace(*stateDir),
+		ProviderProfile:     strings.TrimSpace(*providerProfile),
+		Model:               strings.TrimSpace(*modelID),
+		Permission:          strings.TrimSpace(*permission),
+		SensitivePaths:      append([]string(nil), sensitivePaths...),
+		TrustWorkspace:      *trustWorkspace,
+		RelocateWorktree:    codingagent.WorktreeID(strings.TrimSpace(*relocateWorktree)),
+		SkipRelocation:      *skipRelocation,
+		DisableProductTurns: *disableProductTurns,
+		Input:               stdin,
+		Output:              stdout,
 	}
 	application, err := app.New(ctx, options)
 	input := bufio.NewReader(stdin)

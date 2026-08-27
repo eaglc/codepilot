@@ -125,6 +125,19 @@ type RunRequest struct {
 	Limits           RunLimits
 }
 
+// ContinueRequest starts another Run in an existing conversation without
+// appending a synthetic user message.
+type ContinueRequest struct {
+	SessionID        agentsession.ID
+	Lane             agentsession.Lane
+	RunID            agentsession.RunID
+	SystemPrompt     string
+	Model            llm.ModelRef
+	UntrustedContext []llm.Message
+	Tools            *tool.Registry
+	Limits           RunLimits
+}
+
 // RunStatus describes how a generic Agent run returned to its caller.
 type RunStatus string
 
@@ -134,6 +147,8 @@ const (
 	RunLimitReached RunStatus = "limit_reached"
 	RunAborted      RunStatus = "aborted"
 	RunFailed       RunStatus = "failed"
+	// RunHandedOff means a resolved control boundary returned execution to its coordinator.
+	RunHandedOff RunStatus = "handed_off"
 )
 
 // RunResult contains terminal Agent facts without Coding-specific classification.
@@ -204,6 +219,48 @@ func (r *Runtime) Run(ctx context.Context, request RunRequest, sink EventSink) (
 		return r.failRun(runCtx, request, dispatcher, 0, "publish_run_started", err)
 	}
 
+	model, err := r.models.CreateModel(runCtx, request.Model)
+	if err != nil {
+		return r.failRun(runCtx, request, dispatcher, 0, "create_model", err)
+	}
+	return r.runSteps(runCtx, request, dispatcher, model, 1)
+}
+
+// Continue starts a new Run on the existing lane without adding another user message.
+func (r *Runtime) Continue(ctx context.Context, continuation ContinueRequest, sink EventSink) (RunResult, error) {
+	if r == nil {
+		return RunResult{}, errors.New("continue agent: runtime is nil")
+	}
+	request, err := r.normalizeContinueRequest(continuation)
+	if err != nil {
+		return RunResult{}, err
+	}
+	if sink == nil {
+		sink = NopEventSink{}
+	}
+	runCtx, cancel := context.WithTimeout(ctx, request.Limits.MaxDuration)
+	defer cancel()
+	dispatcher := &eventDispatcher{runtime: r, sink: sink, sessionID: request.SessionID, runID: request.RunID}
+
+	snapshot, err := r.sessions.Load(runCtx, request.SessionID)
+	if err != nil {
+		return RunResult{}, fmt.Errorf("continue agent: load session: %w", err)
+	}
+	if recovery := agentsession.AnalyzeRecovery(snapshot); len(recovery.PendingRuns) != 0 || len(recovery.PendingInterrupts) != 0 || len(recovery.PendingTools) != 0 {
+		return RunResult{}, errors.New("continue agent: session has unfinished work")
+	}
+	if len(snapshot.Entries) == 0 {
+		return RunResult{}, errors.New("continue agent: existing conversation is empty")
+	}
+	if err := r.appendRecord(runCtx, request, agentsession.Record{
+		Type: agentsession.RecordOperationStarted, RunID: request.RunID,
+		Operation: &agentsession.OperationData{Intent: agentsession.OperationRun},
+	}); err != nil {
+		return RunResult{}, fmt.Errorf("continue agent: persist operation start: %w", err)
+	}
+	if err := dispatcher.publish(runCtx, Event{Kind: EventRunStarted}); err != nil {
+		return r.failRun(runCtx, request, dispatcher, 0, "publish_run_started", err)
+	}
 	model, err := r.models.CreateModel(runCtx, request.Model)
 	if err != nil {
 		return r.failRun(runCtx, request, dispatcher, 0, "create_model", err)
@@ -285,6 +342,13 @@ func (r *Runtime) Resume(ctx context.Context, resume ResumeRequest, sink EventSi
 		Interrupt: &agentsession.InterruptData{InterruptID: pendingInterrupt.InterruptID, Kind: pendingInterrupt.Kind, ToolCallID: pendingInterrupt.ToolCallID, Decision: string(resolution.Status), Payload: append(json.RawMessage(nil), resolution.Details...)},
 	}); err != nil {
 		return RunResult{}, fmt.Errorf("resume agent: persist interrupt resolution: %w", err)
+	}
+	if policy, ok := request.Tools.ControlPolicy(pendingTool.ToolName); ok && policy.HandoffAfterResolution && resolution.Status == tool.ResultCompleted {
+		steps := completedStepCount(snapshot, request.RunID)
+		if err := r.finishRun(runCtx, request, dispatcher, steps, RunHandedOff, "control_handoff"); err != nil {
+			return RunResult{}, err
+		}
+		return RunResult{RunID: request.RunID, Status: RunHandedOff, Steps: steps, Reason: "control_handoff"}, nil
 	}
 	assistant, err := assistantMessage(snapshot, pendingTool.AssistantEntryID)
 	if err != nil {
@@ -422,6 +486,9 @@ func (r *Runtime) runSteps(ctx context.Context, request RunRequest, dispatcher *
 		}
 
 		calls := assistant.ToolCalls()
+		if err := validateExclusiveControlCalls(request.Tools, calls); err != nil {
+			return r.failRun(ctx, request, dispatcher, step, "exclusive_control_conflict", err)
+		}
 		if reason, err := r.runBudgetReason(ctx, request); err != nil {
 			return r.failRun(ctx, request, dispatcher, step, "inspect_run_budget", err)
 		} else if reason != "" {
@@ -521,6 +588,51 @@ func (r *Runtime) normalizeRequest(request RunRequest) (RunRequest, error) {
 	}
 	request.Limits = normalizeRetryLimits(request.Limits)
 	return request, nil
+}
+
+func (r *Runtime) normalizeContinueRequest(continuation ContinueRequest) (RunRequest, error) {
+	if continuation.SessionID == "" || continuation.RunID == "" {
+		return RunRequest{}, errors.New("continue agent: session and run ids are required")
+	}
+	if err := continuation.Model.Validate(); err != nil {
+		return RunRequest{}, fmt.Errorf("continue agent: %w", err)
+	}
+	request := RunRequest{
+		SessionID: continuation.SessionID, Lane: continuation.Lane, RunID: continuation.RunID,
+		SystemPrompt: continuation.SystemPrompt, Model: continuation.Model,
+		UntrustedContext: cloneLLMMessages(continuation.UntrustedContext), Tools: continuation.Tools, Limits: continuation.Limits,
+	}
+	if request.Lane == "" {
+		request.Lane = agentsession.MainLane
+	}
+	if request.Tools == nil {
+		registry, err := tool.NewRegistry()
+		if err != nil {
+			return RunRequest{}, err
+		}
+		request.Tools = registry
+	}
+	if request.Limits.MaxSteps <= 0 {
+		request.Limits.MaxSteps = 32
+	}
+	if request.Limits.MaxDuration <= 0 {
+		request.Limits.MaxDuration = 30 * time.Minute
+	}
+	request.Limits = normalizeRetryLimits(request.Limits)
+	if err := validateUntrustedContext(request.UntrustedContext); err != nil {
+		return RunRequest{}, err
+	}
+	return request, nil
+}
+
+func validateExclusiveControlCalls(registry *tool.Registry, calls []llm.ToolCall) error {
+	for _, call := range calls {
+		policy, ok := registry.ControlPolicy(call.Name)
+		if ok && policy.Exclusive && len(calls) != 1 {
+			return fmt.Errorf("exclusive control Tool %q must be the only Tool call in its assistant message", call.Name)
+		}
+	}
+	return nil
 }
 
 func validateUntrustedContext(messages []llm.Message) error {

@@ -309,6 +309,9 @@ func (r *Runtime) continueAfterAssistant(ctx context.Context, request RunRequest
 		return r.failRun(ctx, request, dispatcher, step, "load_recovered_assistant", err)
 	}
 	calls := assistant.ToolCalls()
+	if err := validateExclusiveControlCalls(request.Tools, calls); err != nil {
+		return r.failRun(ctx, request, dispatcher, step, "exclusive_control_conflict", err)
+	}
 	if len(calls) == 0 {
 		if err := r.finishRun(ctx, request, dispatcher, step, RunCompleted, "recovered_model_completed"); err != nil {
 			return RunResult{}, err

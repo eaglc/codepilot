@@ -86,6 +86,7 @@ type TranscriptItem struct {
 // PendingInterrupt is a product-safe resumable input request.
 type PendingInterrupt struct {
 	TurnID          TurnID
+	RunID           RunID
 	InterruptID     string
 	Kind            string
 	ToolCallID      string
@@ -109,6 +110,7 @@ const (
 type RecoveryAction struct {
 	ID           string
 	TurnID       TurnID
+	RunID        RunID
 	Kind         string
 	ToolCallID   string
 	ToolName     string
@@ -123,6 +125,10 @@ type RecoveryAction struct {
 // usage; step and timing fields describe the latest turn on that branch.
 type SessionMetrics struct {
 	LatestTurnID     TurnID
+	LatestRunID      RunID
+	LatestPhase      TurnPhase
+	LatestProfile    CapabilityProfile
+	LatestTurnStatus TurnStatus
 	Steps            int
 	InputTokens      int
 	OutputTokens     int
@@ -137,6 +143,16 @@ type SessionMetrics struct {
 	Elapsed          time.Duration
 }
 
+// TurnSnapshot is the bounded Product Turn state shown by presentation layers.
+type TurnSnapshot struct {
+	ID       TurnID
+	Phase    TurnPhase
+	Status   TurnStatus
+	Strategy ExecutionStrategy
+	RunCount int
+	Revision uint64
+}
+
 // Snapshot is the authoritative Coding Agent state exposed to UI and future clients.
 type Snapshot struct {
 	Revision          uint64
@@ -147,4 +163,5 @@ type Snapshot struct {
 	RecoveryActions   []RecoveryAction
 	RecoveryWarnings  []string
 	Metrics           SessionMetrics
+	ActiveTurn        *TurnSnapshot
 }

@@ -178,7 +178,7 @@ func newSessionManagementService(t *testing.T) (*codingagent.Service, *codingmem
 	}
 	events := &productEvents{}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: products, AgentSessions: agents, Worktrees: products, Agent: runtime,
+		Sessions: products, Turns: products, AgentSessions: agents, Worktrees: products, Agent: runtime,
 		Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: events,
 	})
 	if err != nil {

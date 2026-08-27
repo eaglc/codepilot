@@ -24,8 +24,28 @@ type AgentRunner interface {
 	Recover(ctx context.Context, request agent.RecoverRequest, events agent.EventSink) (agent.RunResult, error)
 }
 
+// ContinuationRunner is implemented by runtimes that can start another Run
+// without appending a synthetic user message. It remains optional so existing
+// AgentRunner adapters continue to compile while the P0 seam rolls out.
+type ContinuationRunner interface {
+	Continue(ctx context.Context, request agent.ContinueRequest, events agent.EventSink) (agent.RunResult, error)
+}
+
+// FeatureFlags controls independently reversible product capabilities.
+type FeatureFlags struct {
+	ProductTurns bool
+}
+
+// DefaultFeatureFlags returns the current stable product defaults.
+func DefaultFeatureFlags() FeatureFlags {
+	return FeatureFlags{ProductTurns: true}
+}
+
 // ToolScope contains immutable trusted Coding facts captured before model-controlled execution.
 type ToolScope struct {
+	Profile          CapabilityProfile
+	TurnID           TurnID
+	RunID            RunID
 	SessionID        SessionID
 	WorkspaceID      WorkspaceID
 	WorktreeID       WorktreeID
@@ -42,6 +62,9 @@ type ToolFactory interface {
 
 // PromptScope contains trusted Coding facts used to build a system prompt.
 type PromptScope struct {
+	Profile        CapabilityProfile
+	TurnID         TurnID
+	RunID          RunID
 	WorkspaceID    WorkspaceID
 	WorktreeID     WorktreeID
 	WorktreeRoot   string
@@ -64,6 +87,7 @@ type UntrustedContextBuilder interface {
 // Dependencies contains concrete capabilities required by Service.
 type Dependencies struct {
 	Sessions      SessionRepository
+	Turns         TurnRepository
 	AgentSessions agentsession.Repository
 	Worktrees     WorktreeReader
 	Workspaces    WorkspaceController
@@ -73,6 +97,7 @@ type Dependencies struct {
 	Events        EventSink
 	Providers     ProviderManager
 	Limits        agent.RunLimits
+	Features      *FeatureFlags
 }
 
 // Service owns Coding session lifecycle while delegating model/tool loops to generic Agent.
@@ -85,14 +110,24 @@ type Service struct {
 	activeSeq   uint64
 	active      SessionID
 	eventSeq    uint64
+	features    FeatureFlags
 }
 
 // NewService validates and creates a Coding Agent product service.
 func NewService(deps Dependencies) (*Service, error) {
-	if deps.Sessions == nil || deps.AgentSessions == nil || deps.Worktrees == nil || deps.Agent == nil || deps.Tools == nil || deps.Prompts == nil || deps.Events == nil {
+	features := DefaultFeatureFlags()
+	if deps.Features != nil {
+		features = *deps.Features
+	}
+	if deps.Turns == nil {
+		if repository, ok := deps.Sessions.(TurnRepository); ok {
+			deps.Turns = repository
+		}
+	}
+	if deps.Sessions == nil || (features.ProductTurns && deps.Turns == nil) || deps.AgentSessions == nil || deps.Worktrees == nil || deps.Agent == nil || deps.Tools == nil || deps.Prompts == nil || deps.Events == nil {
 		return nil, errors.New("create Coding Agent service: dependencies are incomplete")
 	}
-	return &Service{deps: deps, states: make(map[SessionID]RuntimeState), operations: make(map[SessionID]*sync.Mutex), activeTurns: make(map[SessionID]activeTurn)}, nil
+	return &Service{deps: deps, features: features, states: make(map[SessionID]RuntimeState), operations: make(map[SessionID]*sync.Mutex), activeTurns: make(map[SessionID]activeTurn)}, nil
 }
 
 type activeTurn struct {
@@ -167,6 +202,7 @@ type TurnRequest struct {
 // TurnResult contains product-level terminal facts without lower-layer messages or events.
 type TurnResult struct {
 	TurnID        TurnID
+	RunID         RunID
 	Status        string
 	Response      string
 	Steps         int
@@ -194,62 +230,60 @@ func (s *Service) StartTurn(ctx context.Context, request TurnRequest) (TurnResul
 	if recovery := agentsession.AnalyzeRecovery(durable); len(recovery.PendingRuns) != 0 || len(recovery.PendingInterrupts) != 0 || len(recovery.PendingTools) != 0 {
 		return TurnResult{}, errors.New("start Coding Agent turn: the session has unfinished work that must be resumed first")
 	}
-	worktree, err := s.deps.Worktrees.LoadWorktree(ctx, product.WorktreeID)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("start Coding Agent turn: load worktree: %w", err)
+	if !s.features.ProductTurns {
+		return s.startLegacyTurn(ctx, product, strings.TrimSpace(request.Text))
 	}
-	scope := ToolScope{
-		SessionID: product.ID, WorkspaceID: product.WorkspaceID, WorktreeID: product.WorktreeID,
-		WorktreeRoot: worktree.Root, PermissionMode: product.PermissionMode, PermissionGrants: clonePermissionGrants(product.PermissionGrants), SensitivePaths: append([]string(nil), product.SensitivePaths...),
-	}
-	tools, err := s.deps.Tools.CreateTools(ctx, scope)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("start Coding Agent turn: create tools: %w", err)
-	}
-	definitions := tools.Definitions()
-	names := make([]string, len(definitions))
-	for index, definition := range definitions {
-		names[index] = definition.Name
-	}
-	promptScope := PromptScope{
-		WorkspaceID: product.WorkspaceID, WorktreeID: product.WorktreeID, WorktreeRoot: worktree.Root,
-		ToolNames: names, SensitivePaths: append([]string(nil), product.SensitivePaths...),
-	}
-	systemPrompt, untrustedContext, err := buildPromptContext(ctx, s.deps.Prompts, promptScope)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("start Coding Agent turn: build prompt: %w", err)
-	}
-	revisions := durableRevisionSource{repository: s.deps.AgentSessions, agentSessionID: product.AgentSessionID}
-	eventAdapter, err := NewAgentEventAdapter(product.ID, s.deps.Events, revisions)
+	turnIDValue, err := newID("turn")
 	if err != nil {
 		return TurnResult{}, err
+	}
+	runIDValue, err := newID("run")
+	if err != nil {
+		return TurnResult{}, err
+	}
+	entryIDValue, err := newID("entry")
+	if err != nil {
+		return TurnResult{}, err
+	}
+	now := time.Now().UTC()
+	turn := Turn{
+		ID: TurnID(turnIDValue), SessionID: product.ID, RequestText: strings.TrimSpace(request.Text),
+		Phase: TurnPhaseDirect, Status: TurnPending, Strategy: ExecutionSingle, Revision: 1,
+		Runs:      []RunBinding{{RunID: agentsession.RunID(runIDValue), UserEntryID: agentsession.EntryID(entryIDValue), Phase: TurnPhaseDirect, Profile: CapabilityDirect, Status: RunBindingPending}},
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.deps.Turns.CreateTurn(ctx, turn); err != nil {
+		return TurnResult{}, fmt.Errorf("start Coding Agent turn: persist Product Turn: %w", err)
+	}
+	environment, err := s.prepareRunEnvironment(ctx, product, turn.ID, RunID(runIDValue), "")
+	if err != nil {
+		return TurnResult{}, fmt.Errorf("start Coding Agent turn: %w", err)
+	}
+	turn, err = s.markRunStarted(ctx, turn, agentsession.RunID(runIDValue), now)
+	if err != nil {
+		return TurnResult{}, fmt.Errorf("start Coding Agent turn: %w", err)
 	}
 	s.setState(product.ID, RuntimeRunning)
 	runCtx, finishActive := s.beginActiveTurn(ctx, product.ID)
 	defer finishActive()
 	result, runErr := s.deps.Agent.Run(runCtx, agent.RunRequest{
-		SessionID: product.AgentSessionID, Lane: sessionLane(product), SystemPrompt: systemPrompt,
+		SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: agentsession.RunID(runIDValue), UserEntryID: agentsession.EntryID(entryIDValue), SystemPrompt: environment.systemPrompt,
 		Model:            llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
-		UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: strings.TrimSpace(request.Text)}}, Timestamp: time.Now().UTC()},
-		UntrustedContext: untrustedContext, Tools: tools, Limits: s.deps.Limits,
-	}, eventAdapter)
-	state := RuntimeIdle
-	if result.Status == agent.RunInterrupted {
-		state = RuntimeAwaitingApproval
+		UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: turn.RequestText}}, Timestamp: now},
+		UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
+	}, environment.events)
+	if result.RunID == "" {
+		result.RunID = agentsession.RunID(runIDValue)
 	}
-	s.setState(product.ID, state)
+	turn, finishErr := s.finishProductRun(context.WithoutCancel(ctx), turn, result, runErr)
+	s.setState(product.ID, runtimeStateForTurn(turn))
 	touchErr := s.touchSession(context.WithoutCancel(ctx), product)
-	response := ""
-	if result.FinalMessage != nil {
-		response = visibleText(*result.FinalMessage)
-	}
-	productResult := TurnResult{TurnID: TurnID(result.RunID), Status: string(result.Status), Response: response, Steps: result.Steps, Reason: result.Reason}
-	if result.Interrupt != nil {
-		productResult.InterruptID = result.Interrupt.ID
-		productResult.InterruptKind = result.Interrupt.Kind
-	}
+	productResult := productTurnResult(turn.ID, result)
 	if runErr != nil {
 		return productResult, fmt.Errorf("start Coding Agent turn: %w", runErr)
+	}
+	if finishErr != nil {
+		return productResult, fmt.Errorf("start Coding Agent turn: persist terminal Product Turn: %w", finishErr)
 	}
 	if touchErr != nil {
 		return productResult, fmt.Errorf("start Coding Agent turn: update product session: %w", touchErr)
@@ -303,6 +337,22 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("resume Coding Agent turn: load session: %w", err)
 	}
+	turn := Turn{ID: request.TurnID, SessionID: request.SessionID}
+	binding := RunBinding{RunID: agentsession.RunID(request.TurnID), Status: RunBindingInterrupted}
+	if s.features.ProductTurns {
+		turn, err = s.deps.Turns.LoadTurn(ctx, request.TurnID)
+		if err != nil {
+			return TurnResult{}, fmt.Errorf("resume Coding Agent turn: load Product Turn: %w", err)
+		}
+		if turn.SessionID != request.SessionID {
+			return TurnResult{}, errors.New("resume Coding Agent turn: Product Turn belongs to another session")
+		}
+		var found bool
+		binding, found = turn.ActiveRun()
+		if !found || binding.Status != RunBindingInterrupted {
+			return TurnResult{}, errors.New("resume Coding Agent turn: Product Turn has no interrupted Run")
+		}
+	}
 	if request.GrantScope == "" {
 		request.GrantScope = PermissionGrantOnce
 	}
@@ -317,7 +367,7 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 		if loadErr != nil {
 			return TurnResult{}, fmt.Errorf("resume Coding Agent turn: load pending approval: %w", loadErr)
 		}
-		grant, grantErr := deriveSessionGrant(product, durable, request, time.Now().UTC())
+		grant, grantErr := deriveSessionGrant(product, durable, request, binding.RunID, time.Now().UTC())
 		if grantErr != nil {
 			return TurnResult{}, fmt.Errorf("resume Coding Agent turn: %w", grantErr)
 		}
@@ -332,61 +382,45 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 			}
 		}
 	}
-	worktree, err := s.deps.Worktrees.LoadWorktree(ctx, product.WorktreeID)
+	environment, err := s.prepareRunEnvironment(ctx, product, turn.ID, RunID(binding.RunID), "")
 	if err != nil {
-		return TurnResult{}, fmt.Errorf("resume Coding Agent turn: load worktree: %w", err)
-	}
-	tools, err := s.deps.Tools.CreateTools(ctx, toolScope(product, worktree))
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("resume Coding Agent turn: create tools: %w", err)
-	}
-	definitions := tools.Definitions()
-	names := make([]string, len(definitions))
-	for index, definition := range definitions {
-		names[index] = definition.Name
-	}
-	promptScope := PromptScope{
-		WorkspaceID: product.WorkspaceID, WorktreeID: product.WorktreeID, WorktreeRoot: worktree.Root,
-		ToolNames: names, SensitivePaths: append([]string(nil), product.SensitivePaths...),
-	}
-	systemPrompt, untrustedContext, err := buildPromptContext(ctx, s.deps.Prompts, promptScope)
-	if err != nil {
-		return TurnResult{}, fmt.Errorf("resume Coding Agent turn: build prompt: %w", err)
+		return TurnResult{}, fmt.Errorf("resume Coding Agent turn: %w", err)
 	}
 	resolution, err := productResolution(request)
 	if err != nil {
 		return TurnResult{}, err
 	}
-	revisions := durableRevisionSource{repository: s.deps.AgentSessions, agentSessionID: product.AgentSessionID}
-	eventAdapter, err := NewAgentEventAdapter(product.ID, s.deps.Events, revisions)
-	if err != nil {
-		return TurnResult{}, err
+	if s.features.ProductTurns {
+		turn, err = s.markRunResumed(ctx, turn, binding.RunID, time.Now().UTC())
+		if err != nil {
+			return TurnResult{}, fmt.Errorf("resume Coding Agent turn: %w", err)
+		}
 	}
 	s.setState(product.ID, RuntimeRunning)
 	runCtx, finishActive := s.beginActiveTurn(ctx, product.ID)
 	defer finishActive()
 	result, resumeErr := s.deps.Agent.Resume(runCtx, agent.ResumeRequest{
-		SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: agentsession.RunID(request.TurnID), InterruptID: request.InterruptID,
-		Resolution: resolution, SystemPrompt: systemPrompt,
-		Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID}, UntrustedContext: untrustedContext, Tools: tools, Limits: s.deps.Limits,
-	}, eventAdapter)
-	state := RuntimeIdle
-	if result.Status == agent.RunInterrupted {
-		state = RuntimeAwaitingApproval
+		SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: binding.RunID, InterruptID: request.InterruptID,
+		Resolution: resolution, SystemPrompt: environment.systemPrompt,
+		Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID}, UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
+	}, environment.events)
+	if result.RunID == "" {
+		result.RunID = binding.RunID
 	}
-	s.setState(product.ID, state)
+	var finishErr error
+	if s.features.ProductTurns {
+		turn, finishErr = s.finishProductRun(context.WithoutCancel(ctx), turn, result, resumeErr)
+		s.setState(product.ID, runtimeStateForTurn(turn))
+	} else {
+		s.setState(product.ID, runtimeStateForResult(result, resumeErr))
+	}
 	touchErr := s.touchSession(context.WithoutCancel(ctx), product)
-	response := ""
-	if result.FinalMessage != nil {
-		response = visibleText(*result.FinalMessage)
-	}
-	productResult := TurnResult{TurnID: TurnID(result.RunID), Status: string(result.Status), Response: response, Steps: result.Steps, Reason: result.Reason}
-	if result.Interrupt != nil {
-		productResult.InterruptID = result.Interrupt.ID
-		productResult.InterruptKind = result.Interrupt.Kind
-	}
+	productResult := productTurnResult(turn.ID, result)
 	if resumeErr != nil {
 		return productResult, fmt.Errorf("resume Coding Agent turn: %w", resumeErr)
+	}
+	if finishErr != nil {
+		return productResult, fmt.Errorf("resume Coding Agent turn: persist Product Turn: %w", finishErr)
 	}
 	if touchErr != nil {
 		return productResult, fmt.Errorf("resume Coding Agent turn: update product session: %w", touchErr)
@@ -429,7 +463,52 @@ func (s *Service) Snapshot(ctx context.Context, id SessionID) (Snapshot, error) 
 	if len(durable.Log) != 0 {
 		revision = durable.Log[len(durable.Log)-1].Sequence
 	}
-	return ProjectSnapshot(product, durable, sessionLane(product), s.state(id), revision)
+	if !s.features.ProductTurns {
+		return ProjectSnapshot(product, durable, sessionLane(product), s.state(id), revision)
+	}
+	turns, err := s.deps.Turns.ListTurns(ctx, id)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("load Coding Agent snapshot: list Product Turns: %w", err)
+	}
+	return ProjectSnapshotWithTurns(product, durable, sessionLane(product), s.state(id), revision, turns)
+}
+
+func (s *Service) startLegacyTurn(ctx context.Context, product Session, requestText string) (TurnResult, error) {
+	runIDValue, err := newID("turn")
+	if err != nil {
+		return TurnResult{}, err
+	}
+	entryIDValue, err := newID("entry")
+	if err != nil {
+		return TurnResult{}, err
+	}
+	runID := RunID(runIDValue)
+	environment, err := s.prepareRunEnvironment(ctx, product, TurnID(runIDValue), runID, "")
+	if err != nil {
+		return TurnResult{}, fmt.Errorf("start Coding Agent turn: %w", err)
+	}
+	s.setState(product.ID, RuntimeRunning)
+	runCtx, finishActive := s.beginActiveTurn(ctx, product.ID)
+	defer finishActive()
+	result, runErr := s.deps.Agent.Run(runCtx, agent.RunRequest{
+		SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: agentsession.RunID(runID), UserEntryID: agentsession.EntryID(entryIDValue), SystemPrompt: environment.systemPrompt,
+		Model:            llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
+		UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: requestText}}, Timestamp: time.Now().UTC()},
+		UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
+	}, environment.events)
+	if result.RunID == "" {
+		result.RunID = agentsession.RunID(runID)
+	}
+	s.setState(product.ID, runtimeStateForResult(result, runErr))
+	touchErr := s.touchSession(context.WithoutCancel(ctx), product)
+	productResult := productTurnResult(TurnID(result.RunID), result)
+	if runErr != nil {
+		return productResult, fmt.Errorf("start Coding Agent turn: %w", runErr)
+	}
+	if touchErr != nil {
+		return productResult, fmt.Errorf("start Coding Agent turn: update product session: %w", touchErr)
+	}
+	return productResult, nil
 }
 
 // CurrentRevision implements RevisionSource from durable Agent journal sequence.

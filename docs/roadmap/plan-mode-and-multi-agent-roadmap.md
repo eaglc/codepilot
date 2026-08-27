@@ -1,9 +1,11 @@
 # CodePilot Plan 模式与多 Agent 演进规划
 
-状态：规划稿，作为 P3/P4 阶段的开发指导文档
+状态：已被取代，仅保留用于追溯，不作为开发指导文档
 形成日期：2026-08-24
 适用基线：当前模块化架构中的 `agent`、`agent/session`、`codingagent`、`codingstore`、`ui` 与 `app`；`_legacy` 不作为新功能依赖
 前置文档：[模块化架构与迁移计划](../architecture/modular-architecture-migration.md)、[产品补全路线图](product-completion-roadmap.md)、[架构评估报告](../archive/2026-08-24-architecture-evaluation-report.md)
+
+> 本文档记录早期技术方案，其中关于 Auto Router、Plan 入口和 Plan 与 Workflow 关系的假设已经不再代表当前需求。后续产品设计必须以 [Plan 模式、子 Agent 与 Workflow 产品需求](../design/plan-mode-and-multi-agent-requirements.md) 为准，实施顺序与验收门槛以 [Plan、Workflow 与多 Agent 可持续交付方案](plan-workflow-multi-agent-delivery-plan.md) 为准。
 
 ## 1. 文档结论
 

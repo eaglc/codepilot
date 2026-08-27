@@ -50,11 +50,11 @@ func TestDeriveSessionGrantRejectsUIClaimsAndInvalidDurableScope(t *testing.T) {
 		}},
 	}}
 	request := ResumeTurnRequest{SessionID: "session", TurnID: "turn", InterruptID: "approval", Decision: ResolutionApproved, GrantScope: PermissionGrantSession}
-	if _, err := deriveSessionGrant(Session{ID: "session"}, durable, request, time.Now().UTC()); err == nil {
+	if _, err := deriveSessionGrant(Session{ID: "session"}, durable, request, "turn", time.Now().UTC()); err == nil {
 		t.Fatal("invalid durable path created a grant")
 	}
 	request.InterruptID = "ui-invented-approval"
-	if _, err := deriveSessionGrant(Session{ID: "session"}, durable, request, time.Now().UTC()); err == nil {
+	if _, err := deriveSessionGrant(Session{ID: "session"}, durable, request, "turn", time.Now().UTC()); err == nil {
 		t.Fatal("UI-invented interrupt created a grant")
 	}
 }
@@ -71,7 +71,7 @@ func TestDeriveSessionGrantSupportsExactSingleFileEditScopes(t *testing.T) {
 				}},
 			}}
 			request := ResumeTurnRequest{SessionID: "session", TurnID: "turn", InterruptID: "approval", Decision: ResolutionApproved, GrantScope: PermissionGrantSession}
-			grant, err := deriveSessionGrant(Session{ID: "session"}, durable, request, time.Now().UTC())
+			grant, err := deriveSessionGrant(Session{ID: "session"}, durable, request, "turn", time.Now().UTC())
 			if err != nil {
 				t.Fatalf("derive %s grant: %v", toolName, err)
 			}
@@ -113,7 +113,7 @@ func TestDeriveSessionGrantUsesDurableLanguageServerScope(t *testing.T) {
 		}},
 	}}
 	request := ResumeTurnRequest{SessionID: "session", TurnID: "turn", InterruptID: "approval", Decision: ResolutionApproved, GrantScope: PermissionGrantSession}
-	grant, err := deriveSessionGrant(Session{ID: "session"}, durable, request, time.Now().UTC())
+	grant, err := deriveSessionGrant(Session{ID: "session"}, durable, request, "turn", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("derive language-server grant: %v", err)
 	}

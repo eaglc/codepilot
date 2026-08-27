@@ -123,7 +123,7 @@ func runCodingE2E(t *testing.T, test codingE2ECase) {
 		t.Fatalf("create Agent runtime: %v", err)
 	}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: products, AgentSessions: agentSessions, Worktrees: products, Agent: runtimeAgent,
+		Sessions: products, Turns: products, AgentSessions: agentSessions, Worktrees: products, Agent: runtimeAgent,
 		Tools:   codingtools.NewFactory(codingtools.Options{Artifacts: products, Security: security}),
 		Prompts: codingprompt.NewBuilder(), Events: &e2eEventSink{},
 		Limits: agent.RunLimits{MaxSteps: 6, MaxDuration: time.Minute, MaxModelAttempts: 1, MaxToolCalls: 8, MaxRepeatedToolCalls: 3, MaxOutputBytes: 1 << 20, MaxNoProgressSteps: 3},

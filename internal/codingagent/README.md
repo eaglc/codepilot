@@ -18,7 +18,7 @@ never see paths, credentials, or runtime objects.
 
 ## Key types
 
-- `Service` — `NewService`, `CreateSession`, `StartTurn`, `ResumeTurn`,
+- `Service` — `NewService`, `CreateSession`, `StartTurn`, `ResumeTurn`, `ContinueTurn`,
   `RecoverTurn`, `RecoverAutomatically`, `CancelTurn`, `Snapshot`, `ListSessions`,
   `SwitchSession`, `RenameSession`, `SetPermissionMode`, `ArchiveSession`,
   `ForkLane`, plus provider and workspace management methods.
@@ -27,7 +27,8 @@ never see paths, credentials, or runtime objects.
   cross-repository diagnosis/repair.
 - `AgentEventAdapter` — maps generic Agent events to the product event protocol.
 - `ProjectSnapshot` / `Snapshot` / `TranscriptItem` — the secret-free product view.
-- `Session`, `Workspace`, `Worktree`, `Event`, `PermissionGrant`, `PermissionMode`.
+- `Turn`, `RunBinding`, `CapabilityProfile`, `FeatureFlags`, `Session`, `Workspace`,
+  `Worktree`, `Event`, `PermissionGrant`, `PermissionMode`.
 
 ## Dependencies
 
@@ -40,6 +41,9 @@ never see paths, credentials, or runtime objects.
   revocation, and automatic grant revocation on permission-mode change.
 - Two-phase session creation via a durable `SessionCreationIntent`, and
   non-destructive `ConsistencyManager` repair.
+- Product Turns are durable Session-scoped journals and may bind multiple Agent
+  Runs without appending synthetic user messages. `--disable-product-turns`
+  keeps the legacy Direct path available as a rollback switch.
 - The package never forwards generic runtime objects across its API — everything
   is mapped through typed, secret-free DTOs.
 

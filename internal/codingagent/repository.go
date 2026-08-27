@@ -11,7 +11,19 @@ var (
 	ErrSessionNotFound = errors.New("Coding session not found")
 	// ErrWorktreeNotFound identifies a missing Coding worktree binding.
 	ErrWorktreeNotFound = errors.New("Coding worktree not found")
+	// ErrTurnNotFound identifies a missing Product Turn.
+	ErrTurnNotFound = errors.New("Coding turn not found")
+	// ErrTurnConflict identifies a stale Product Turn compare-and-swap update.
+	ErrTurnConflict = errors.New("Coding turn revision conflict")
 )
+
+// TurnRepository persists Product Turns independently from generic Agent journals.
+type TurnRepository interface {
+	CreateTurn(ctx context.Context, turn Turn) error
+	LoadTurn(ctx context.Context, id TurnID) (Turn, error)
+	ListTurns(ctx context.Context, sessionID SessionID) ([]Turn, error)
+	SaveTurn(ctx context.Context, turn Turn, expectedRevision uint64) error
+}
 
 // SessionRepository persists Coding product session bindings and metadata.
 type SessionRepository interface {

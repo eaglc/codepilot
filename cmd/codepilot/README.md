@@ -13,7 +13,8 @@ signal-based context and `os.Exit`.
 
 Main: `--workspace`, `--config-dir`, `--state-dir`, `--provider`, `--model`,
 `--permission`, `--sensitive-path` (repeatable), `--version`, `--trust-workspace`,
-`--relocate-worktree`, `--skip-relocation`.
+`--relocate-worktree`, `--skip-relocation`, and the P0 rollback switch
+`--disable-product-turns`.
 
 Subcommands: `doctor`/`repair` (`--state-dir`, `--json`).
 
