@@ -227,7 +227,7 @@ func (c *providerPickerClient) ListProviderModels(context.Context, string) ([]co
 	return c.models, c.modelsErr
 }
 
-func TestSingleColumnToolResultCollapsesDetailAndDiff(t *testing.T) {
+func TestToolResultCollapsesThenShowsWideDiffPane(t *testing.T) {
 	bridge, err := NewEventBridge(4)
 	if err != nil {
 		t.Fatalf("create bridge: %v", err)
@@ -267,8 +267,80 @@ func TestSingleColumnToolResultCollapsesDetailAndDiff(t *testing.T) {
 	}
 	model.Update(tea.MouseClickMsg(tea.Mouse{X: 3, Y: clickY, Button: tea.MouseLeft}))
 	model.Update(tea.MouseReleaseMsg(tea.Mouse{X: 3, Y: clickY, Button: tea.MouseLeft}))
-	if view = model.View().Content; !strings.Contains(view, "verbose tool output") || !strings.Contains(view, "Applied changes") || !strings.Contains(view, "+new") {
+	if view = model.View().Content; !strings.Contains(view, "verbose tool output") || !strings.Contains(view, "Changes  •  apply_patch  •  1 file") || !strings.Contains(view, "-old") || !strings.Contains(view, "+new") || !strings.Contains(view, "│") {
 		t.Fatalf("expanded tool view = %q", view)
+	}
+}
+
+func TestNarrowToolDiffFallsBackToInlineExpansion(t *testing.T) {
+	bridge, _ := NewEventBridge(2)
+	defer bridge.Close()
+	snapshot := codingagent.Snapshot{
+		Session: codingagent.Session{ID: "session", Title: "repo"},
+		Transcript: []codingagent.TranscriptItem{{Kind: codingagent.TranscriptToolResult, Tool: &codingagent.TranscriptTool{
+			CallID: "call", Name: "apply_patch", Status: "completed",
+			Diff: &codingagent.InlineDiff{Text: "--- a/main.go\n+++ b/main.go\n@@ -1 +1 @@\n-old\n+new\n", Files: []string{"main.go"}},
+		}}},
+	}
+	model, err := NewModel(context.Background(), fakeClient{snapshot: snapshot}, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width, model.height = 80, 20
+	model.selectBlock(model.selectableBlocks()[0])
+	model.expanded["call"] = true
+	view := ansi.Strip(model.View().Content)
+	if !strings.Contains(view, "Applied changes") || !strings.Contains(view, "-old") || strings.Contains(view, "Changes  •  apply_patch") {
+		t.Fatalf("narrow diff fallback = %q", view)
+	}
+}
+
+func TestDiffPaneShowsOldAndNewLineNumbersWithChangeColors(t *testing.T) {
+	rows := diffPaneContentLines("--- a/main.go\n+++ b/main.go\n@@ -4,2 +7,2 @@\n-old\n+new\n same\n", 80)
+	if len(rows) != 6 {
+		t.Fatalf("diff rows = %#v", rows)
+	}
+	removed := ansi.Strip(rows[3])
+	added := ansi.Strip(rows[4])
+	contextLine := ansi.Strip(rows[5])
+	if !strings.Contains(removed, "4") || !strings.Contains(removed, "-old") || !strings.Contains(added, "7") || !strings.Contains(added, "+new") || !strings.Contains(contextLine, "5") || !strings.Contains(contextLine, "8") {
+		t.Fatalf("numbered diff rows: removed=%q added=%q context=%q", removed, added, contextLine)
+	}
+	if rows[3] != theme.removed.Render(removed) || rows[4] != theme.added.Render(added) {
+		t.Fatalf("diff change colors were not applied: removed=%q added=%q", rows[3], rows[4])
+	}
+}
+
+func TestMouseWheelOverDiffPaneScrollsDiffIndependently(t *testing.T) {
+	bridge, _ := NewEventBridge(2)
+	defer bridge.Close()
+	var diff strings.Builder
+	diff.WriteString("--- a/main.go\n+++ b/main.go\n@@ -1,20 +1,20 @@\n")
+	for index := 0; index < 20; index++ {
+		fmt.Fprintf(&diff, "-old %d\n+new %d\n", index, index)
+	}
+	snapshot := codingagent.Snapshot{
+		Session: codingagent.Session{ID: "session", Title: "repo"},
+		Transcript: []codingagent.TranscriptItem{{Kind: codingagent.TranscriptToolResult, Tool: &codingagent.TranscriptTool{
+			CallID: "call", Name: "apply_patch", Status: "completed",
+			Diff: &codingagent.InlineDiff{Text: diff.String(), Files: []string{"main.go"}},
+		}}},
+	}
+	model, err := NewModel(context.Background(), fakeClient{snapshot: snapshot}, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width, model.height = 120, 12
+	model.selectBlock(model.selectableBlocks()[0])
+	model.expanded["call"] = true
+	_ = model.View()
+	if !model.diffPaneActive || model.diffMaxScroll == 0 {
+		t.Fatalf("long diff did not activate a scrollable pane: active=%v max=%d", model.diffPaneActive, model.diffMaxScroll)
+	}
+	conversationScroll := model.scroll
+	model.Update(tea.MouseWheelMsg(tea.Mouse{X: model.width - 2, Y: 4, Button: tea.MouseWheelDown}))
+	if model.diffScroll == 0 || model.scroll != conversationScroll {
+		t.Fatalf("right-pane wheel routing: diff=%d conversation=%d want conversation=%d", model.diffScroll, model.scroll, conversationScroll)
 	}
 }
 
@@ -690,6 +762,76 @@ func TestMessagesAndToolResultsCanBeSelectedAndCopied(t *testing.T) {
 	}
 }
 
+func TestSelectedTextCopiesDuringApprovalAndBusyTurn(t *testing.T) {
+	bridge, _ := NewEventBridge(2)
+	defer bridge.Close()
+	snapshot := codingagent.Snapshot{
+		Session: codingagent.Session{ID: "session", Title: "repo"},
+		Transcript: []codingagent.TranscriptItem{
+			{ID: "assistant", Kind: codingagent.TranscriptText, Role: codingagent.TranscriptRoleAssistant, Text: "copy while waiting"},
+		},
+		PendingInterrupts: []codingagent.PendingInterrupt{{TurnID: "turn", InterruptID: "approval", Kind: "approval", Summary: "Create file"}},
+	}
+	client := &cancelClient{fakeClient: fakeClient{snapshot: snapshot}}
+	model, err := NewModel(context.Background(), client, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.busy = true
+	model.markdownEnabled = false
+	model.textSelection = textSelection{dragged: true, anchor: textPosition{row: 0, column: 0}, focus: textPosition{row: 0, column: 3}}
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: 'c', Mod: tea.ModCtrl}))
+	if command == nil || !strings.Contains(fmt.Sprint(command()), "copy") {
+		t.Fatalf("clipboard command during approval = %#v", command)
+	}
+	if client.calls != 0 || model.textSelection.hasRange() {
+		t.Fatalf("copy cancelled the turn or kept selection: cancel calls=%d selection=%#v", client.calls, model.textSelection)
+	}
+}
+
+func TestConsecutiveCreateFileActivitiesRenderAndSelectAsDirectoryTrees(t *testing.T) {
+	bridge, _ := NewEventBridge(2)
+	defer bridge.Close()
+	toolPair := func(callID, name, path string) []codingagent.TranscriptItem {
+		return []codingagent.TranscriptItem{
+			{Kind: codingagent.TranscriptToolCall, Tool: &codingagent.TranscriptTool{CallID: callID, Name: name, Status: "requested"}},
+			{Kind: codingagent.TranscriptToolResult, Tool: &codingagent.TranscriptTool{
+				CallID: callID, Name: name, Status: "completed", Summary: "Completed",
+				Resources: []codingagent.ToolResource{{Path: path}},
+				Diff:      &codingagent.InlineDiff{Text: fmt.Sprintf("--- /dev/null\n+++ b/%s\n@@ -0,0 +1 @@\n+created\n", path), Files: []string{path}},
+			}},
+		}
+	}
+	transcript := append(toolPair("create-1", createFileToolName, "cmd/app/main.go"), toolPair("create-2", createFileToolName, "internal/config/config.go")...)
+	transcript = append(transcript, toolPair("read-1", "read_file", "go.mod")...)
+	transcript = append(transcript, toolPair("create-3", createFileToolName, "README.md")...)
+	snapshot := codingagent.Snapshot{Session: codingagent.Session{ID: "session", Title: "repo"}, Transcript: transcript}
+	model, err := NewModel(context.Background(), fakeClient{snapshot: snapshot}, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := ansi.Strip(renderedRows(model.conversationRows(100)))
+	if count := strings.Count(plain, createFileToolName); count != 2 {
+		t.Fatalf("create_file presentation count=%d, want 2 groups: %q", count, plain)
+	}
+	for _, expected := range []string{"2 files", "├── cmd/", "│   └── app/", "main.go", "internal/", "config.go", "README.md"} {
+		if !strings.Contains(plain, expected) {
+			t.Fatalf("create_file tree does not contain %q: %q", expected, plain)
+		}
+	}
+	blocks := model.selectableBlocks()
+	if len(blocks) != 3 || blocks[0].toolID != "create-1" || !strings.Contains(blocks[0].text, "cmd/") || !strings.Contains(blocks[0].text, "app/") || !strings.Contains(blocks[0].text, "config.go") {
+		t.Fatalf("grouped selectable blocks = %#v", blocks)
+	}
+	model.width, model.height = 120, 24
+	model.selectBlock(blocks[0])
+	model.expanded["create-1"] = true
+	wide := ansi.Strip(model.View().Content)
+	if !strings.Contains(wide, "Changes  •  create_file  •  2 files") || !strings.Contains(wide, "cmd/app/main.go") || !strings.Contains(wide, "internal/config/config.go") || strings.Count(wide, "+created") != 2 {
+		t.Fatalf("grouped create_file diff pane = %q", wide)
+	}
+}
+
 func TestConversationUsesPromptBlocksWithoutRoleHeadersAndShowsTurnTime(t *testing.T) {
 	bridge, _ := NewEventBridge(2)
 	defer bridge.Close()
@@ -1104,6 +1246,141 @@ func TestHelpAndUnknownSlashCommandsNeverReachAgent(t *testing.T) {
 	}
 }
 
+func TestPlanCommandStartsExplicitReadOnlyPlanTurn(t *testing.T) {
+	bridge, _ := NewEventBridge(4)
+	initial := codingagent.Snapshot{Session: codingagent.Session{ID: "session", Title: "repo", PermissionMode: codingagent.PermissionAsk}}
+	client := &sessionClient{fakeClient: fakeClient{snapshot: initial}}
+	model, err := NewModel(context.Background(), client, bridge, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := runPlanCommand(model, "inspect the workflow")
+	if command == nil {
+		t.Fatal("/plan request did not start a turn")
+	}
+	model.Update(command())
+	if client.turnRequest.Mode != codingagent.TurnModePlan || client.turnRequest.Text != "inspect the workflow" {
+		t.Fatalf("Plan Turn request = %#v", client.turnRequest)
+	}
+	runPlanCommand(model, "")
+	if !model.planInput || !strings.Contains(model.promptLine(), "Plan") {
+		t.Fatalf("empty /plan did not switch input state: prompt=%q", model.promptLine())
+	}
+}
+
+func TestPlanApprovalSupportsRevisionFeedbackAtSingleUserBoundary(t *testing.T) {
+	bridge, _ := NewEventBridge(4)
+	snapshot := codingagent.Snapshot{
+		Session: codingagent.Session{ID: "session", Title: "repo"}, PendingPlanApproval: true,
+		ActivePlan: &codingagent.PlanSnapshot{
+			ID: "plan", TurnID: "turn", Version: 1, Goal: "Implement Plan mode.",
+			Scope:    codingagent.PlanScope{Included: []string{"internal/codingagent"}},
+			Findings: []string{"P0 exists."}, Risks: []string{"Keep approval separate."},
+			Steps:              []codingagent.PlanStep{{ID: "implement", Goal: "Implement P1.", Validation: []string{"Run tests."}}},
+			AcceptanceCriteria: []string{"Tests pass."}, RecommendedStrategy: codingagent.ExecutionSingle,
+		},
+		PendingInterrupts: []codingagent.PendingInterrupt{{TurnID: "turn", InterruptID: "plan-approval", Kind: "plan_approval", PlanID: "plan", PlanVersion: 1, Summary: "Review Plan v1"}},
+	}
+	client := &approvalClient{fakeClient: fakeClient{snapshot: snapshot}}
+	model, err := NewModel(context.Background(), client, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	if _, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter})); command != nil || !model.planFeedback {
+		t.Fatal("Plan revision choice did not open feedback input")
+	}
+	for _, character := range "keep the UI compact" {
+		model.Update(tea.KeyPressMsg(tea.Key{Code: character, Text: string(character)}))
+	}
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if command == nil {
+		t.Fatal("Plan feedback did not produce a decision command")
+	}
+	_ = command()
+	if client.calls != 1 || client.request.Decision != codingagent.ResolutionDenied || client.request.GrantScope != codingagent.PermissionGrantOnce || client.request.Message != "keep the UI compact" {
+		t.Fatalf("Plan revision request = %#v calls=%d", client.request, client.calls)
+	}
+}
+
+func TestPlanClarificationOffersRecommendedChoicesAndFreeFormOther(t *testing.T) {
+	bridge, _ := NewEventBridge(4)
+	prompt := codingagent.ClarificationPrompt{Questions: []codingagent.ClarificationRequest{
+		{
+			ID: "storage", Header: "Storage", Question: "Which storage should the feature use?",
+			SelectionMode: codingagent.ClarificationSelectionSingle,
+			Options: []codingagent.ClarificationOption{
+				{ID: "file", Label: "File", Description: "Keep local persistence simple.", Recommended: true},
+				{ID: "database", Label: "Database", Description: "Support stronger querying."},
+			},
+		},
+		{
+			ID: "compatibility", Header: "Compatibility", Question: "Which compatibility target should apply?",
+			SelectionMode: codingagent.ClarificationSelectionMultiple,
+			Options: []codingagent.ClarificationOption{
+				{ID: "current", Label: "Current version", Description: "Keep the implementation focused.", Recommended: true},
+				{ID: "legacy", Label: "Legacy versions", Description: "Preserve older behavior."},
+			},
+		},
+	}}
+	snapshot := codingagent.Snapshot{
+		Session:           codingagent.Session{ID: "session", Title: "repo"},
+		PendingInterrupts: []codingagent.PendingInterrupt{{TurnID: "turn", InterruptID: "clarification-1", Kind: "clarification", Summary: prompt.Questions[0].Question, Clarification: &prompt}},
+	}
+	client := &approvalClient{fakeClient: fakeClient{snapshot: snapshot}}
+	model, err := NewModel(context.Background(), client, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := model.View().Content
+	for _, expected := range []string{"Plan needs your input", "Question 1/2", "File (Recommended)", "Other"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("clarification view does not contain %q: %s", expected, view)
+		}
+	}
+	if _, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter})); command != nil || model.clarificationIndex != 1 || len(model.clarificationAnswers) != 1 {
+		t.Fatal("first answer did not advance to the next question")
+	}
+	view = model.View().Content
+	if !strings.Contains(view, "Question 2/2") || !strings.Contains(view, "Multiple choice") || !strings.Contains(view, "Current version (Recommended)") {
+		t.Fatalf("second clarification view is incomplete: %s", view)
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeySpace, Text: " "}))
+	view = model.View().Content
+	if !strings.Contains(view, "[x]") {
+		t.Fatalf("multiple-choice selection is not visible: %s", view)
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	if _, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter})); command != nil || !model.clarificationOther {
+		t.Fatal("Other choice did not open free-form input")
+	}
+	for _, character := range "Use the existing embedded store" {
+		model.Update(tea.KeyPressMsg(tea.Key{Code: character, Text: string(character)}))
+	}
+	view = model.View().Content
+	if !strings.Contains(view, "Other ❯ Use the existing embedded store") || strings.Contains(view, "Current version (Recommended)") {
+		t.Fatalf("free-form input is not shown inline: %s", view)
+	}
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if command == nil {
+		t.Fatal("free-form clarification did not produce a resume command")
+	}
+	_ = command()
+	if client.calls != 1 || client.request.Decision != codingagent.ResolutionApproved || len(client.request.Details) == 0 {
+		t.Fatalf("clarification resume = %#v calls=%d", client.request, client.calls)
+	}
+}
+
+func TestDeliverablePlanApprovalFinishesWithoutExecuteLabel(t *testing.T) {
+	pending := codingagent.PendingInterrupt{Kind: "plan_approval", PlanCompletion: codingagent.PlanCompletionDeliverable}
+	model := &Model{}
+	choices := model.approvalChoices(pending)
+	if len(choices) == 0 || choices[0].label != "Accept Plan and finish" {
+		t.Fatalf("deliverable Plan choices = %#v", choices)
+	}
+}
+
 func TestPermissionsPickerChangesCurrentSessionMode(t *testing.T) {
 	bridge, _ := NewEventBridge(4)
 	initial := codingagent.Snapshot{Session: codingagent.Session{ID: "session", Title: "repo", PermissionMode: codingagent.PermissionAsk}}
@@ -1279,14 +1556,21 @@ func TestPendingApprovalChoiceUsesExplicitSessionGrantScope(t *testing.T) {
 	bridge, _ := NewEventBridge(1)
 	snapshot := codingagent.Snapshot{
 		Session: codingagent.Session{ID: "session", Title: "repo"},
+		Transcript: []codingagent.TranscriptItem{{Kind: codingagent.TranscriptToolCall, Tool: &codingagent.TranscriptTool{
+			CallID: "call", Name: createFileToolName, Status: "interrupted",
+		}}},
 		PendingInterrupts: []codingagent.PendingInterrupt{{
-			TurnID: "turn", InterruptID: "approval", Kind: "approval", Summary: "Edit main.go", CanGrantSession: true,
+			TurnID: "turn", InterruptID: "approval", Kind: "approval", ToolCallID: "call", Summary: "Create main.go", CanGrantSession: true,
 		}},
 	}
 	client := &approvalClient{fakeClient: fakeClient{snapshot: snapshot}}
 	model, err := NewModel(context.Background(), client, bridge, snapshot)
 	if err != nil {
 		t.Fatalf("create model: %v", err)
+	}
+	approval := ansi.Strip(renderedRows(model.approvalRows(snapshot.PendingInterrupts[0], 120)))
+	if !strings.Contains(approval, "Allow for this session (new files in this worktree)") || !strings.Contains(approval, "safety checks still apply") {
+		t.Fatalf("create_file session scope is unclear: %q", approval)
 	}
 	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
 	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))

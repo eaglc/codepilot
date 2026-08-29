@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/eaglc/codepilot/internal/codingagent"
 )
 
 type commandSpec struct {
@@ -20,6 +22,7 @@ type commandSpec struct {
 func registeredCommands() []commandSpec {
 	return []commandSpec{
 		{name: "/help", usage: "/help", description: "Show this command guide", run: runHelpCommand},
+		{name: "/plan", usage: "/plan [request]", description: "Start a read-only Plan task", takesArg: true, run: runPlanCommand},
 		{name: "/workspace", usage: "/workspace", description: "Choose or repair a workspace", run: runWorkspaceCommand},
 		{name: "/provider", usage: "/provider", description: "Configure a provider and choose a model", aliases: []string{"/model"}, run: runModelCommand},
 		{name: "/permissions", usage: "/permissions", description: "Choose the active session's safety mode", run: runPermissionsCommand},
@@ -162,6 +165,15 @@ func runHelpCommand(m *Model, arguments string) tea.Cmd {
 		m.helpActive = true
 	}
 	return nil
+}
+
+func runPlanCommand(m *Model, arguments string) tea.Cmd {
+	if strings.TrimSpace(arguments) == "" {
+		m.planInput = true
+		m.status = "Plan mode: enter a request for read-only planning."
+		return nil
+	}
+	return m.submitTurn(strings.TrimSpace(arguments), codingagent.TurnModePlan)
 }
 
 func runWorkspaceCommand(m *Model, arguments string) tea.Cmd {

@@ -2,6 +2,9 @@ package file
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +16,23 @@ import (
 	agentsession "github.com/eaglc/codepilot/internal/agent/session"
 	"github.com/eaglc/codepilot/internal/codingagent"
 )
+
+type legacyPlanV1Fixture struct {
+	ID                  codingagent.PlanID            `json:"id"`
+	TurnID              codingagent.TurnID            `json:"turn_id"`
+	Version             uint64                        `json:"version"`
+	Goal                string                        `json:"goal"`
+	Scope               codingagent.PlanScope         `json:"scope"`
+	Findings            []string                      `json:"findings"`
+	Assumptions         []string                      `json:"assumptions,omitempty"`
+	Risks               []string                      `json:"risks"`
+	Steps               []codingagent.PlanStep        `json:"steps"`
+	AcceptanceCriteria  []string                      `json:"acceptance_criteria"`
+	RecommendedStrategy codingagent.ExecutionStrategy `json:"recommended_strategy"`
+	WorkspaceRevision   codingagent.WorkspaceRevision `json:"workspace_revision"`
+	Digest              string                        `json:"digest"`
+	CreatedAt           time.Time                     `json:"created_at"`
+}
 
 func TestRepositoryPersistsProductBindingsAcrossRestart(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
@@ -82,6 +102,27 @@ func TestRepositoryPersistsProductBindingsAcrossRestart(t *testing.T) {
 	turn.Revision = 2
 	if err := reopened.SaveTurn(context.Background(), turn, 1); err != nil {
 		t.Fatalf("save turn: %v", err)
+	}
+	plan := codingagent.Plan{
+		ID: "plan-1", TurnID: turn.ID, Version: 1, Goal: "Persist Plan versions.",
+		Scope:    codingagent.PlanScope{Included: []string{"internal/codingagent"}},
+		Findings: []string{"The Product Turn is durable."}, Risks: []string{"Plan versions must be immutable."},
+		Steps:              []codingagent.PlanStep{{ID: "persist", Goal: "Persist the Plan.", Files: []string{"internal/codingagent/plan.go"}, Validation: []string{"Reopen the repository."}}},
+		AcceptanceCriteria: []string{"The exact version survives restart."}, RecommendedStrategy: codingagent.ExecutionSingle,
+		WorkspaceRelevant: true, CompletionMode: codingagent.PlanCompletionExecute,
+		WorkspaceRevision: codingagent.WorkspaceRevision{WorktreeID: worktree.ID, StatusDigest: strings.Repeat("a", 64), RecordedAt: now}, CreatedAt: now,
+	}
+	plan.Digest, _ = codingagent.ComputePlanDigest(plan)
+	if err := reopened.CreatePlanVersion(context.Background(), plan); err != nil {
+		t.Fatalf("create Plan version: %v", err)
+	}
+	planStore, err := NewRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedPlan, err := planStore.LoadPlan(context.Background(), plan.ID, plan.Version)
+	if err != nil || persistedPlan.Digest != plan.Digest {
+		t.Fatalf("reopened Plan = %#v, %v", persistedPlan, err)
 	}
 	turnsPath, err := reopened.turnsPath(session.ID)
 	if err != nil {
@@ -157,6 +198,48 @@ func TestRepositoryMigratesLegacyFlatSessionMetadata(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy metadata remains after migration: %v", err)
+	}
+}
+
+func TestRepositoryLoadsLegacyPlanWithoutNewCompletionFields(t *testing.T) {
+	root := t.TempDir()
+	repository, err := NewRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	legacy := legacyPlanV1Fixture{
+		ID: "plan-legacy", TurnID: "turn-legacy", Version: 1, Goal: "Load the original Plan format.",
+		Scope:    codingagent.PlanScope{Included: []string{"internal/codingagent"}},
+		Findings: []string{"The stored Plan predates completion modes."}, Risks: []string{"Its immutable digest must remain valid."},
+		Steps:              []codingagent.PlanStep{{ID: "load", Goal: "Load the Plan.", Files: []string{"internal/codingagent/plan.go"}, Validation: []string{"Open the existing session."}}},
+		AcceptanceCriteria: []string{"Startup succeeds without rewriting the Plan."}, RecommendedStrategy: codingagent.ExecutionSingle,
+		WorkspaceRevision: codingagent.WorkspaceRevision{WorktreeID: "worktree-legacy", StatusDigest: strings.Repeat("b", 64), RecordedAt: now},
+		CreatedAt:         now,
+	}
+	canonical, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(canonical)
+	legacy.Digest = hex.EncodeToString(digest[:])
+	path, err := repository.planVersionPath(legacy.ID, legacy.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEnvelope(path, legacy); err != nil {
+		t.Fatal(err)
+	}
+	versions, err := repository.ListPlanVersions(context.Background(), legacy.ID)
+	if err != nil || len(versions) != 1 {
+		t.Fatalf("list legacy Plan versions = %#v, %v", versions, err)
+	}
+	loaded := versions[0]
+	if loaded.CompletionMode != codingagent.PlanCompletionExecute || !loaded.WorkspaceRelevant || loaded.Digest != legacy.Digest {
+		t.Fatalf("loaded legacy Plan = %#v", loaded)
 	}
 }
 

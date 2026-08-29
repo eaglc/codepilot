@@ -530,7 +530,12 @@ func (r *Runtime) runSteps(ctx context.Context, request RunRequest, dispatcher *
 				}
 				return RunResult{RunID: request.RunID, Status: RunInterrupted, Steps: step, Reason: "tool_interrupted", Interrupt: interrupted}, nil
 			}
-			_ = result
+			if policy, ok := request.Tools.ControlPolicy(call.Name); ok && policy.HandoffAfterExecution && result.Status == tool.ResultCompleted {
+				if err := r.finishRun(ctx, request, dispatcher, step, RunHandedOff, "control_handoff"); err != nil {
+					return RunResult{}, err
+				}
+				return RunResult{RunID: request.RunID, Status: RunHandedOff, Steps: step, Reason: "control_handoff"}, nil
+			}
 		}
 	}
 	if err := r.finishRun(ctx, request, dispatcher, request.Limits.MaxSteps, RunLimitReached, "max_steps"); err != nil {

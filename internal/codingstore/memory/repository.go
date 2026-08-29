@@ -21,6 +21,7 @@ type Repository struct {
 	worktrees  map[codingagent.WorktreeID]codingagent.Worktree
 	intents    map[codingagent.SessionCreationIntentID]codingagent.SessionCreationIntent
 	turns      map[codingagent.TurnID]codingagent.Turn
+	plans      map[codingagent.PlanID][]codingagent.Plan
 }
 
 // NewRepository creates an empty product repository.
@@ -29,7 +30,70 @@ func NewRepository() *Repository {
 		sessions: make(map[codingagent.SessionID]codingagent.Session), workspaces: make(map[codingagent.WorkspaceID]codingagent.Workspace),
 		worktrees: make(map[codingagent.WorktreeID]codingagent.Worktree), intents: make(map[codingagent.SessionCreationIntentID]codingagent.SessionCreationIntent),
 		turns: make(map[codingagent.TurnID]codingagent.Turn),
+		plans: make(map[codingagent.PlanID][]codingagent.Plan),
 	}
+}
+
+// CreatePlanVersion appends one immutable, sequential Plan revision.
+func (r *Repository) CreatePlanVersion(ctx context.Context, value codingagent.Plan) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := codingagent.ValidatePlan(value); err != nil {
+		return fmt.Errorf("create Coding plan version: %w", err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	turn, exists := r.turns[value.TurnID]
+	if !exists {
+		return fmt.Errorf("create Coding plan %q: turn %q not found", value.ID, value.TurnID)
+	}
+	versions := r.plans[value.ID]
+	if len(versions) == 0 {
+		if value.Version != 1 {
+			return fmt.Errorf("create Coding plan %q: initial version must be 1", value.ID)
+		}
+	} else {
+		latest := versions[len(versions)-1]
+		if latest.TurnID != value.TurnID || value.Version != latest.Version+1 {
+			return fmt.Errorf("create Coding plan %q: version or immutable Turn binding is invalid", value.ID)
+		}
+	}
+	if turn.PlanID != "" && turn.PlanID != value.ID {
+		return fmt.Errorf("create Coding plan %q: Product Turn references another Plan", value.ID)
+	}
+	r.plans[value.ID] = append(versions, clonePlan(value))
+	return nil
+}
+
+// LoadPlan returns one exact immutable Plan revision.
+func (r *Repository) LoadPlan(ctx context.Context, id codingagent.PlanID, version uint64) (codingagent.Plan, error) {
+	if err := ctx.Err(); err != nil {
+		return codingagent.Plan{}, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, value := range r.plans[id] {
+		if value.Version == version {
+			return clonePlan(value), nil
+		}
+	}
+	return codingagent.Plan{}, fmt.Errorf("load Coding plan %q version %d: %w", id, version, codingagent.ErrPlanNotFound)
+}
+
+// ListPlanVersions returns immutable Plan revisions in ascending version order.
+func (r *Repository) ListPlanVersions(ctx context.Context, id codingagent.PlanID) ([]codingagent.Plan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	versions := r.plans[id]
+	values := make([]codingagent.Plan, len(versions))
+	for index := range versions {
+		values[index] = clonePlan(versions[index])
+	}
+	return values, nil
 }
 
 // CreateTurn stores a new Product Turn with its initial revision.
@@ -402,5 +466,21 @@ func cloneSession(value codingagent.Session) codingagent.Session {
 
 func cloneTurn(value codingagent.Turn) codingagent.Turn {
 	value.Runs = append([]codingagent.RunBinding(nil), value.Runs...)
+	return value
+}
+
+func clonePlan(value codingagent.Plan) codingagent.Plan {
+	value.Scope.Included = append([]string(nil), value.Scope.Included...)
+	value.Scope.Excluded = append([]string(nil), value.Scope.Excluded...)
+	value.Findings = append([]string(nil), value.Findings...)
+	value.Assumptions = append([]string(nil), value.Assumptions...)
+	value.Risks = append([]string(nil), value.Risks...)
+	value.AcceptanceCriteria = append([]string(nil), value.AcceptanceCriteria...)
+	value.Steps = append([]codingagent.PlanStep(nil), value.Steps...)
+	for index := range value.Steps {
+		value.Steps[index].DependsOn = append([]string(nil), value.Steps[index].DependsOn...)
+		value.Steps[index].Files = append([]string(nil), value.Steps[index].Files...)
+		value.Steps[index].Validation = append([]string(nil), value.Steps[index].Validation...)
+	}
 	return value
 }

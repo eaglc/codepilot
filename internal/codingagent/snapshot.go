@@ -93,6 +93,11 @@ type PendingInterrupt struct {
 	Summary         string
 	Proposed        *ProposedChange
 	CanGrantSession bool
+	PlanID          PlanID
+	PlanVersion     uint64
+	PlanDigest      string
+	PlanCompletion  PlanCompletionMode
+	Clarification   *ClarificationPrompt
 }
 
 // RecoveryDecision is a product-level operator choice for unfinished work.
@@ -153,15 +158,45 @@ type TurnSnapshot struct {
 	Revision uint64
 }
 
+// PlanVersionSummary identifies one immutable Plan revision in history.
+type PlanVersionSummary struct {
+	ID        PlanID
+	Version   uint64
+	Digest    string
+	Goal      string
+	CreatedAt time.Time
+}
+
+// PlanSnapshot is the bounded structured Plan shown by presentation layers.
+type PlanSnapshot struct {
+	ID                  PlanID
+	TurnID              TurnID
+	Version             uint64
+	Digest              string
+	Goal                string
+	Scope               PlanScope
+	Findings            []string
+	Assumptions         []string
+	Risks               []string
+	Steps               []PlanStep
+	AcceptanceCriteria  []string
+	RecommendedStrategy ExecutionStrategy
+	WorkspaceRelevant   bool
+	CompletionMode      PlanCompletionMode
+}
+
 // Snapshot is the authoritative Coding Agent state exposed to UI and future clients.
 type Snapshot struct {
-	Revision          uint64
-	Session           Session
-	RuntimeState      RuntimeState
-	Transcript        []TranscriptItem
-	PendingInterrupts []PendingInterrupt
-	RecoveryActions   []RecoveryAction
-	RecoveryWarnings  []string
-	Metrics           SessionMetrics
-	ActiveTurn        *TurnSnapshot
+	Revision            uint64
+	Session             Session
+	RuntimeState        RuntimeState
+	Transcript          []TranscriptItem
+	PendingInterrupts   []PendingInterrupt
+	RecoveryActions     []RecoveryAction
+	RecoveryWarnings    []string
+	Metrics             SessionMetrics
+	ActiveTurn          *TurnSnapshot
+	ActivePlan          *PlanSnapshot
+	PlanHistory         []PlanVersionSummary
+	PendingPlanApproval bool
 }

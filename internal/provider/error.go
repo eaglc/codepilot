@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"regexp"
 	"strconv"
@@ -21,6 +22,8 @@ const (
 	ErrorModelNotFound        ErrorCode = "model_not_found"
 	ErrorRateLimited          ErrorCode = "rate_limited"
 	ErrorTimeout              ErrorCode = "timeout"
+	ErrorStreamInterrupted    ErrorCode = "stream_interrupted"
+	ErrorProviderFailed       ErrorCode = "provider_failed"
 )
 
 var statusPattern = regexp.MustCompile(`(?i)(?:status(?:[\s_]+code)?[=:\s]+|http[/\s][0-9.]*\s+)([1-5][0-9]{2})`)
@@ -113,6 +116,9 @@ func ClassifyTransportError(operation string, err error) error {
 	if errors.As(err, &networkError) && networkError.Timeout() {
 		return NewProductError(ErrorTimeout, operation, "Provider request timed out. Check the endpoint and try again.", true, err)
 	}
+	if errors.As(err, &networkError) {
+		return NewProductError(ErrorConnectionFailed, operation, "Cannot connect to the Provider endpoint. Check the Base URL, network, and local service status.", true, err)
+	}
 	if status := statusCode(err); status != 0 {
 		classified := HTTPStatusError(operation, status)
 		if target, ok := classified.(*ProductError); ok {
@@ -128,8 +134,12 @@ func ClassifyTransportError(operation string, err error) error {
 		return NewProductError(ErrorRateLimited, operation, "Provider rate limit was reached. Wait and try again.", true, err)
 	case strings.Contains(lower, "model") && strings.Contains(lower, "not found"):
 		return NewProductError(ErrorModelNotFound, operation, "The selected model is unavailable. Choose an installed or accessible model.", false, err)
-	default:
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), strings.Contains(lower, "stream closed"), strings.Contains(lower, "connection reset"):
+		return NewProductError(ErrorStreamInterrupted, operation, "The Provider response was interrupted before it completed. Retry the request.", true, err)
+	case strings.Contains(lower, "connection refused"), strings.Contains(lower, "no such host"), strings.Contains(lower, "dial tcp"), strings.Contains(lower, "tls handshake"):
 		return NewProductError(ErrorConnectionFailed, operation, "Cannot connect to the Provider endpoint. Check the Base URL, network, and local service status.", true, err)
+	default:
+		return NewProductError(ErrorProviderFailed, operation, "The Provider request failed before a complete response was produced. Retry the request or inspect the local diagnostics.", true, err)
 	}
 }
 

@@ -34,11 +34,12 @@ type ContinuationRunner interface {
 // FeatureFlags controls independently reversible product capabilities.
 type FeatureFlags struct {
 	ProductTurns bool
+	PlanMode     bool
 }
 
 // DefaultFeatureFlags returns the current stable product defaults.
 func DefaultFeatureFlags() FeatureFlags {
-	return FeatureFlags{ProductTurns: true}
+	return FeatureFlags{ProductTurns: true, PlanMode: true}
 }
 
 // ToolScope contains immutable trusted Coding facts captured before model-controlled execution.
@@ -88,6 +89,7 @@ type UntrustedContextBuilder interface {
 type Dependencies struct {
 	Sessions      SessionRepository
 	Turns         TurnRepository
+	Plans         PlanRepository
 	AgentSessions agentsession.Repository
 	Worktrees     WorktreeReader
 	Workspaces    WorkspaceController
@@ -124,7 +126,15 @@ func NewService(deps Dependencies) (*Service, error) {
 			deps.Turns = repository
 		}
 	}
-	if deps.Sessions == nil || (features.ProductTurns && deps.Turns == nil) || deps.AgentSessions == nil || deps.Worktrees == nil || deps.Agent == nil || deps.Tools == nil || deps.Prompts == nil || deps.Events == nil {
+	if deps.Plans == nil {
+		if repository, ok := deps.Sessions.(PlanRepository); ok {
+			deps.Plans = repository
+		}
+	}
+	if !features.ProductTurns {
+		features.PlanMode = false
+	}
+	if deps.Sessions == nil || (features.ProductTurns && deps.Turns == nil) || (features.PlanMode && deps.Plans == nil) || deps.AgentSessions == nil || deps.Worktrees == nil || deps.Agent == nil || deps.Tools == nil || deps.Prompts == nil || deps.Events == nil {
 		return nil, errors.New("create Coding Agent service: dependencies are incomplete")
 	}
 	return &Service{deps: deps, features: features, states: make(map[SessionID]RuntimeState), operations: make(map[SessionID]*sync.Mutex), activeTurns: make(map[SessionID]activeTurn)}, nil
@@ -193,10 +203,19 @@ func (s *Service) CreateSession(ctx context.Context, value Session) (Session, er
 	return value, nil
 }
 
+// TurnMode selects the explicit product entry mode for a new request.
+type TurnMode string
+
+const (
+	TurnModeDirect TurnMode = "direct"
+	TurnModePlan   TurnMode = "plan"
+)
+
 // TurnRequest starts one complete user-triggered Coding Agent turn.
 type TurnRequest struct {
 	SessionID SessionID
 	Text      string
+	Mode      TurnMode
 }
 
 // TurnResult contains product-level terminal facts without lower-layer messages or events.
@@ -230,8 +249,20 @@ func (s *Service) StartTurn(ctx context.Context, request TurnRequest) (TurnResul
 	if recovery := agentsession.AnalyzeRecovery(durable); len(recovery.PendingRuns) != 0 || len(recovery.PendingInterrupts) != 0 || len(recovery.PendingTools) != 0 {
 		return TurnResult{}, errors.New("start Coding Agent turn: the session has unfinished work that must be resumed first")
 	}
+	if request.Mode == "" {
+		request.Mode = TurnModeDirect
+	}
+	if request.Mode != TurnModeDirect && request.Mode != TurnModePlan {
+		return TurnResult{}, fmt.Errorf("start Coding Agent turn: unsupported mode %q", request.Mode)
+	}
 	if !s.features.ProductTurns {
+		if request.Mode == TurnModePlan {
+			return TurnResult{}, errors.New("start Coding Agent turn: Plan mode is disabled")
+		}
 		return s.startLegacyTurn(ctx, product, strings.TrimSpace(request.Text))
+	}
+	if request.Mode == TurnModePlan && !s.features.PlanMode {
+		return TurnResult{}, errors.New("start Coding Agent turn: Plan mode is disabled")
 	}
 	turnIDValue, err := newID("turn")
 	if err != nil {
@@ -246,16 +277,25 @@ func (s *Service) StartTurn(ctx context.Context, request TurnRequest) (TurnResul
 		return TurnResult{}, err
 	}
 	now := time.Now().UTC()
+	phase, profile, entrySource := TurnPhaseDirect, CapabilityDirect, TurnEntryDirect
+	if request.Mode == TurnModePlan {
+		phase, profile, entrySource = TurnPhasePlanning, CapabilityPlan, TurnEntryUserPlan
+	}
 	turn := Turn{
 		ID: TurnID(turnIDValue), SessionID: product.ID, RequestText: strings.TrimSpace(request.Text),
-		Phase: TurnPhaseDirect, Status: TurnPending, Strategy: ExecutionSingle, Revision: 1,
-		Runs:      []RunBinding{{RunID: agentsession.RunID(runIDValue), UserEntryID: agentsession.EntryID(entryIDValue), Phase: TurnPhaseDirect, Profile: CapabilityDirect, Status: RunBindingPending}},
+		EntrySource: entrySource, Phase: phase, Status: TurnPending, Strategy: ExecutionSingle, Revision: 1,
+		Runs:      []RunBinding{{RunID: agentsession.RunID(runIDValue), UserEntryID: agentsession.EntryID(entryIDValue), Phase: phase, Profile: profile, Status: RunBindingPending}},
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := s.deps.Turns.CreateTurn(ctx, turn); err != nil {
 		return TurnResult{}, fmt.Errorf("start Coding Agent turn: persist Product Turn: %w", err)
 	}
-	environment, err := s.prepareRunEnvironment(ctx, product, turn.ID, RunID(runIDValue), "")
+	if request.Mode == TurnModePlan {
+		if err := s.publishPlanEvent(ctx, product, turn, EventPlanStarted, ""); err != nil {
+			return TurnResult{}, fmt.Errorf("start Coding Agent turn: publish Plan start: %w", err)
+		}
+	}
+	environment, err := s.prepareRunEnvironment(ctx, product, turn, RunID(runIDValue), "", profile)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("start Coding Agent turn: %w", err)
 	}
@@ -275,6 +315,10 @@ func (s *Service) StartTurn(ctx context.Context, request TurnRequest) (TurnResul
 	if result.RunID == "" {
 		result.RunID = agentsession.RunID(runIDValue)
 	}
+	turn, err = s.refreshProductTurn(context.WithoutCancel(ctx), turn)
+	if err != nil {
+		return productTurnResult(turn.ID, result), fmt.Errorf("start Coding Agent turn: %w", err)
+	}
 	turn, finishErr := s.finishProductRun(context.WithoutCancel(ctx), turn, result, runErr)
 	s.setState(product.ID, runtimeStateForTurn(turn))
 	touchErr := s.touchSession(context.WithoutCancel(ctx), product)
@@ -284,6 +328,17 @@ func (s *Service) StartTurn(ctx context.Context, request TurnRequest) (TurnResul
 	}
 	if finishErr != nil {
 		return productResult, fmt.Errorf("start Coding Agent turn: persist terminal Product Turn: %w", finishErr)
+	}
+	if request.Mode == TurnModePlan && turn.Phase == TurnPhaseAwaitingPlanApproval && turn.PlanVersion != 0 {
+		if err := s.publishPlanEvent(context.WithoutCancel(ctx), product, turn, EventPlanCreated, ""); err != nil {
+			return productResult, fmt.Errorf("start Coding Agent turn: publish Plan creation: %w", err)
+		}
+	}
+	if result.Status == agent.RunHandedOff && turn.Status == TurnRunning && turn.Phase == TurnPhasePlanning && turn.Runs[len(turn.Runs)-1].Profile == CapabilityPlan {
+		if touchErr != nil {
+			return productResult, fmt.Errorf("start Coding Agent turn: update product session: %w", touchErr)
+		}
+		return s.continueTurnLocked(ctx, product, turn)
 	}
 	if touchErr != nil {
 		return productResult, fmt.Errorf("start Coding Agent turn: update product session: %w", touchErr)
@@ -356,6 +411,46 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 	if request.GrantScope == "" {
 		request.GrantScope = PermissionGrantOnce
 	}
+	durableInterrupts, loadInterruptErr := s.deps.AgentSessions.Load(ctx, product.AgentSessionID)
+	if loadInterruptErr != nil {
+		return TurnResult{}, fmt.Errorf("resume Coding Agent turn: load pending interrupt: %w", loadInterruptErr)
+	}
+	pendingKind := ""
+	for _, pending := range agentsession.AnalyzeRecovery(durableInterrupts).PendingInterrupts {
+		if pending.RunID == binding.RunID && pending.InterruptID == request.InterruptID {
+			pendingKind = pending.Kind
+			break
+		}
+	}
+	if pendingKind == "" {
+		return TurnResult{}, errors.New("resume Coding Agent turn: interrupt is not the current durable decision boundary")
+	}
+	planProfile := binding.Profile == CapabilityPlan || binding.Profile == CapabilityPlanWorkspace
+	planApproval := s.features.ProductTurns && pendingKind == "plan_approval" && turn.Phase == TurnPhaseAwaitingPlanApproval && planProfile
+	clarification := s.features.ProductTurns && pendingKind == clarificationInterruptKind && turn.Phase == TurnPhasePlanning && planProfile
+	if pendingKind == clarificationInterruptKind && !clarification {
+		return TurnResult{}, errors.New("resume Coding Agent turn: clarification is not attached to the active Planning Run")
+	}
+	if clarification {
+		if request.GrantScope == PermissionGrantSession {
+			return TurnResult{}, errors.New("resume Coding Agent turn: clarification cannot create a permission grant")
+		}
+		if request.Decision != ResolutionApproved || len(request.Details) == 0 {
+			return TurnResult{}, errors.New("resume Coding Agent turn: clarification requires one selected or free-form answer")
+		}
+	}
+	if planApproval && request.GrantScope == PermissionGrantSession {
+		return TurnResult{}, errors.New("resume Coding Agent turn: Plan approval cannot create a permission grant")
+	}
+	if planApproval && request.Decision == ResolutionDenied {
+		expected := turn.Revision
+		turn.Phase = TurnPhasePlanning
+		turn.UpdatedAt = time.Now().UTC()
+		turn.Revision++
+		if err := s.deps.Turns.SaveTurn(ctx, turn, expected); err != nil {
+			return TurnResult{}, fmt.Errorf("resume Coding Agent turn: begin Plan revision: %w", err)
+		}
+	}
 	if request.GrantScope != PermissionGrantOnce && request.GrantScope != PermissionGrantSession {
 		return TurnResult{}, fmt.Errorf("resume Coding Agent turn: unsupported grant scope %q", request.GrantScope)
 	}
@@ -382,7 +477,7 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 			}
 		}
 	}
-	environment, err := s.prepareRunEnvironment(ctx, product, turn.ID, RunID(binding.RunID), "")
+	environment, err := s.prepareRunEnvironment(ctx, product, turn, RunID(binding.RunID), "", binding.Profile)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("resume Coding Agent turn: %w", err)
 	}
@@ -407,9 +502,31 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 	if result.RunID == "" {
 		result.RunID = binding.RunID
 	}
+	planCompletion := PlanCompletionExecute
+	if planApproval {
+		if s.deps.Plans == nil {
+			return TurnResult{}, errors.New("resume Coding Agent turn: Plan repository is unavailable")
+		}
+		plan, loadErr := s.deps.Plans.LoadPlan(context.WithoutCancel(ctx), turn.PlanID, turn.PlanVersion)
+		if loadErr != nil || plan.Digest != turn.PlanDigest {
+			return TurnResult{}, errors.New("resume Coding Agent turn: current Plan revision is unavailable or changed")
+		}
+		planCompletion = plan.CompletionMode
+	}
+	if planApproval && request.Decision == ResolutionCancelled && result.Status == agent.RunHandedOff {
+		result.Status = agent.RunAborted
+		result.Reason = "plan_cancelled"
+	}
+	if planApproval && request.Decision == ResolutionApproved && planCompletion == PlanCompletionDeliverable && result.Status == agent.RunHandedOff {
+		result.Status = agent.RunCompleted
+		result.Reason = "plan_delivered"
+	}
 	var finishErr error
 	if s.features.ProductTurns {
-		turn, finishErr = s.finishProductRun(context.WithoutCancel(ctx), turn, result, resumeErr)
+		turn, finishErr = s.refreshProductTurn(context.WithoutCancel(ctx), turn)
+		if finishErr == nil {
+			turn, finishErr = s.finishProductRun(context.WithoutCancel(ctx), turn, result, resumeErr)
+		}
 		s.setState(product.ID, runtimeStateForTurn(turn))
 	} else {
 		s.setState(product.ID, runtimeStateForResult(result, resumeErr))
@@ -421,6 +538,39 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 	}
 	if finishErr != nil {
 		return productResult, fmt.Errorf("resume Coding Agent turn: persist Product Turn: %w", finishErr)
+	}
+	if planApproval {
+		kind, decision := EventKind(""), string(request.Decision)
+		switch request.Decision {
+		case ResolutionDenied:
+			if result.Status == agent.RunInterrupted && turn.PlanVersion > 1 {
+				kind = EventPlanRevised
+			}
+		case ResolutionApproved:
+			kind = EventPlanApproved
+		case ResolutionCancelled:
+			kind = EventPlanCancelled
+		}
+		if kind != "" {
+			if err := s.publishPlanEvent(context.WithoutCancel(ctx), product, turn, kind, decision); err != nil {
+				return productResult, fmt.Errorf("resume Coding Agent turn: publish Plan decision: %w", err)
+			}
+		}
+	}
+	if planApproval && request.Decision == ResolutionApproved {
+		if planCompletion == PlanCompletionDeliverable {
+			if result.Status != agent.RunCompleted || turn.Status != TurnCompleted {
+				return productResult, errors.New("resume Coding Agent turn: accepted deliverable Plan did not complete its Product Turn")
+			}
+			if touchErr != nil {
+				return productResult, fmt.Errorf("resume Coding Agent turn: update product session: %w", touchErr)
+			}
+			return productResult, nil
+		}
+		if result.Status != agent.RunHandedOff || turn.Status != TurnRunning {
+			return productResult, errors.New("resume Coding Agent turn: approved Plan did not reach a durable control handoff")
+		}
+		return s.continueTurnLocked(ctx, product, turn)
 	}
 	if touchErr != nil {
 		return productResult, fmt.Errorf("resume Coding Agent turn: update product session: %w", touchErr)
@@ -470,7 +620,84 @@ func (s *Service) Snapshot(ctx context.Context, id SessionID) (Snapshot, error) 
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("load Coding Agent snapshot: list Product Turns: %w", err)
 	}
-	return ProjectSnapshotWithTurns(product, durable, sessionLane(product), s.state(id), revision, turns)
+	snapshot, err := ProjectSnapshotWithTurns(product, durable, sessionLane(product), s.state(id), revision, turns)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if s.deps.Plans != nil {
+		if err := s.projectPlanSnapshot(ctx, &snapshot, turns); err != nil {
+			return Snapshot{}, err
+		}
+	}
+	return snapshot, nil
+}
+
+func (s *Service) projectPlanSnapshot(ctx context.Context, snapshot *Snapshot, turns []Turn) error {
+	if snapshot == nil || s.deps.Plans == nil {
+		return nil
+	}
+	var active *Turn
+	for index := range turns {
+		turn := &turns[index]
+		if turn.PlanID == "" {
+			continue
+		}
+		versions, err := s.deps.Plans.ListPlanVersions(ctx, turn.PlanID)
+		if err != nil {
+			return fmt.Errorf("load Coding Agent snapshot: list Plan versions: %w", err)
+		}
+		for _, version := range versions {
+			snapshot.PlanHistory = append(snapshot.PlanHistory, PlanVersionSummary{ID: version.ID, Version: version.Version, Digest: version.Digest, Goal: boundedUTF8(redactSensitiveText(version.Goal), maxPlanTextBytes), CreatedAt: version.CreatedAt})
+		}
+		if turn.Status == TurnPending || turn.Status == TurnRunning || turn.Status == TurnInterrupted {
+			active = turn
+		}
+	}
+	if active == nil && len(turns) != 0 && turns[len(turns)-1].PlanID != "" {
+		active = &turns[len(turns)-1]
+	}
+	if len(snapshot.PlanHistory) > 64 {
+		snapshot.PlanHistory = append([]PlanVersionSummary(nil), snapshot.PlanHistory[len(snapshot.PlanHistory)-64:]...)
+	}
+	if active == nil || active.PlanID == "" {
+		return nil
+	}
+	plan, err := s.deps.Plans.LoadPlan(ctx, active.PlanID, active.PlanVersion)
+	if err != nil || plan.Digest != active.PlanDigest {
+		return errors.New("load Coding Agent snapshot: active Plan revision is unavailable or changed")
+	}
+	value := projectPlanForSnapshot(plan)
+	snapshot.ActivePlan = &value
+	snapshot.PendingPlanApproval = active.Phase == TurnPhaseAwaitingPlanApproval && active.Status == TurnInterrupted
+	return nil
+}
+
+func projectPlanForSnapshot(plan Plan) PlanSnapshot {
+	value := PlanSnapshot{
+		ID: plan.ID, TurnID: plan.TurnID, Version: plan.Version, Digest: plan.Digest,
+		Goal: boundedUTF8(redactSensitiveText(plan.Goal), maxPlanTextBytes), RecommendedStrategy: plan.RecommendedStrategy,
+		WorkspaceRelevant: plan.WorkspaceRelevant, CompletionMode: plan.CompletionMode,
+	}
+	projectList := func(source []string) []string {
+		result := make([]string, len(source))
+		for index := range source {
+			result[index] = boundedUTF8(redactSensitiveText(source[index]), maxPlanTextBytes)
+		}
+		return result
+	}
+	value.Scope = PlanScope{Included: projectList(plan.Scope.Included), Excluded: projectList(plan.Scope.Excluded)}
+	value.Findings = projectList(plan.Findings)
+	value.Assumptions = projectList(plan.Assumptions)
+	value.Risks = projectList(plan.Risks)
+	value.AcceptanceCriteria = projectList(plan.AcceptanceCriteria)
+	value.Steps = make([]PlanStep, len(plan.Steps))
+	for index, step := range plan.Steps {
+		value.Steps[index] = PlanStep{
+			ID: step.ID, Goal: boundedUTF8(redactSensitiveText(step.Goal), maxPlanTextBytes),
+			DependsOn: append([]string(nil), step.DependsOn...), Files: append([]string(nil), step.Files...), Validation: projectList(step.Validation),
+		}
+	}
+	return value
 }
 
 func (s *Service) startLegacyTurn(ctx context.Context, product Session, requestText string) (TurnResult, error) {
@@ -483,7 +710,8 @@ func (s *Service) startLegacyTurn(ctx context.Context, product Session, requestT
 		return TurnResult{}, err
 	}
 	runID := RunID(runIDValue)
-	environment, err := s.prepareRunEnvironment(ctx, product, TurnID(runIDValue), runID, "")
+	legacyTurn := Turn{ID: TurnID(runIDValue), Phase: TurnPhaseDirect}
+	environment, err := s.prepareRunEnvironment(ctx, product, legacyTurn, runID, "", CapabilityDirect)
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("start Coding Agent turn: %w", err)
 	}

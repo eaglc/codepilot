@@ -28,6 +28,10 @@ func ProjectSnapshot(product Session, durable agentsession.Snapshot, lane agents
 		projected := PendingInterrupt{TurnID: TurnID(pending.RunID), InterruptID: pending.InterruptID, Kind: pending.Kind, ToolCallID: pending.ToolCallID}
 		if pending.Kind == "approval" && len(pending.Payload) != 0 {
 			projectApprovalInterrupt(&projected, pending.Payload)
+		} else if pending.Kind == "plan_approval" && len(pending.Payload) != 0 {
+			projectPlanApprovalInterrupt(&projected, pending.Payload)
+		} else if pending.Kind == clarificationInterruptKind && len(pending.Payload) != 0 {
+			projectClarificationInterrupt(&projected, pending.Payload)
 		}
 		snapshot.PendingInterrupts = append(snapshot.PendingInterrupts, projected)
 	}
@@ -90,6 +94,21 @@ func ProjectSnapshot(product Session, durable agentsession.Snapshot, lane agents
 	return snapshot, nil
 }
 
+func projectPlanApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage) {
+	if target == nil || len(raw) == 0 || !json.Valid(raw) {
+		return
+	}
+	var payload planApprovalPayload
+	if json.Unmarshal(raw, &payload) != nil || payload.Kind != "coding_plan_approval_v1" || payload.Version != 1 || payload.PlanID == "" || payload.Revision == 0 || !isHexDigest(payload.Digest, 64, 64) {
+		return
+	}
+	target.Summary = boundedUTF8(redactSensitiveText(payload.Summary), 4<<10)
+	target.PlanID = payload.PlanID
+	target.PlanVersion = payload.Revision
+	target.PlanDigest = payload.Digest
+	target.PlanCompletion = payload.CompletionMode
+}
+
 // ProjectSnapshotWithTurns adds explicit Product Turn/Run relationships while
 // preserving legacy Agent-only history when no Product Turn exists.
 func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, lane agentsession.Lane, state RuntimeState, revision uint64, turns []Turn) (Snapshot, error) {
@@ -117,6 +136,14 @@ func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, la
 		runID := agentsession.RunID(snapshot.Transcript[index].TurnID)
 		if turnID, found := runTurns[runID]; found {
 			snapshot.Transcript[index].TurnID = turnID
+		}
+		if snapshot.Transcript[index].Kind == TranscriptFailure {
+			switch runPhases[runID] {
+			case TurnPhasePlanning:
+				snapshot.Transcript[index].Text = "Planning request failed: " + snapshot.Transcript[index].Text
+			case TurnPhaseExecuting:
+				snapshot.Transcript[index].Text = "Approved Plan execution failed: " + snapshot.Transcript[index].Text
+			}
 		}
 	}
 	for index := range snapshot.PendingInterrupts {

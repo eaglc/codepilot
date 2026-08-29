@@ -35,12 +35,15 @@ func PermissionStartLanguageServerAction(languageID string) string {
 
 // PermissionGrant is an append-only, secret-free authorization audit record.
 // Paths are exact worktree-relative resources, never globs or absolute paths.
+// AllPaths is reserved for tool-scoped operations whose own security boundary
+// validates every target; it never grants another tool or action.
 type PermissionGrant struct {
 	ID                string               `json:"id"`
 	Scope             PermissionGrantScope `json:"scope"`
 	ToolName          string               `json:"tool_name"`
 	Action            string               `json:"action"`
 	Paths             []string             `json:"paths,omitempty"`
+	AllPaths          bool                 `json:"all_paths,omitempty"`
 	SourceTurnID      TurnID               `json:"source_turn_id"`
 	SourceInterruptID string               `json:"source_interrupt_id"`
 	CreatedAt         time.Time            `json:"created_at"`
@@ -55,8 +58,8 @@ type PermissionRequest struct {
 	Paths    []string
 }
 
-// PermissionGranted reports whether an active exact-scope grant covers every
-// requested path. A pathless grant covers only a pathless request.
+// PermissionGranted reports whether an active tool-and-action grant covers
+// every requested path. A pathless grant covers only a pathless request.
 func PermissionGranted(grants []PermissionGrant, request PermissionRequest, at time.Time) bool {
 	requested, ok := normalizeGrantPaths(request.Paths)
 	if !ok || strings.TrimSpace(request.ToolName) == "" || strings.TrimSpace(request.Action) == "" {
@@ -64,6 +67,12 @@ func PermissionGranted(grants []PermissionGrant, request PermissionRequest, at t
 	}
 	for _, grant := range grants {
 		if grant.Scope != PermissionGrantSession || grant.ToolName != request.ToolName || grant.Action != request.Action || !grant.RevokedAt.IsZero() || at.Before(grant.CreatedAt) || !at.Before(grant.ExpiresAt) {
+			continue
+		}
+		if grant.AllPaths {
+			if grant.ToolName == "create_file" && grant.Action == PermissionActionModify && len(grant.Paths) == 0 && len(requested) != 0 {
+				return true
+			}
 			continue
 		}
 		granted, valid := normalizeGrantPaths(grant.Paths)
@@ -100,6 +109,9 @@ func ValidatePermissionGrants(grants []PermissionGrant) error {
 		}
 		if strings.ContainsAny(grant.ID+grant.ToolName+grant.Action+grant.SourceInterruptID, "\r\n\x00") {
 			return errors.New("permission grant contains invalid control characters")
+		}
+		if grant.AllPaths && (grant.ToolName != "create_file" || grant.Action != PermissionActionModify || len(grant.Paths) != 0) {
+			return errors.New("all-path permission grants are limited to create_file modify access without exact paths")
 		}
 		if _, exists := seen[grant.ID]; exists {
 			return errors.New("permission grant ids must be unique")

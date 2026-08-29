@@ -54,6 +54,9 @@ type ControlPolicy struct {
 	// HandoffAfterResolution ends the Run after an interrupted call is resolved
 	// successfully, returning control to the product coordinator.
 	HandoffAfterResolution bool
+	// HandoffAfterExecution ends the Run after the control Tool completes
+	// successfully, allowing the product coordinator to change capability profile.
+	HandoffAfterExecution bool
 }
 
 // ControlTool marks a Tool as a product-coordination boundary.

@@ -25,9 +25,24 @@ type approvalChoice struct {
 }
 
 func (m *Model) approvalChoices(pending codingagent.PendingInterrupt) []approvalChoice {
+	if pending.Kind == "plan_approval" {
+		approveLabel := "Approve Plan and execute"
+		if pending.PlanCompletion == codingagent.PlanCompletionDeliverable {
+			approveLabel = "Accept Plan and finish"
+		}
+		return []approvalChoice{
+			{kind: approvalAllowOnce, label: approveLabel},
+			{kind: approvalDeny, label: "Request Plan revision"},
+			{kind: approvalCancel, label: "Cancel task"},
+		}
+	}
 	choices := []approvalChoice{{kind: approvalAllowOnce, label: "Allow once"}}
 	if pending.CanGrantSession {
-		choices = append(choices, approvalChoice{kind: approvalAllowSession, label: "Allow for this session"})
+		label := "Allow for this session"
+		if m.pendingToolName(pending) == createFileToolName {
+			label += " (new files in this worktree)"
+		}
+		choices = append(choices, approvalChoice{kind: approvalAllowSession, label: label})
 	}
 	choices = append(choices,
 		approvalChoice{kind: approvalDeny, label: "Deny"},
@@ -90,11 +105,21 @@ func (m *Model) applyApprovalChoice(pending codingagent.PendingInterrupt, choice
 	switch choice.kind {
 	case approvalAllowOnce:
 		m.status = "Applying approved action..."
+		if pending.Kind == "plan_approval" && pending.PlanCompletion == codingagent.PlanCompletionDeliverable {
+			m.status = "Accepting Plan..."
+		}
 		return m.resume(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce)
 	case approvalAllowSession:
 		m.status = "Allowing this scope for the session..."
 		return m.resume(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantSession)
 	case approvalDeny:
+		if pending.Kind == "plan_approval" {
+			m.busy = false
+			m.planFeedback = true
+			m.clearInput()
+			m.status = "Enter Plan revision feedback."
+			return nil
+		}
 		m.status = "Declining action..."
 		return m.resume(pending, codingagent.ResolutionDenied, codingagent.PermissionGrantOnce)
 	case approvalCancel:
@@ -117,12 +142,19 @@ func (m *Model) approvalRows(pending codingagent.PendingInterrupt, width int) []
 	if summary == "" {
 		summary = "The agent needs permission before continuing."
 	}
+	title := "Permission required"
+	if pending.Kind == "plan_approval" {
+		title = "Plan approval required"
+	}
 	lines := []string{
-		theme.header.Render("Permission required"),
+		theme.header.Render(title),
 		theme.warning.Render(summary),
 	}
 	details := approvalProposalLines(pending.Proposed, max(8, width-4))
 	lines = append(lines, details...)
+	if pending.CanGrantSession && m.pendingToolName(pending) == createFileToolName {
+		lines = append(lines, theme.muted.Render("Session scope only skips repeated create_file prompts; path and content safety checks still apply."))
+	}
 	for index, choice := range choices {
 		label := fmt.Sprintf("  %d. %s", index+1, choice.label)
 		if index == m.approvalCursor {
@@ -141,6 +173,18 @@ func (m *Model) approvalRows(pending codingagent.PendingInterrupt, width int) []
 		rows = append(rows, renderRow{text: truncateANSI(line, width)})
 	}
 	return append(rows, renderRow{})
+}
+
+func (m *Model) pendingToolName(pending codingagent.PendingInterrupt) string {
+	for _, item := range m.snapshot.Transcript {
+		if item.Tool != nil && item.Tool.CallID == pending.ToolCallID && strings.TrimSpace(item.Tool.Name) != "" {
+			return item.Tool.Name
+		}
+	}
+	if activity, found := m.activities[pending.ToolCallID]; found {
+		return activity.Name
+	}
+	return ""
 }
 
 func approvalProposalLines(proposed *codingagent.ProposedChange, width int) []string {

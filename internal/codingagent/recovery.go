@@ -69,7 +69,10 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoverTurnRequest) (
 	if legacy {
 		s.refreshRecoveryState(ctx, environment.product)
 	} else {
-		turn, finishErr = s.finishProductRun(context.WithoutCancel(ctx), turn, result, recoverErr)
+		turn, finishErr = s.refreshProductTurn(context.WithoutCancel(ctx), turn)
+		if finishErr == nil {
+			turn, finishErr = s.finishProductRun(context.WithoutCancel(ctx), turn, result, recoverErr)
+		}
 		s.setState(environment.product.ID, runtimeStateForTurn(turn))
 	}
 	touchErr := s.touchSession(context.WithoutCancel(ctx), environment.product)
@@ -160,7 +163,10 @@ func (s *Service) RecoverAutomatically(ctx context.Context, sessionID SessionID)
 			return completed, fmt.Errorf("coordinate Coding Agent recovery action %q: %w", action.ID, err)
 		}
 		if found {
-			turn, finishErr := s.finishProductRun(context.WithoutCancel(ctx), turn, result, nil)
+			turn, finishErr := s.refreshProductTurn(context.WithoutCancel(ctx), turn)
+			if finishErr == nil {
+				turn, finishErr = s.finishProductRun(context.WithoutCancel(ctx), turn, result, nil)
+			}
 			if finishErr != nil {
 				return completed, fmt.Errorf("coordinate Coding Agent recovery action %q: persist Product Turn: %w", action.ID, finishErr)
 			}
@@ -197,6 +203,12 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 	for _, turn := range turns {
 		binding, active := turn.ActiveRun()
 		if !active {
+			if len(turn.Runs) != 0 && turn.Status == TurnRunning && turn.Runs[len(turn.Runs)-1].Status == RunBindingHandedOff {
+				if _, continueErr := s.continueTurnLocked(ctx, product, turn); continueErr != nil {
+					return completed, fmt.Errorf("coordinate Coding Agent recovery: continue handed-off Product Turn %q: %w", turn.ID, continueErr)
+				}
+				completed++
+			}
 			continue
 		}
 		started, finished, outcome := runTerminalFacts(durable, binding.RunID)
@@ -206,6 +218,12 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 				status = agent.RunAborted
 			} else if outcome == string(agent.RunFailed) {
 				status = agent.RunFailed
+			} else if outcome == string(agent.RunHandedOff) {
+				status = agent.RunHandedOff
+			}
+			status, statusErr := s.normalizeRecoveredPlanHandoff(ctx, turn, status)
+			if statusErr != nil {
+				return completed, fmt.Errorf("coordinate Coding Agent recovery: inspect Plan completion for Turn %q: %w", turn.ID, statusErr)
 			}
 			updated, saveErr := s.finishProductRun(ctx, turn, agent.RunResult{RunID: binding.RunID, Status: status, Reason: "recovered_terminal"}, nil)
 			if saveErr != nil {
@@ -213,6 +231,12 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 			}
 			s.setState(product.ID, runtimeStateForTurn(updated))
 			completed++
+			if status == agent.RunHandedOff {
+				if _, continueErr := s.continueTurnLocked(ctx, product, updated); continueErr != nil {
+					return completed, fmt.Errorf("coordinate Coding Agent recovery: continue recovered Product Turn %q: %w", turn.ID, continueErr)
+				}
+				completed++
+			}
 			continue
 		}
 		if started {
@@ -221,7 +245,7 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 		if binding.Status != RunBindingPending && binding.Status != RunBindingRunning {
 			continue
 		}
-		environment, envErr := s.prepareRunEnvironment(ctx, product, turn.ID, RunID(binding.RunID), "")
+		environment, envErr := s.prepareRunEnvironment(ctx, product, turn, RunID(binding.RunID), "", binding.Profile)
 		if envErr != nil {
 			return completed, fmt.Errorf("coordinate Coding Agent recovery: prepare Product Turn %q: %w", turn.ID, envErr)
 		}
@@ -231,15 +255,38 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 				return completed, fmt.Errorf("coordinate Coding Agent recovery: bind Product Turn %q: %w", turn.ID, envErr)
 			}
 		}
-		result, runErr := s.deps.Agent.Run(ctx, agent.RunRequest{
-			SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: binding.RunID, UserEntryID: binding.UserEntryID,
-			SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
-			UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: turn.RequestText}}, Timestamp: turn.CreatedAt},
-			UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
-		}, environment.events)
+		var result agent.RunResult
+		var runErr error
+		if binding.UserEntryID == "" {
+			continuation, ok := s.deps.Agent.(ContinuationRunner)
+			if !ok {
+				return completed, fmt.Errorf("coordinate Coding Agent recovery: Product Turn %q continuation is unsupported", turn.ID)
+			}
+			result, runErr = continuation.Continue(ctx, agent.ContinueRequest{
+				SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: binding.RunID,
+				SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
+				UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
+			}, environment.events)
+		} else {
+			result, runErr = s.deps.Agent.Run(ctx, agent.RunRequest{
+				SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: binding.RunID, UserEntryID: binding.UserEntryID,
+				SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
+				UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: turn.RequestText}}, Timestamp: turn.CreatedAt},
+				UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
+			}, environment.events)
+		}
 		if result.RunID == "" {
 			result.RunID = binding.RunID
 		}
+		result.Status, err = s.normalizeRecoveredPlanHandoff(ctx, turn, result.Status)
+		if err != nil {
+			return completed, fmt.Errorf("coordinate Coding Agent recovery: inspect Plan completion for Turn %q: %w", turn.ID, err)
+		}
+		refreshed, saveErr := s.refreshProductTurn(context.WithoutCancel(ctx), turn)
+		if saveErr != nil {
+			return completed, fmt.Errorf("coordinate Coding Agent recovery: reload Product Turn %q: %w", turn.ID, saveErr)
+		}
+		turn = refreshed
 		updated, saveErr := s.finishProductRun(context.WithoutCancel(ctx), turn, result, runErr)
 		if saveErr != nil {
 			return completed, fmt.Errorf("coordinate Coding Agent recovery: finish Product Turn %q: %w", turn.ID, saveErr)
@@ -251,6 +298,20 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 		}
 	}
 	return completed, nil
+}
+
+func (s *Service) normalizeRecoveredPlanHandoff(ctx context.Context, turn Turn, status agent.RunStatus) (agent.RunStatus, error) {
+	if status != agent.RunHandedOff || turn.Phase != TurnPhaseAwaitingPlanApproval || turn.PlanID == "" || s.deps.Plans == nil {
+		return status, nil
+	}
+	plan, err := s.deps.Plans.LoadPlan(ctx, turn.PlanID, turn.PlanVersion)
+	if err != nil || plan.Digest != turn.PlanDigest {
+		return status, errors.New("approved Plan revision is unavailable or changed")
+	}
+	if plan.CompletionMode == PlanCompletionDeliverable {
+		return agent.RunCompleted, nil
+	}
+	return status, nil
 }
 
 func runTerminalFacts(snapshot agentsession.Snapshot, runID agentsession.RunID) (started, finished bool, outcome string) {
@@ -284,7 +345,19 @@ func (s *Service) prepareRecovery(ctx context.Context, sessionID SessionID, turn
 	if err != nil {
 		return recoveryEnvironment{}, fmt.Errorf("prepare Coding Agent recovery: load session: %w", err)
 	}
-	environment, err := s.prepareRunEnvironment(ctx, product, turnID, RunID(runID), "")
+	turn := Turn{ID: turnID, Phase: TurnPhaseDirect}
+	profile := CapabilityDirect
+	if s.features.ProductTurns {
+		if durableTurn, loadErr := s.deps.Turns.LoadTurn(ctx, turnID); loadErr == nil {
+			turn = durableTurn
+			if binding, found := durableTurn.Run(runID); found {
+				profile = binding.Profile
+			}
+		} else if !errors.Is(loadErr, ErrTurnNotFound) {
+			return recoveryEnvironment{}, fmt.Errorf("prepare Coding Agent recovery: load Product Turn: %w", loadErr)
+		}
+	}
+	environment, err := s.prepareRunEnvironment(ctx, product, turn, RunID(runID), "", profile)
 	if err != nil {
 		return recoveryEnvironment{}, err
 	}

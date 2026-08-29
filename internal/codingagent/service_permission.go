@@ -55,12 +55,17 @@ func deriveSessionGrant(product Session, durable agentsession.Snapshot, request 
 		CreatedAt: now, ExpiresAt: now.Add(defaultSessionGrantTTL),
 	}
 	switch {
-	case payload.Kind == "coding_patch_approval_v1" && (toolName == "apply_patch" || toolName == "edit_file" || toolName == "replace_file"):
+	case payload.Kind == "coding_patch_approval_v1" && (toolName == "apply_patch" || toolName == "create_file" || toolName == "edit_file" || toolName == "replace_file"):
 		paths, valid := normalizeGrantPaths(payload.Files)
 		if !valid || len(paths) == 0 {
 			return PermissionGrant{}, errors.New("the pending patch has no grantable paths")
 		}
-		grant.Action, grant.Paths = PermissionActionModify, paths
+		grant.Action = PermissionActionModify
+		if toolName == "create_file" {
+			grant.AllPaths = true
+		} else {
+			grant.Paths = paths
+		}
 	case payload.Kind == "coding_check_approval_v1" && toolName == "run_checks" && strings.TrimSpace(payload.PlanID) != "":
 		grant.Action = PermissionExecutePlanAction(payload.PlanID)
 	case payload.Kind == "coding_lsp_start_approval_v1" && isNavigationTool(toolName) && payload.RequestedTool == toolName && payload.GrantToolName == "language_server" && validLanguageGrant(payload.Language):
@@ -76,7 +81,8 @@ func deriveSessionGrant(product Session, durable agentsession.Snapshot, request 
 		ToolName    string
 		Action      string
 		Paths       []string
-	}{SessionID: product.ID, TurnID: request.TurnID, InterruptID: request.InterruptID, ToolName: grant.ToolName, Action: grant.Action, Paths: grant.Paths})
+		AllPaths    bool
+	}{SessionID: product.ID, TurnID: request.TurnID, InterruptID: request.InterruptID, ToolName: grant.ToolName, Action: grant.Action, Paths: grant.Paths, AllPaths: grant.AllPaths})
 	digest := sha256.Sum256(seed)
 	grant.ID = "grant_" + hex.EncodeToString(digest[:16])
 	if err := ValidatePermissionGrants([]PermissionGrant{grant}); err != nil {

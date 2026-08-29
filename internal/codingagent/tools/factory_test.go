@@ -3,6 +3,8 @@ package codingtools
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,7 +80,7 @@ func TestFactoryCreatesBoundedReadOnlyTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create tools: %v", err)
 	}
-	if got := len(registry.Definitions()); got != 13 {
+	if got := len(registry.Definitions()); got != 14 {
 		t.Fatalf("tool definitions = %d", got)
 	}
 	result, err := registry.Execute(context.Background(), tool.Call{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"main.go","start_line":1,"end_line":2}`)}, nil)
@@ -87,6 +89,46 @@ func TestFactoryCreatesBoundedReadOnlyTools(t *testing.T) {
 	}
 	if result.Status != tool.ResultCompleted || !strings.Contains(result.Content[0].Text, "1: package main") {
 		t.Fatalf("read result = %#v", result)
+	}
+}
+
+func TestFactoryPlanProfilesGateWorkspaceReads(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := NewFactory(Options{}).CreateTools(context.Background(), codingagent.ToolScope{
+		Profile: codingagent.CapabilityPlan, SessionID: "session", WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+	})
+	if err != nil {
+		t.Fatalf("create initial Plan tools: %v", err)
+	}
+	if len(initial.Definitions()) != 0 {
+		t.Fatalf("initial Plan profile exposed workspace tools: %#v", initial.Definitions())
+	}
+	registry, err := NewFactory(Options{}).CreateTools(context.Background(), codingagent.ToolScope{
+		Profile: codingagent.CapabilityPlanWorkspace, SessionID: "session", WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+	})
+	if err != nil {
+		t.Fatalf("create workspace Plan tools: %v", err)
+	}
+	allowed := map[string]bool{
+		"read_file": true, "list_files": true, "search_code": true,
+		"git_status": true, "git_diff": true, "git_log": true,
+		"git_branches": true, "git_show_commit": true,
+	}
+	if len(registry.Definitions()) != len(allowed) {
+		t.Fatalf("workspace Plan tools = %#v", registry.Definitions())
+	}
+	for _, definition := range registry.Definitions() {
+		if !allowed[definition.Name] {
+			t.Fatalf("Plan profile exposed %q", definition.Name)
+		}
+	}
+	for _, forbidden := range []string{"apply_patch", "create_file", "edit_file", "replace_file", "run_checks", "language_server"} {
+		if _, found := registry.Lookup(forbidden); found {
+			t.Fatalf("Plan profile exposed side-effect tool %q", forbidden)
+		}
 	}
 }
 
@@ -130,6 +172,141 @@ func TestEditFileUsesExactReplacementAndGeneratedDiff(t *testing.T) {
 	missing, err := registry.Execute(context.Background(), tool.Call{ID: "missing", Name: "edit_file", Arguments: call.Arguments}, nil)
 	if err != nil || missing.Status != tool.ResultInvalid || !strings.Contains(missing.Content[0].Text, "not found exactly once") {
 		t.Fatalf("stale exact edit result=%#v err=%v", missing, err)
+	}
+}
+
+func TestCreateFileBuildsNestedStructureInEmptyWorktree(t *testing.T) {
+	root := t.TempDir()
+	registry, err := NewFactory(Options{}).CreateTools(context.Background(), codingagent.ToolScope{
+		SessionID: "session", WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+		PermissionMode: codingagent.PermissionAutoEdit,
+	})
+	if err != nil {
+		t.Fatalf("create tools: %v", err)
+	}
+	call := tool.Call{ID: "create", Name: "create_file", Arguments: mustJSON(map[string]string{
+		"path": "cmd/app/main.go", "content": "package main\n\nfunc main() {}\n", "intent": "Create application entrypoint",
+	})}
+	result, err := registry.Execute(context.Background(), call, nil)
+	if err != nil || result.Status != tool.ResultCompleted || !strings.Contains(string(result.Details), `"kind":"coding_patch_v1"`) {
+		t.Fatalf("create result=%#v err=%v", result, err)
+	}
+	content, err := os.ReadFile(filepath.Join(root, "cmd", "app", "main.go"))
+	if err != nil || string(content) != "package main\n\nfunc main() {}\n" {
+		t.Fatalf("created content=%q err=%v", content, err)
+	}
+	again, err := registry.Execute(context.Background(), call, nil)
+	if err != nil || again.Status != tool.ResultInvalid || !strings.Contains(again.Content[0].Text, "already exists") {
+		t.Fatalf("duplicate create=%#v err=%v", again, err)
+	}
+	empty, err := registry.Execute(context.Background(), tool.Call{ID: "empty", Name: "create_file", Arguments: json.RawMessage(`{"path":"testdata/.gitkeep","content":""}`)}, nil)
+	if err != nil || empty.Status != tool.ResultCompleted {
+		t.Fatalf("empty placeholder=%#v err=%v", empty, err)
+	}
+	if info, err := os.Stat(filepath.Join(root, "testdata", ".gitkeep")); err != nil || info.Size() != 0 {
+		t.Fatalf("empty placeholder info=%#v err=%v", info, err)
+	}
+}
+
+func TestCreateFileApprovalPreventsOverwriteAndSupportsResume(t *testing.T) {
+	root := t.TempDir()
+	registry, err := NewFactory(Options{}).CreateTools(context.Background(), codingagent.ToolScope{
+		SessionID: "session", WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+		PermissionMode: codingagent.PermissionAsk,
+	})
+	if err != nil {
+		t.Fatalf("create tools: %v", err)
+	}
+	call := tool.Call{ID: "create", Name: "create_file", IdempotencyKey: "turn:create", Arguments: mustJSON(map[string]string{
+		"path": "internal/config/config.go", "content": "package config\n", "intent": "Create configuration package",
+	})}
+	pending, err := registry.Execute(context.Background(), call, nil)
+	if err != nil || pending.Status != tool.ResultInterrupted || pending.Interrupt == nil {
+		t.Fatalf("pending creation=%#v err=%v", pending, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "internal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("creation changed worktree before approval: %v", err)
+	}
+	completed, err := registry.Resume(context.Background(), call, *pending.Interrupt, tool.Result{
+		Status: tool.ResultCompleted, Content: []llm.Content{{Type: llm.ContentText, Text: "approved"}},
+	}, nil)
+	if err != nil || completed.Status != tool.ResultCompleted {
+		t.Fatalf("resumed creation=%#v err=%v", completed, err)
+	}
+	if content, err := os.ReadFile(filepath.Join(root, "internal", "config", "config.go")); err != nil || string(content) != "package config\n" {
+		t.Fatalf("approved creation content=%q err=%v", content, err)
+	}
+	driftCall := tool.Call{ID: "drift", Name: "create_file", IdempotencyKey: "turn:drift", Arguments: mustJSON(map[string]string{
+		"path": "README.md", "content": "agent content\n", "intent": "Create readme",
+	})}
+	driftPending, err := registry.Execute(context.Background(), driftCall, nil)
+	if err != nil || driftPending.Status != tool.ResultInterrupted || driftPending.Interrupt == nil {
+		t.Fatalf("pending drift creation=%#v err=%v", driftPending, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("user content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	drifted, err := registry.Resume(context.Background(), driftCall, *driftPending.Interrupt, tool.Result{
+		Status: tool.ResultCompleted, Content: []llm.Content{{Type: llm.ContentText, Text: "approved"}},
+	}, nil)
+	if err != nil || drifted.Status != tool.ResultFailed {
+		t.Fatalf("drifted creation=%#v err=%v", drifted, err)
+	}
+	if content, _ := os.ReadFile(filepath.Join(root, "README.md")); string(content) != "user content\n" {
+		t.Fatalf("drifted creation overwrote user file: %q", content)
+	}
+}
+
+func TestCreateFileSessionGrantCoversNewPathsButNotOtherWriteTools(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	grant := codingagent.PermissionGrant{
+		ID: "grant-create", Scope: codingagent.PermissionGrantSession, ToolName: "create_file", Action: codingagent.PermissionActionModify, AllPaths: true,
+		SourceTurnID: "turn", SourceInterruptID: "approval", CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+	}
+	registry, err := NewFactory(Options{}).CreateTools(context.Background(), codingagent.ToolScope{
+		SessionID: "session", WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+		PermissionMode: codingagent.PermissionAsk, PermissionGrants: []codingagent.PermissionGrant{grant},
+	})
+	if err != nil {
+		t.Fatalf("create tools: %v", err)
+	}
+	for index, target := range []string{"cmd/app/main.go", "internal/config/config.go"} {
+		result, executeErr := registry.Execute(context.Background(), tool.Call{
+			ID: fmt.Sprintf("create-%d", index), Name: "create_file",
+			Arguments: mustJSON(map[string]string{"path": target, "content": "package generated\n"}),
+		}, nil)
+		if executeErr != nil || result.Status != tool.ResultCompleted || result.Interrupt != nil {
+			t.Fatalf("session-granted create %q = %#v err=%v", target, result, executeErr)
+		}
+	}
+	result, err := registry.Execute(context.Background(), tool.Call{
+		ID: "edit", Name: "edit_file",
+		Arguments: json.RawMessage(`{"path":"cmd/app/main.go","old_text":"generated","new_text":"changed"}`),
+	}, nil)
+	if err != nil || result.Status != tool.ResultInterrupted || result.Interrupt == nil {
+		t.Fatalf("create_file grant leaked to edit_file: result=%#v err=%v", result, err)
+	}
+}
+
+func TestCreateFileRejectsSensitiveTraversalAndSecretContent(t *testing.T) {
+	root := t.TempDir()
+	registry, err := NewFactory(Options{}).CreateTools(context.Background(), codingagent.ToolScope{
+		SessionID: "session", WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+		PermissionMode: codingagent.PermissionAutoEdit,
+	})
+	if err != nil {
+		t.Fatalf("create tools: %v", err)
+	}
+	for name, arguments := range map[string]json.RawMessage{
+		"traversal": json.RawMessage(`{"path":"../outside.txt","content":"safe"}`),
+		"sensitive": json.RawMessage(`{"path":".env","content":"PUBLIC=true"}`),
+		"secret":    json.RawMessage(`{"path":"config.txt","content":"API_KEY=top-secret-value"}`),
+	} {
+		result, executeErr := registry.Execute(context.Background(), tool.Call{ID: name, Name: "create_file", Arguments: arguments}, nil)
+		if executeErr != nil || result.Status == tool.ResultCompleted || result.Interrupt != nil {
+			t.Fatalf("%s creation=%#v err=%v", name, result, executeErr)
+		}
 	}
 }
 
@@ -644,8 +821,8 @@ func TestLanguageNavigationRequiresProcessApprovalThenReturnsBoundedResult(t *te
 	if err != nil {
 		t.Fatalf("create tools: %v", err)
 	}
-	if len(registry.Definitions()) != 17 {
-		t.Fatalf("tool definitions = %d, want 17", len(registry.Definitions()))
+	if len(registry.Definitions()) != 18 {
+		t.Fatalf("tool definitions = %d, want 18", len(registry.Definitions()))
 	}
 	call := tool.Call{ID: "definition", Name: "find_definition", Arguments: json.RawMessage(`{"path":"main.go","line":1,"column":1}`), IdempotencyKey: "turn:definition"}
 	pending, err := registry.Execute(context.Background(), call, nil)

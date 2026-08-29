@@ -15,6 +15,7 @@ type repository interface {
 	codingagent.WorkspaceRepository
 	codingagent.SessionRepository
 	codingagent.TurnRepository
+	codingagent.PlanRepository
 }
 
 func TestRepositoriesEnforceTheSamePersistenceContract(t *testing.T) {
@@ -112,6 +113,35 @@ func testRepositoryContract(t *testing.T, repository repository) {
 	}
 	if err := repository.CreateTurn(ctx, turn); err != nil {
 		t.Fatalf("CreateTurn: %v", err)
+	}
+	plan := codingagent.Plan{
+		ID: "plan", TurnID: turn.ID, Version: 1, Goal: "Implement the approved scope.",
+		Scope:    codingagent.PlanScope{Included: []string{"internal/codingagent"}},
+		Findings: []string{"Product Turn exists."}, Risks: []string{"Keep write approval separate."},
+		Steps:              []codingagent.PlanStep{{ID: "implement", Goal: "Implement the change.", Files: []string{"internal/codingagent/plan.go"}, Validation: []string{"Run tests."}}},
+		AcceptanceCriteria: []string{"Tests pass."}, RecommendedStrategy: codingagent.ExecutionSingle,
+		WorkspaceRelevant: true, CompletionMode: codingagent.PlanCompletionExecute,
+		WorkspaceRevision: codingagent.WorkspaceRevision{WorktreeID: worktree.ID, StatusDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", RecordedAt: now}, CreatedAt: now,
+	}
+	plan.Digest, _ = codingagent.ComputePlanDigest(plan)
+	if err := repository.CreatePlanVersion(ctx, plan); err != nil {
+		t.Fatalf("CreatePlanVersion: %v", err)
+	}
+	loadedPlan, err := repository.LoadPlan(ctx, plan.ID, plan.Version)
+	if err != nil || loadedPlan.Digest != plan.Digest {
+		t.Fatalf("LoadPlan = %#v, %v", loadedPlan, err)
+	}
+	secondPlan := plan
+	secondPlan.Version = 2
+	secondPlan.Goal = "Implement the revised approved scope."
+	secondPlan.CreatedAt = now.Add(time.Second)
+	secondPlan.Digest, _ = codingagent.ComputePlanDigest(secondPlan)
+	if err := repository.CreatePlanVersion(ctx, secondPlan); err != nil {
+		t.Fatalf("CreatePlanVersion second: %v", err)
+	}
+	versions, err := repository.ListPlanVersions(ctx, plan.ID)
+	if err != nil || len(versions) != 2 || versions[1].Version != 2 {
+		t.Fatalf("ListPlanVersions = %#v, %v", versions, err)
 	}
 	secondSession := session
 	secondSession.ID = "session-2"

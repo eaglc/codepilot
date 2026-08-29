@@ -64,7 +64,7 @@ type patchDiffDetail struct {
 func (t *applyPatchTool) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{
 		Name:        t.toolName(),
-		Description: "Apply an advanced bounded unified diff, primarily for atomic multi-file changes. Prefer edit_file for ordinary single-file replacements. The product permission policy may require user approval before any file is changed.",
+		Description: "Apply an advanced bounded unified diff, primarily for atomic multi-file changes to existing files. Use create_file for new text files and edit_file for ordinary single-file replacements. Mode, rename, and copy metadata are not supported. The product permission policy may require user approval before any file is changed.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"patch":{"type":"string","minLength":1},"intent":{"type":"string"}},"required":["patch"],"additionalProperties":false}`),
 	}
 }

@@ -15,6 +15,8 @@ var (
 	ErrTurnNotFound = errors.New("Coding turn not found")
 	// ErrTurnConflict identifies a stale Product Turn compare-and-swap update.
 	ErrTurnConflict = errors.New("Coding turn revision conflict")
+	// ErrPlanNotFound identifies a missing immutable Plan revision.
+	ErrPlanNotFound = errors.New("Coding plan not found")
 )
 
 // TurnRepository persists Product Turns independently from generic Agent journals.
@@ -23,6 +25,13 @@ type TurnRepository interface {
 	LoadTurn(ctx context.Context, id TurnID) (Turn, error)
 	ListTurns(ctx context.Context, sessionID SessionID) ([]Turn, error)
 	SaveTurn(ctx context.Context, turn Turn, expectedRevision uint64) error
+}
+
+// PlanRepository persists immutable, versioned Plans separately from Product Turns.
+type PlanRepository interface {
+	CreatePlanVersion(ctx context.Context, plan Plan) error
+	LoadPlan(ctx context.Context, id PlanID, version uint64) (Plan, error)
+	ListPlanVersions(ctx context.Context, id PlanID) ([]Plan, error)
 }
 
 // SessionRepository persists Coding product session bindings and metadata.

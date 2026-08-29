@@ -2,7 +2,6 @@ package ui
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -65,7 +64,8 @@ func (m *Model) selectableBlocks() []selectableBlock {
 	}
 	seenTools := make(map[string]struct{})
 	var blocks []selectableBlock
-	for index, item := range m.snapshot.Transcript {
+	for index := 0; index < len(m.snapshot.Transcript); index++ {
+		item := m.snapshot.Transcript[index]
 		switch item.Kind {
 		case codingagent.TranscriptText:
 			if item.Role != codingagent.TranscriptRoleUser && item.Role != codingagent.TranscriptRoleAssistant {
@@ -79,26 +79,36 @@ func (m *Model) selectableBlocks() []selectableBlock {
 			if _, exists := seenTools[item.Tool.CallID]; exists {
 				continue
 			}
-			seenTools[item.Tool.CallID] = struct{}{}
-			activity := *item.Tool
-			if result, found := results[item.Tool.CallID]; found {
-				activity = result
+			activity, _ := m.resolvedTranscriptTool(item, results)
+			if activity.Name == createFileToolName {
+				group, next := m.collectConsecutiveCreateFiles(index, results)
+				for _, grouped := range group.activities {
+					seenTools[grouped.CallID] = struct{}{}
+				}
+				id := group.primaryID()
+				blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + id, kind: "tool", toolID: id, text: createFileGroupCopyText(group)})
+				index = next - 1
+				continue
 			}
+			seenTools[item.Tool.CallID] = struct{}{}
 			blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + item.Tool.CallID, kind: "tool", toolID: item.Tool.CallID, text: toolCopyText(activity)})
 		}
 	}
-	var liveIDs []string
-	for id := range m.activities {
-		if _, exists := seenTools[id]; id != "" && !exists {
-			liveIDs = append(liveIDs, id)
+	var liveCreates createFileGroup
+	for _, activity := range m.unanchoredLiveTools(results) {
+		if _, exists := seenTools[activity.CallID]; activity.CallID == "" || exists {
+			continue
 		}
+		seenTools[activity.CallID] = struct{}{}
+		if activity.Name == createFileToolName {
+			liveCreates.activities = append(liveCreates.activities, activity)
+			continue
+		}
+		blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + activity.CallID, kind: "tool", toolID: activity.CallID, text: toolCopyText(activity)})
 	}
-	sort.Strings(liveIDs)
-	for _, id := range liveIDs {
-		activity := m.activities[id]
-		blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + id, kind: "tool", toolID: id, text: toolCopyText(codingagent.TranscriptTool{
-			CallID: id, Name: activity.Name, Status: activity.Status, Summary: activity.Summary, Detail: activity.Detail, Diff: activity.Diff,
-		})})
+	if len(liveCreates.activities) != 0 {
+		id := liveCreates.primaryID()
+		blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + id, kind: "tool", toolID: id, text: createFileGroupCopyText(liveCreates)})
 	}
 	return blocks
 }
@@ -147,6 +157,9 @@ func (m *Model) cycleSelection() {
 }
 
 func (m *Model) selectBlock(block selectableBlock) {
+	if block.toolID != m.selectedTool {
+		m.diffScroll = 0
+	}
 	m.selectedBlock = block.key
 	m.selectedTool = block.toolID
 }
@@ -189,7 +202,11 @@ func (m *Model) copySelection() tea.Cmd {
 }
 
 func (m *Model) copyTextSelection() tea.Cmd {
-	value := m.selectedText(m.conversationRows(max(20, m.width)))
+	width := max(20, m.width)
+	if m.diffPaneActive && m.conversationWidth > 0 {
+		width = m.conversationWidth
+	}
+	value := m.selectedText(m.conversationRows(width))
 	if strings.TrimSpace(value) == "" {
 		m.errorMessage = "The text selection has no copyable content."
 		return nil
@@ -291,6 +308,12 @@ func (m *Model) finishMouseTextSelection(mouse tea.Mouse) {
 }
 
 func (m *Model) mouseTextPosition(x, y int, requireContent bool) (textPosition, bool) {
+	if m.diffPaneActive && m.conversationWidth > 0 && x >= m.conversationWidth {
+		if requireContent {
+			return textPosition{}, false
+		}
+		x = m.conversationWidth - 1
+	}
 	hit, found := m.hitTextRows[y]
 	if !found && !requireContent && len(m.hitTextRows) != 0 {
 		nearestY := y

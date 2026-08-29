@@ -48,7 +48,7 @@ func NewRepository(root string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, directory := range []string{"coding-sessions", "coding-workspaces", "coding-worktrees", "coding-artifacts", filepath.Join("coding-transactions", "session-create"), worktreeRelocationDirectory} {
+	for _, directory := range []string{"coding-sessions", "coding-plans", "coding-workspaces", "coding-worktrees", "coding-artifacts", filepath.Join("coding-transactions", "session-create"), worktreeRelocationDirectory} {
 		if err := os.MkdirAll(filepath.Join(absolute, directory), 0o700); err != nil {
 			return nil, fmt.Errorf("create Coding file repository: create %s: %w", directory, err)
 		}

@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -38,7 +39,9 @@ func TestClassifyTransportErrorIsSafeAndStable(t *testing.T) {
 		{name: "authentication", err: errors.New("status code: 401 secret-value"), code: ErrorAuthenticationFailed},
 		{name: "rate limit", err: errors.New("too many requests secret-value"), code: ErrorRateLimited},
 		{name: "model", err: errors.New("model not found secret-value"), code: ErrorModelNotFound},
-		{name: "connection", err: errors.New("dial failed secret-value"), code: ErrorConnectionFailed},
+		{name: "connection", err: errors.New("dial tcp connection refused secret-value"), code: ErrorConnectionFailed},
+		{name: "stream", err: io.ErrUnexpectedEOF, code: ErrorStreamInterrupted},
+		{name: "unknown", err: errors.New("sdk failed secret-value"), code: ErrorProviderFailed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

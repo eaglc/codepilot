@@ -24,6 +24,7 @@
 
 ### 工程指南
 
+- [Plan 功能实现与维护指南](guides/plan-implementation-and-maintenance.md)：从代码实现出发，介绍 Plan 的状态机、工具权限、审批、持久化和维护要点。
 - [真实 Provider 可选集成测试](guides/live-provider-integration-tests.md)：OpenAI、DeepSeek、Ollama 的显式联网测试指南。
 - [发布、安装、升级与回滚](release-and-upgrade.md)：版本、制品、安装、升级、回滚和发布检查。该文件保留在 `docs/` 根目录，因为 README、GoReleaser 和架构测试会引用它。
 

@@ -15,6 +15,11 @@ type CapabilityProfile string
 const (
 	// CapabilityDirect is the existing single-Agent implementation profile.
 	CapabilityDirect CapabilityProfile = "direct"
+	// CapabilityPlan exposes only Plan controls until workspace relevance is declared.
+	CapabilityPlan CapabilityProfile = "plan"
+	// CapabilityPlanWorkspace adds trusted workspace reads after an explicit
+	// relevance handoff from the initial Plan profile.
+	CapabilityPlanWorkspace CapabilityProfile = "plan_workspace"
 )
 
 // TurnPhase identifies the product-controlled phase of a user request.
@@ -23,6 +28,20 @@ type TurnPhase string
 const (
 	// TurnPhaseDirect executes a request with the existing direct capabilities.
 	TurnPhaseDirect TurnPhase = "direct"
+	// TurnPhasePlanning performs read-only exploration and Plan authoring.
+	TurnPhasePlanning TurnPhase = "planning"
+	// TurnPhaseAwaitingPlanApproval waits for a decision on one exact Plan revision.
+	TurnPhaseAwaitingPlanApproval TurnPhase = "awaiting_plan_approval"
+	// TurnPhaseExecuting implements an approved Plan with normal permission checks.
+	TurnPhaseExecuting TurnPhase = "executing"
+)
+
+// TurnEntrySource records how the product-level request entered its initial phase.
+type TurnEntrySource string
+
+const (
+	TurnEntryDirect   TurnEntrySource = "direct"
+	TurnEntryUserPlan TurnEntrySource = "user_plan"
 )
 
 // TurnStatus identifies durable product-level progress independently of an Agent Run.
@@ -77,11 +96,14 @@ type Turn struct {
 	ID          TurnID            `json:"id"`
 	SessionID   SessionID         `json:"session_id"`
 	RequestText string            `json:"request_text"`
+	EntrySource TurnEntrySource   `json:"entry_source,omitempty"`
 	Phase       TurnPhase         `json:"phase"`
 	Status      TurnStatus        `json:"status"`
 	Strategy    ExecutionStrategy `json:"strategy"`
 	Runs        []RunBinding      `json:"runs,omitempty"`
-	PlanID      string            `json:"plan_id,omitempty"`
+	PlanID      PlanID            `json:"plan_id,omitempty"`
+	PlanVersion uint64            `json:"plan_version,omitempty"`
+	PlanDigest  string            `json:"plan_digest,omitempty"`
 	WorkflowID  string            `json:"workflow_id,omitempty"`
 	Revision    uint64            `json:"revision"`
 	CreatedAt   time.Time         `json:"created_at"`
@@ -118,8 +140,17 @@ func ValidateTurn(value Turn) error {
 	if len(value.RequestText) > 1<<20 {
 		return errors.New("Coding turn original request exceeds its size limit")
 	}
-	if value.Phase != TurnPhaseDirect || value.Strategy != ExecutionSingle {
+	if !validTurnPhase(value.Phase) || value.Strategy != ExecutionSingle {
 		return fmt.Errorf("Coding turn phase %q or strategy %q is unsupported", value.Phase, value.Strategy)
+	}
+	if value.EntrySource != "" && value.EntrySource != TurnEntryDirect && value.EntrySource != TurnEntryUserPlan {
+		return fmt.Errorf("Coding turn entry source %q is unsupported", value.EntrySource)
+	}
+	if value.EntrySource == TurnEntryUserPlan && value.Phase == TurnPhaseDirect {
+		return errors.New("User Plan entry cannot use the Direct phase")
+	}
+	if err := validateTurnPlanReference(value); err != nil {
+		return err
 	}
 	switch value.Status {
 	case TurnPending, TurnRunning, TurnInterrupted, TurnCompleted, TurnCancelled, TurnFailed:
@@ -144,7 +175,7 @@ func ValidateTurn(value Turn) error {
 	activeRuns := 0
 	lastActiveIndex := -1
 	for index, binding := range value.Runs {
-		if binding.RunID == "" || binding.Phase != value.Phase || binding.Profile != CapabilityDirect {
+		if binding.RunID == "" || !validRunPhaseProfile(binding.Phase, binding.Profile) {
 			return fmt.Errorf("Coding turn run binding %d has invalid identity, phase, or profile", index)
 		}
 		if _, exists := seenRuns[binding.RunID]; exists {
@@ -196,6 +227,9 @@ func ValidateTurn(value Turn) error {
 		return fmt.Errorf("Coding turn Run %q is active before the latest binding", value.Runs[lastActiveIndex].RunID)
 	}
 	latest := value.Runs[len(value.Runs)-1]
+	if !latestPhaseMatchesTurn(value.Phase, latest.Phase) {
+		return fmt.Errorf("Coding turn phase %q does not match latest Run phase %q", value.Phase, latest.Phase)
+	}
 	statusMatches := false
 	switch latest.Status {
 	case RunBindingPending:
@@ -225,8 +259,14 @@ func ValidateTurnTransition(previous, next Turn) error {
 	if err := ValidateTurn(next); err != nil {
 		return fmt.Errorf("next Coding turn is invalid: %w", err)
 	}
-	if previous.ID != next.ID || previous.SessionID != next.SessionID || previous.RequestText != next.RequestText || previous.Phase != next.Phase || previous.Strategy != next.Strategy || !previous.CreatedAt.Equal(next.CreatedAt) {
+	if previous.ID != next.ID || previous.SessionID != next.SessionID || previous.RequestText != next.RequestText || previous.EntrySource != next.EntrySource || previous.Strategy != next.Strategy || !previous.CreatedAt.Equal(next.CreatedAt) {
 		return errors.New("Coding turn immutable identity changed")
+	}
+	if !validTurnPhaseTransition(previous.Phase, next.Phase) {
+		return fmt.Errorf("Coding turn phase cannot transition from %q to %q", previous.Phase, next.Phase)
+	}
+	if err := validateTurnPlanTransition(previous, next); err != nil {
+		return err
 	}
 	if next.Revision != previous.Revision+1 {
 		return errors.New("Coding turn revision must advance exactly once")
@@ -252,9 +292,81 @@ func ValidateTurnTransition(previous, next Turn) error {
 	if len(next.Runs) != len(previous.Runs) {
 		latest := previous.Runs[len(previous.Runs)-1]
 		appended := next.Runs[len(next.Runs)-1]
-		if previous.Status != TurnRunning || latest.Status != RunBindingHandedOff || appended.Status != RunBindingPending || appended.UserEntryID != "" {
+		if previous.Status != TurnRunning || latest.Status != RunBindingHandedOff || appended.Status != RunBindingPending || appended.UserEntryID != "" || appended.Phase != next.Phase {
 			return errors.New("Coding turn can append a continuation Run only after a control handoff")
 		}
+	}
+	return nil
+}
+
+func validTurnPhase(value TurnPhase) bool {
+	switch value {
+	case TurnPhaseDirect, TurnPhasePlanning, TurnPhaseAwaitingPlanApproval, TurnPhaseExecuting:
+		return true
+	default:
+		return false
+	}
+}
+
+func validRunPhaseProfile(phase TurnPhase, profile CapabilityProfile) bool {
+	switch phase {
+	case TurnPhasePlanning:
+		return profile == CapabilityPlan || profile == CapabilityPlanWorkspace
+	case TurnPhaseDirect, TurnPhaseExecuting:
+		return profile == CapabilityDirect
+	default:
+		return false
+	}
+}
+
+func latestPhaseMatchesTurn(turnPhase, runPhase TurnPhase) bool {
+	if turnPhase == TurnPhaseAwaitingPlanApproval {
+		return runPhase == TurnPhasePlanning
+	}
+	return turnPhase == runPhase
+}
+
+func validTurnPhaseTransition(previous, next TurnPhase) bool {
+	if previous == next {
+		return true
+	}
+	switch previous {
+	case TurnPhasePlanning:
+		return next == TurnPhaseAwaitingPlanApproval
+	case TurnPhaseAwaitingPlanApproval:
+		return next == TurnPhasePlanning || next == TurnPhaseExecuting
+	default:
+		return false
+	}
+}
+
+func validateTurnPlanReference(value Turn) error {
+	hasIdentity := value.PlanID != "" || value.PlanVersion != 0 || value.PlanDigest != ""
+	complete := value.PlanID != "" && value.PlanVersion != 0 && isHexDigest(value.PlanDigest, 64, 64)
+	if hasIdentity && !complete {
+		return errors.New("Coding turn Plan reference must contain id, version, and digest")
+	}
+	if (value.Phase == TurnPhaseAwaitingPlanApproval || value.Phase == TurnPhaseExecuting) && !complete {
+		return errors.New("Coding turn phase requires an exact Plan reference")
+	}
+	if value.Phase == TurnPhaseDirect && hasIdentity {
+		return errors.New("Direct Coding turn cannot reference a Plan")
+	}
+	return nil
+}
+
+func validateTurnPlanTransition(previous, next Turn) error {
+	if previous.PlanID != "" && previous.PlanID != next.PlanID {
+		return errors.New("Coding turn Plan identity cannot change")
+	}
+	if previous.PlanVersion > next.PlanVersion || next.PlanVersion > previous.PlanVersion+1 {
+		return errors.New("Coding turn Plan version must be preserved or advance exactly once")
+	}
+	if previous.PlanVersion == next.PlanVersion && previous.PlanDigest != next.PlanDigest {
+		return errors.New("Coding turn Plan digest changed without a new version")
+	}
+	if previous.PlanVersion != 0 && next.PlanVersion == previous.PlanVersion+1 && previous.PlanDigest == next.PlanDigest {
+		return errors.New("Coding turn new Plan version must have new canonical content")
 	}
 	return nil
 }

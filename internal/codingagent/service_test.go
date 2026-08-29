@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -209,7 +212,10 @@ func (f recoveryToolFactory) CreateTools(context.Context, codingagent.ToolScope)
 	return tool.NewRegistry(f.executable)
 }
 
-type gapAgentRunner struct{ runs int }
+type gapAgentRunner struct {
+	runs          int
+	continuations int
+}
 
 func (r *gapAgentRunner) Run(_ context.Context, request agent.RunRequest, _ agent.EventSink) (agent.RunResult, error) {
 	r.runs++
@@ -223,6 +229,12 @@ func (*gapAgentRunner) Resume(context.Context, agent.ResumeRequest, agent.EventS
 
 func (*gapAgentRunner) Recover(context.Context, agent.RecoverRequest, agent.EventSink) (agent.RunResult, error) {
 	return agent.RunResult{}, nil
+}
+
+func (r *gapAgentRunner) Continue(_ context.Context, request agent.ContinueRequest, _ agent.EventSink) (agent.RunResult, error) {
+	r.continuations++
+	message := finalAssistant()
+	return agent.RunResult{RunID: request.RunID, Status: agent.RunCompleted, FinalMessage: &message}, nil
 }
 
 func TestServiceComposesGenericAgentIntoProductSnapshotAndEvents(t *testing.T) {
@@ -276,6 +288,234 @@ func TestServiceComposesGenericAgentIntoProductSnapshotAndEvents(t *testing.T) {
 	}
 }
 
+func TestServiceExplicitPlanPersistsApprovalAndExecutesInOneProductTurn(t *testing.T) {
+	root := t.TempDir()
+	for _, arguments := range [][]string{{"init", "--quiet"}, {"config", "user.name", "CodePilot Test"}, {"config", "user.email", "test@example.invalid"}, {"commit", "--allow-empty", "--quiet", "-m", "initial"}} {
+		command := exec.Command("git", append([]string{"-C", root}, arguments...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", arguments, err, output)
+		}
+	}
+	products := codingmemory.NewRepository()
+	now := time.Now().UTC()
+	workspace := codingagent.Workspace{ID: "workspace-plan", DisplayName: "plan", GitCommonDir: filepath.Join(root, ".git"), Trusted: true, CreatedAt: now, UpdatedAt: now}
+	worktree := codingagent.Worktree{ID: "worktree-plan", WorkspaceID: workspace.ID, Root: root, GitDir: workspace.GitCommonDir, CreatedAt: now, LastUsedAt: now}
+	if err := products.SaveWorkspace(context.Background(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := products.SaveWorktree(context.Background(), worktree); err != nil {
+		t.Fatal(err)
+	}
+	agentSessions := agentsession.NewMemoryRepository()
+	contexts, _ := contextmanager.NewManager()
+	planArguments, _ := json.Marshal(codingagent.PlanSubmission{
+		Goal: "Add explicit Plan mode.", Scope: codingagent.PlanScope{Included: []string{"internal/codingagent"}, Excluded: []string{"docs"}},
+		Findings: []string{"Product Turns already support continuation."}, Risks: []string{"Plan approval must not grant writes."},
+		Steps:              []codingagent.PlanStep{{ID: "implement", Goal: "Implement the approved change.", Files: []string{"internal/codingagent/plan.go"}, Validation: []string{"Run unit tests."}}},
+		AcceptanceCriteria: []string{"The approved Plan executes in the same Product Turn."}, RecommendedStrategy: codingagent.ExecutionSingle,
+		WorkspaceRelevant: true, CompletionMode: codingagent.PlanCompletionExecute,
+	})
+	planCall := llm.Message{
+		Role: llm.RoleAssistant, Provider: "profile-1", Model: "model-1", StopReason: llm.StopReasonToolUse,
+		Content: []llm.Content{{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "exit-plan-1", Name: "exit_plan_mode", Arguments: planArguments}}},
+	}
+	workspaceCall := llm.Message{
+		Role: llm.RoleAssistant, Provider: "profile-1", Model: "model-1", StopReason: llm.StopReasonToolUse,
+		Content: []llm.Content{{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "workspace-context-1", Name: "request_workspace_context", Arguments: json.RawMessage(`{"reason":"The requested code change depends on the current implementation."}`)}}},
+	}
+	var revisedSubmission codingagent.PlanSubmission
+	if err := json.Unmarshal(planArguments, &revisedSubmission); err != nil {
+		t.Fatal(err)
+	}
+	revisedSubmission.Goal = "Add explicit, compact Plan mode."
+	revisedArguments, _ := json.Marshal(revisedSubmission)
+	revisedPlanCall := llm.Message{
+		Role: llm.RoleAssistant, Provider: "profile-1", Model: "model-1", StopReason: llm.StopReasonToolUse,
+		Content: []llm.Content{{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "exit-plan-2", Name: "exit_plan_mode", Arguments: revisedArguments}}},
+	}
+	model := &sequentialModel{responses: []llm.Message{workspaceCall, planCall, revisedPlanCall, finalAssistant()}}
+	runtime, err := agent.NewRuntime(agent.Dependencies{Models: sequentialModelFactory{model: model}, Contexts: contexts, Sessions: agentSessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := codingagent.NewService(codingagent.Dependencies{
+		Sessions: products, Turns: products, Plans: products, AgentSessions: agentSessions, Worktrees: products,
+		Agent: runtime, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: &productEvents{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(context.Background(), codingagent.Session{
+		ID: "coding-plan", AgentSessionID: "agent-plan", WorkspaceID: workspace.ID, WorktreeID: worktree.ID,
+		ProviderProfileID: "profile-1", ModelID: "model-1", PermissionMode: codingagent.PermissionAsk,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, err := service.StartTurn(context.Background(), codingagent.TurnRequest{SessionID: session.ID, Text: "Plan this change", Mode: codingagent.TurnModePlan})
+	if err != nil || planned.Status != string(agent.RunInterrupted) || planned.InterruptKind != "plan_approval" {
+		t.Fatalf("Plan start = %#v, %v", planned, err)
+	}
+	statusCommand := exec.Command("git", "-C", root, "status", "--porcelain")
+	if output, statusErr := statusCommand.Output(); statusErr != nil || len(output) != 0 {
+		t.Fatalf("read-only Planning changed the worktree: status=%q err=%v", output, statusErr)
+	}
+	snapshot, err := service.Snapshot(context.Background(), session.ID)
+	if err != nil || snapshot.ActivePlan == nil || !snapshot.PendingPlanApproval || snapshot.ActivePlan.Version != 1 {
+		t.Fatalf("Plan snapshot = %#v, %v", snapshot, err)
+	}
+	if snapshot.ActiveTurn == nil || snapshot.ActiveTurn.Phase != codingagent.TurnPhaseAwaitingPlanApproval || snapshot.ActiveTurn.RunCount != 2 {
+		t.Fatalf("Plan Turn snapshot = %#v", snapshot.ActiveTurn)
+	}
+	revised, err := service.ResumeTurn(context.Background(), codingagent.ResumeTurnRequest{
+		SessionID: session.ID, TurnID: planned.TurnID, InterruptID: planned.InterruptID,
+		Decision: codingagent.ResolutionDenied, GrantScope: codingagent.PermissionGrantOnce, Message: "Keep the UI compact.",
+	})
+	if err != nil || revised.Status != string(agent.RunInterrupted) || revised.InterruptID == planned.InterruptID {
+		t.Fatalf("Plan revision = %#v, %v", revised, err)
+	}
+	snapshot, err = service.Snapshot(context.Background(), session.ID)
+	if err != nil || snapshot.ActivePlan == nil || snapshot.ActivePlan.Version != 2 || len(snapshot.PlanHistory) != 2 {
+		t.Fatalf("revised Plan snapshot = %#v, %v", snapshot, err)
+	}
+	if _, err := service.ResumeTurn(context.Background(), codingagent.ResumeTurnRequest{
+		SessionID: session.ID, TurnID: planned.TurnID, InterruptID: planned.InterruptID,
+		Decision: codingagent.ResolutionApproved, GrantScope: codingagent.PermissionGrantOnce,
+	}); err == nil {
+		t.Fatal("old Plan approval applied to a revised Plan")
+	}
+	executed, err := service.ResumeTurn(context.Background(), codingagent.ResumeTurnRequest{
+		SessionID: session.ID, TurnID: planned.TurnID, InterruptID: revised.InterruptID,
+		Decision: codingagent.ResolutionApproved, GrantScope: codingagent.PermissionGrantOnce,
+	})
+	if err != nil || executed.Status != string(agent.RunCompleted) || executed.Response != "done" {
+		t.Fatalf("Plan approval = %#v, %v", executed, err)
+	}
+	turn, err := products.LoadTurn(context.Background(), planned.TurnID)
+	if err != nil || turn.Phase != codingagent.TurnPhaseExecuting || turn.Status != codingagent.TurnCompleted || len(turn.Runs) != 3 || turn.Runs[0].Status != codingagent.RunBindingHandedOff || turn.Runs[1].Status != codingagent.RunBindingHandedOff {
+		t.Fatalf("executed Product Turn = %#v, %v", turn, err)
+	}
+	entries, err := agentSessions.Load(context.Background(), session.AgentSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userMessages := 0
+	for _, entry := range entries.Entries {
+		if entry.Message != nil && entry.Message.Role == llm.RoleUser {
+			userMessages++
+		}
+	}
+	if userMessages != 1 {
+		t.Fatalf("user messages = %d, want one original request", userMessages)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("Plan flow changed worktree availability: %v", err)
+	}
+}
+
+func TestServicePlanClarificationAndDeliverableFinishWithoutExecutionRun(t *testing.T) {
+	products := codingmemory.NewRepository()
+	seedMemoryWorktree(t, products, "workspace-general-plan", "worktree-general-plan")
+	agentSessions := agentsession.NewMemoryRepository()
+	contexts, _ := contextmanager.NewManager()
+	clarificationArguments, _ := json.Marshal(codingagent.ClarificationPrompt{Questions: []codingagent.ClarificationRequest{
+		{
+			ID: "audience", Header: "Audience", Question: "Who is the primary audience?",
+			SelectionMode: codingagent.ClarificationSelectionSingle,
+			Options: []codingagent.ClarificationOption{
+				{ID: "existing-users", Label: "Existing users", Description: "Emphasize changed behavior."},
+				{ID: "new-users", Label: "New users", Description: "Emphasize orientation and context."},
+			},
+		},
+		{
+			ID: "format", Header: "Format", Question: "Which delivery format should be used?",
+			SelectionMode: codingagent.ClarificationSelectionSingle,
+			Options: []codingagent.ClarificationOption{
+				{ID: "concise", Label: "Concise brief", Description: "Optimize for quick review.", Recommended: true},
+				{ID: "detailed", Label: "Detailed guide", Description: "Include more explanation.", Recommended: true},
+			},
+		},
+	}})
+	clarificationCall := llm.Message{
+		Role: llm.RoleAssistant, Provider: "profile-1", Model: "model-1", StopReason: llm.StopReasonToolUse,
+		Content: []llm.Content{{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "clarify-1", Name: "request_user_input", Arguments: clarificationArguments}}},
+	}
+	planArguments, _ := json.Marshal(codingagent.PlanSubmission{
+		Goal: "Plan a product announcement brief.", Scope: codingagent.PlanScope{Included: []string{"A concise user-facing brief"}},
+		Findings: []string{"The primary audience is existing users."}, Risks: []string{"The brief may omit necessary context."},
+		Steps:              []codingagent.PlanStep{{ID: "draft-brief", Goal: "Draft the announcement structure.", Validation: []string{"Keep it concise and audience-specific."}}},
+		AcceptanceCriteria: []string{"The brief reflects the selected audience and format."}, RecommendedStrategy: codingagent.ExecutionSingle,
+		WorkspaceRelevant: false, CompletionMode: codingagent.PlanCompletionDeliverable,
+	})
+	planCall := llm.Message{
+		Role: llm.RoleAssistant, Provider: "profile-1", Model: "model-1", StopReason: llm.StopReasonToolUse,
+		Content: []llm.Content{{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: "exit-general-plan", Name: "exit_plan_mode", Arguments: planArguments}}},
+	}
+	model := &sequentialModel{responses: []llm.Message{clarificationCall, planCall}}
+	runtime, err := agent.NewRuntime(agent.Dependencies{Models: sequentialModelFactory{model: model}, Contexts: contexts, Sessions: agentSessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := codingagent.NewService(codingagent.Dependencies{
+		Sessions: products, Turns: products, Plans: products, AgentSessions: agentSessions, Worktrees: products,
+		Agent: runtime, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: &productEvents{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(context.Background(), codingagent.Session{
+		ID: "coding-general-plan", AgentSessionID: "agent-general-plan", WorkspaceID: "workspace-general-plan", WorktreeID: "worktree-general-plan",
+		ProviderProfileID: "profile-1", ModelID: "model-1", PermissionMode: codingagent.PermissionAsk,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := service.StartTurn(context.Background(), codingagent.TurnRequest{SessionID: session.ID, Text: "Plan a product announcement", Mode: codingagent.TurnModePlan})
+	if err != nil || waiting.InterruptKind != "clarification" {
+		t.Fatalf("clarification start = %#v, %v", waiting, err)
+	}
+	snapshot, err := service.Snapshot(context.Background(), session.ID)
+	if err != nil || len(snapshot.PendingInterrupts) != 1 || snapshot.PendingInterrupts[0].Clarification == nil {
+		t.Fatalf("clarification snapshot = %#v, %v", snapshot.PendingInterrupts, err)
+	}
+	questions := snapshot.PendingInterrupts[0].Clarification.Questions
+	if questions[0].Options[0].Recommended || !questions[1].Options[0].Recommended || questions[1].Options[1].Recommended {
+		t.Fatalf("clarification recommendations were not safely normalized: %#v", questions)
+	}
+	details, err := codingagent.EncodeClarificationAnswers(*snapshot.PendingInterrupts[0].Clarification, []codingagent.ClarificationAnswer{
+		{QuestionID: "audience", OptionID: "existing-users"},
+		{QuestionID: "format", OptionID: "concise"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, err := service.ResumeTurn(context.Background(), codingagent.ResumeTurnRequest{
+		SessionID: session.ID, TurnID: waiting.TurnID, InterruptID: waiting.InterruptID,
+		Decision: codingagent.ResolutionApproved, GrantScope: codingagent.PermissionGrantOnce, Details: details,
+	})
+	if err != nil || planned.InterruptKind != "plan_approval" {
+		t.Fatalf("clarification answer = %#v, %v", planned, err)
+	}
+	snapshot, err = service.Snapshot(context.Background(), session.ID)
+	if err != nil || snapshot.ActivePlan == nil || snapshot.ActivePlan.WorkspaceRelevant || snapshot.ActivePlan.CompletionMode != codingagent.PlanCompletionDeliverable {
+		t.Fatalf("deliverable Plan snapshot = %#v, %v", snapshot.ActivePlan, err)
+	}
+	finished, err := service.ResumeTurn(context.Background(), codingagent.ResumeTurnRequest{
+		SessionID: session.ID, TurnID: waiting.TurnID, InterruptID: planned.InterruptID,
+		Decision: codingagent.ResolutionApproved, GrantScope: codingagent.PermissionGrantOnce,
+	})
+	if err != nil || finished.Status != string(agent.RunCompleted) {
+		t.Fatalf("accept deliverable Plan = %#v, %v", finished, err)
+	}
+	turn, err := products.LoadTurn(context.Background(), waiting.TurnID)
+	if err != nil || turn.Status != codingagent.TurnCompleted || len(turn.Runs) != 1 || turn.Runs[0].Status != codingagent.RunBindingCompleted {
+		t.Fatalf("deliverable Product Turn = %#v, %v", turn, err)
+	}
+	if len(model.responses) != 0 {
+		t.Fatalf("unused model responses = %d", len(model.responses))
+	}
+}
+
 func TestServiceProductTurnFeatureFlagRestoresLegacyDirectPath(t *testing.T) {
 	productStore := codingmemory.NewRepository()
 	seedMemoryWorktree(t, productStore, "workspace-legacy", "worktree-legacy")
@@ -312,6 +552,39 @@ func TestServiceProductTurnFeatureFlagRestoresLegacyDirectPath(t *testing.T) {
 	snapshot, err := service.Snapshot(context.Background(), session.ID)
 	if err != nil || snapshot.ActiveTurn != nil || len(snapshot.Transcript) != 2 {
 		t.Fatalf("legacy snapshot = %#v, %v", snapshot, err)
+	}
+}
+
+func TestServicePlanFeatureFlagRejectsNewPlanButKeepsDirectPath(t *testing.T) {
+	products := codingmemory.NewRepository()
+	seedMemoryWorktree(t, products, "workspace-plan-disabled", "worktree-plan-disabled")
+	agentSessions := agentsession.NewMemoryRepository()
+	contexts, _ := contextmanager.NewManager()
+	runtime, err := agent.NewRuntime(agent.Dependencies{Models: finalModelFactory{}, Contexts: contexts, Sessions: agentSessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	features := codingagent.DefaultFeatureFlags()
+	features.PlanMode = false
+	service, err := codingagent.NewService(codingagent.Dependencies{
+		Sessions: products, Turns: products, Plans: products, AgentSessions: agentSessions, Worktrees: products,
+		Agent: runtime, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: &productEvents{}, Features: &features,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(context.Background(), codingagent.Session{
+		ID: "coding-plan-disabled", AgentSessionID: "agent-plan-disabled", WorkspaceID: "workspace-plan-disabled", WorktreeID: "worktree-plan-disabled",
+		ProviderProfileID: "profile", ModelID: "model", PermissionMode: codingagent.PermissionAsk,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.StartTurn(context.Background(), codingagent.TurnRequest{SessionID: session.ID, Text: "plan this", Mode: codingagent.TurnModePlan}); err == nil {
+		t.Fatal("disabled Plan feature accepted a new Plan Turn")
+	}
+	if result, err := service.StartTurn(context.Background(), codingagent.TurnRequest{SessionID: session.ID, Text: "answer directly"}); err != nil || result.Status != string(agent.RunCompleted) {
+		t.Fatalf("Direct path after disabling Plan = %#v, %v", result, err)
 	}
 }
 
@@ -479,6 +752,60 @@ func TestRecoveryCoordinatorClosesProductTurnCrashGapsExactlyOnce(t *testing.T) 
 			t.Fatalf("terminal Turn = %#v, %v", loaded, err)
 		}
 	})
+}
+
+func TestRecoveryCoordinatorReplaysPendingContinuationWithoutSyntheticUserEntry(t *testing.T) {
+	products := codingmemory.NewRepository()
+	seedMemoryWorktree(t, products, "workspace-continuation", "worktree-continuation")
+	agentSessions := agentsession.NewMemoryRepository()
+	runner := &gapAgentRunner{}
+	service, err := codingagent.NewService(codingagent.Dependencies{
+		Sessions: products, Turns: products, AgentSessions: agentSessions, Worktrees: products,
+		Agent: runner, Tools: emptyToolFactory{}, Prompts: staticPrompt{}, Events: &productEvents{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateSession(context.Background(), codingagent.Session{
+		ID: "coding-continuation", AgentSessionID: "agent-continuation", WorkspaceID: "workspace-continuation", WorktreeID: "worktree-continuation",
+		ProviderProfileID: "profile", ModelID: "model", PermissionMode: codingagent.PermissionAsk,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	turn := codingagent.Turn{
+		ID: "turn-continuation", SessionID: session.ID, RequestText: "one original request", Phase: codingagent.TurnPhaseDirect,
+		Status: codingagent.TurnPending, Strategy: codingagent.ExecutionSingle, Revision: 1,
+		Runs:      []codingagent.RunBinding{{RunID: "run-first", UserEntryID: "entry-first", Phase: codingagent.TurnPhaseDirect, Profile: codingagent.CapabilityDirect, Status: codingagent.RunBindingPending}},
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := products.CreateTurn(context.Background(), turn); err != nil {
+		t.Fatal(err)
+	}
+	turn.Runs[0].Status, turn.Runs[0].StartedAt = codingagent.RunBindingRunning, now
+	turn.Status, turn.Revision = codingagent.TurnRunning, 2
+	if err := products.SaveTurn(context.Background(), turn, 1); err != nil {
+		t.Fatal(err)
+	}
+	turn.Runs[0].Status, turn.Runs[0].FinishedAt = codingagent.RunBindingHandedOff, now.Add(time.Second)
+	turn.UpdatedAt, turn.Revision = now.Add(time.Second), 3
+	if err := products.SaveTurn(context.Background(), turn, 2); err != nil {
+		t.Fatal(err)
+	}
+	turn.Runs = append(turn.Runs, codingagent.RunBinding{RunID: "run-continuation", Phase: codingagent.TurnPhaseDirect, Profile: codingagent.CapabilityDirect, Status: codingagent.RunBindingPending})
+	turn.UpdatedAt, turn.Revision = now.Add(2*time.Second), 4
+	if err := products.SaveTurn(context.Background(), turn, 3); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := service.RecoverAutomatically(context.Background(), session.ID)
+	if err != nil || completed != 1 || runner.runs != 0 || runner.continuations != 1 {
+		t.Fatalf("continuation recovery completed=%d runs=%d continuations=%d err=%v", completed, runner.runs, runner.continuations, err)
+	}
+	recovered, err := products.LoadTurn(context.Background(), turn.ID)
+	if err != nil || recovered.Status != codingagent.TurnCompleted || len(recovered.Runs) != 2 || recovered.Runs[1].UserEntryID != "" {
+		t.Fatalf("recovered continuation = %#v, %v", recovered, err)
+	}
 }
 
 func TestServiceCancelTurnOwnsCancellationAndAgentPersistsAbortedTerminal(t *testing.T) {

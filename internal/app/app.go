@@ -49,6 +49,7 @@ type Options struct {
 	RelocateWorktree    codingagent.WorktreeID
 	SkipRelocation      bool
 	DisableProductTurns bool
+	DisablePlanMode     bool
 	Input               io.Reader
 	Output              io.Writer
 }
@@ -187,8 +188,11 @@ func New(ctx context.Context, options Options) (*Application, error) {
 	if options.DisableProductTurns {
 		features.ProductTurns = false
 	}
+	if options.DisablePlanMode {
+		features.PlanMode = false
+	}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, Turns: productStore, AgentSessions: agentSessions, Worktrees: workspaceManager, Workspaces: workspaceManager,
+		Sessions: productStore, Turns: productStore, Plans: productStore, AgentSessions: agentSessions, Worktrees: workspaceManager, Workspaces: workspaceManager,
 		Agent: agentRuntime, Tools: codingtools.NewFactory(codingtools.Options{Artifacts: productStore, Security: securityPolicy, Languages: language.NewDefaultRegistry(), Navigator: languageServers}), Prompts: prompt.NewBuilder(), Events: bridge,
 		Providers: providerManager, Limits: agent.RunLimits{MaxSteps: 32, MaxDuration: 30 * time.Minute}, Features: &features,
 	})

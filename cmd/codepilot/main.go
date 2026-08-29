@@ -59,6 +59,7 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	relocateWorktree := flags.String("relocate-worktree", "", "explicitly relocate an unavailable stored worktree ID to --workspace")
 	skipRelocation := flags.Bool("skip-relocation", false, "open --workspace as a new binding instead of a detected relocation")
 	disableProductTurns := flags.Bool("disable-product-turns", false, "disable Product Turn persistence and use the legacy Direct execution path")
+	disablePlanMode := flags.Bool("disable-plan-mode", false, "disable starting new explicit Plan tasks")
 	if err := flags.Parse(arguments); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -97,6 +98,7 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 		RelocateWorktree:    codingagent.WorktreeID(strings.TrimSpace(*relocateWorktree)),
 		SkipRelocation:      *skipRelocation,
 		DisableProductTurns: *disableProductTurns,
+		DisablePlanMode:     *disablePlanMode,
 		Input:               stdin,
 		Output:              stdout,
 	}

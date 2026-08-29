@@ -103,43 +103,55 @@ type Model struct {
 	sessionID codingagent.SessionID
 	snapshot  codingagent.Snapshot
 
-	width, height       int
-	input               []rune
-	cursor              int
-	history             []string
-	historyIndex        int
-	busy                bool
-	thinking            bool
-	status              string
-	errorMessage        string
-	liveAssistant       string
-	activities          map[string]codingagent.ToolActivityEvent
-	expanded            map[string]bool
-	selectedTool        string
-	selectedBlock       string
-	textSelection       textSelection
-	mouseDownBlock      string
-	scroll              int
-	followBottom        bool
-	scrollbar           scrollbarState
-	hitRows             map[int]string
-	hitBlocks           map[int]string
-	hitTextRows         map[int]textHit
-	markdownCache       map[string][]string
-	markdownEnabled     bool
-	completionCursor    int
-	completionDismissed bool
-	quitting            bool
-	turnCancel          context.CancelFunc
-	picker              providerPicker
-	sessionPicker       sessionPicker
-	workspacePicker     workspacePicker
-	permissionPicker    permissionPicker
-	approvalCursor      int
-	approvalInterruptID string
-	forkPicker          forkPicker
-	helpActive          bool
-	generation          uint64
+	width, height         int
+	input                 []rune
+	cursor                int
+	history               []string
+	historyIndex          int
+	busy                  bool
+	thinking              bool
+	status                string
+	errorMessage          string
+	liveAssistant         string
+	activities            map[string]codingagent.ToolActivityEvent
+	expanded              map[string]bool
+	selectedTool          string
+	selectedBlock         string
+	diffPaneActive        bool
+	diffScroll            int
+	diffMaxScroll         int
+	conversationWidth     int
+	textSelection         textSelection
+	mouseDownBlock        string
+	scroll                int
+	followBottom          bool
+	scrollbar             scrollbarState
+	hitRows               map[int]string
+	hitBlocks             map[int]string
+	hitTextRows           map[int]textHit
+	markdownCache         map[string][]string
+	markdownEnabled       bool
+	completionCursor      int
+	completionDismissed   bool
+	quitting              bool
+	turnCancel            context.CancelFunc
+	picker                providerPicker
+	sessionPicker         sessionPicker
+	workspacePicker       workspacePicker
+	permissionPicker      permissionPicker
+	approvalCursor        int
+	approvalInterruptID   string
+	forkPicker            forkPicker
+	helpActive            bool
+	planInput             bool
+	planFeedback          bool
+	clarificationOther    bool
+	clarificationID       string
+	clarificationIndex    int
+	clarificationCursor   int
+	clarificationAnswers  []codingagent.ClarificationAnswer
+	clarificationSelected map[string]bool
+	generation            uint64
 }
 
 type eventMsg struct{ event codingagent.Event }
@@ -245,12 +257,20 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		} else if m.picker.active {
 			m.pasteProviderInput(value.Content)
-		} else if !m.busy && m.pendingApproval() == nil && m.pendingRecovery() == nil {
+		} else if !m.busy && (m.pendingApproval() == nil || m.planFeedback) && (m.pendingClarification() == nil || m.clarificationOther) && m.pendingRecovery() == nil {
 			m.clearTextSelection()
 			m.insert([]rune(value.Content))
 		}
 	case tea.MouseWheelMsg:
 		m.scrollbar.dragging = false
+		if m.diffPaneActive && value.Mouse().X > m.conversationWidth {
+			if value.Mouse().Button == tea.MouseWheelUp {
+				m.diffScroll = max(0, m.diffScroll-3)
+			} else if value.Mouse().Button == tea.MouseWheelDown {
+				m.diffScroll = min(m.diffMaxScroll, m.diffScroll+3)
+			}
+			break
+		}
 		if value.Mouse().Button == tea.MouseWheelUp {
 			m.followBottom = false
 			m.scroll = max(0, m.scroll-3)
@@ -259,6 +279,9 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.MouseClickMsg:
 		if value.Mouse().Button == tea.MouseLeft && !m.overlayActive() {
+			if m.diffPaneActive && value.Mouse().X >= m.conversationWidth {
+				break
+			}
 			if !m.beginScrollbarDrag(value.Mouse()) {
 				m.beginMouseTextSelection(value.Mouse())
 			}
@@ -480,6 +503,27 @@ func (m *Model) handleKey(message tea.KeyPressMsg) tea.Cmd {
 		m.scroll += max(3, m.bodyHeight()-2)
 		return nil
 	}
+	// An explicit mouse selection takes precedence over modal approval,
+	// clarification, recovery, and active-turn key handling. Without this,
+	// Ctrl+C is consumed by the modal (or cancels the turn) instead of copying.
+	if m.textSelection.hasRange() {
+		switch {
+		case strings.EqualFold(key.Text, "y"), key.Mod&tea.ModCtrl != 0 && key.Code == 'c':
+			return m.copyTextSelection()
+		case key.Code == tea.KeyEscape || key.Code == tea.KeyEsc:
+			m.clearTextSelection()
+			return nil
+		}
+	}
+	if m.planFeedback {
+		return m.handlePlanFeedbackKey(message)
+	}
+	if m.clarificationOther {
+		return m.handleClarificationOtherKey(message)
+	}
+	if pending := m.pendingClarification(); pending != nil {
+		return m.handleClarificationKey(*pending, message)
+	}
 	if pending := m.pendingApproval(); pending != nil {
 		return m.handleApprovalKey(*pending, message)
 	}
@@ -502,15 +546,6 @@ func (m *Model) handleKey(message tea.KeyPressMsg) tea.Cmd {
 			return m.recover(*pending, decision)
 		}
 		return nil
-	}
-	if m.textSelection.hasRange() && !m.busy {
-		switch {
-		case strings.EqualFold(key.Text, "y"), key.Mod&tea.ModCtrl != 0 && key.Code == 'c':
-			return m.copyTextSelection()
-		case key.Code == tea.KeyEscape || key.Code == tea.KeyEsc:
-			m.clearTextSelection()
-			return nil
-		}
 	}
 	if key.Mod&tea.ModCtrl != 0 && key.Code == 'c' {
 		if m.busy {
@@ -633,6 +668,18 @@ func (m *Model) submit() tea.Cmd {
 	if strings.HasPrefix(text, "/") {
 		return m.submitCommand(text)
 	}
+	mode := codingagent.TurnModeDirect
+	if m.planInput {
+		mode = codingagent.TurnModePlan
+	}
+	return m.submitTurn(text, mode)
+}
+
+func (m *Model) submitTurn(text string, mode codingagent.TurnMode) tea.Cmd {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
 	m.clearTextSelection()
 	m.history = append(m.history, text)
 	if len(m.history) > maxInputHistory {
@@ -640,17 +687,21 @@ func (m *Model) submit() tea.Cmd {
 	}
 	m.historyIndex = -1
 	m.clearInput()
+	m.planInput = false
 	m.busy = true
 	m.errorMessage = ""
 	m.liveAssistant = ""
 	m.activities = make(map[string]codingagent.ToolActivityEvent)
 	m.followBottom = true
 	m.status = "Agent is working..."
+	if mode == codingagent.TurnModePlan {
+		m.status = "Planning (read-only)..."
+	}
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.turnCancel = cancel
 	client, ctx, sessionID, generation := m.client, m.ctx, m.sessionID, m.generation
 	turnCommand := func() tea.Msg {
-		result, err := client.StartTurn(turnCtx, codingagent.TurnRequest{SessionID: sessionID, Text: text})
+		result, err := client.StartTurn(turnCtx, codingagent.TurnRequest{SessionID: sessionID, Text: text, Mode: mode})
 		return turnResultMsg{result: result, err: err, sessionID: sessionID, generation: generation}
 	}
 	if strings.TrimSpace(m.snapshot.Session.Title) == "" {
@@ -663,13 +714,21 @@ func (m *Model) submit() tea.Cmd {
 	return turnCommand
 }
 
-func (m *Model) resume(pending codingagent.PendingInterrupt, decision codingagent.ResolutionDecision, scope codingagent.PermissionGrantScope) tea.Cmd {
+func (m *Model) resume(pending codingagent.PendingInterrupt, decision codingagent.ResolutionDecision, scope codingagent.PermissionGrantScope, messages ...string) tea.Cmd {
+	message := ""
+	if len(messages) != 0 {
+		message = strings.TrimSpace(messages[0])
+	}
+	return m.resumeWithDetails(pending, decision, scope, message, nil)
+}
+
+func (m *Model) resumeWithDetails(pending codingagent.PendingInterrupt, decision codingagent.ResolutionDecision, scope codingagent.PermissionGrantScope, message string, details []byte) tea.Cmd {
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.turnCancel = cancel
 	client, sessionID, generation := m.client, m.sessionID, m.generation
 	return func() tea.Msg {
 		result, err := client.ResumeTurn(turnCtx, codingagent.ResumeTurnRequest{
-			SessionID: sessionID, TurnID: pending.TurnID, InterruptID: pending.InterruptID, Decision: decision, GrantScope: scope,
+			SessionID: sessionID, TurnID: pending.TurnID, InterruptID: pending.InterruptID, Decision: decision, GrantScope: scope, Message: strings.TrimSpace(message), Details: append([]byte(nil), details...),
 		})
 		return resumeResultMsg{result: result, err: err, sessionID: sessionID, generation: generation}
 	}
@@ -806,6 +865,14 @@ func (m *Model) activateSnapshot(snapshot codingagent.Snapshot) {
 	m.permissionPicker = permissionPicker{}
 	m.approvalCursor = 0
 	m.approvalInterruptID = ""
+	m.planInput = false
+	m.planFeedback = false
+	m.clarificationOther = false
+	m.clarificationID = ""
+	m.clarificationIndex = 0
+	m.clarificationCursor = 0
+	m.clarificationAnswers = nil
+	m.clarificationSelected = nil
 	m.forkPicker = forkPicker{}
 	m.helpActive = false
 }
@@ -886,7 +953,16 @@ func eventNeedsSnapshot(kind codingagent.EventKind) bool {
 
 func (m *Model) pendingApproval() *codingagent.PendingInterrupt {
 	for index := range m.snapshot.PendingInterrupts {
-		if m.snapshot.PendingInterrupts[index].Kind == "approval" {
+		if m.snapshot.PendingInterrupts[index].Kind == "approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_approval" {
+			return &m.snapshot.PendingInterrupts[index]
+		}
+	}
+	return nil
+}
+
+func (m *Model) pendingClarification() *codingagent.PendingInterrupt {
+	for index := range m.snapshot.PendingInterrupts {
+		if m.snapshot.PendingInterrupts[index].Kind == "clarification" && m.snapshot.PendingInterrupts[index].Clarification != nil {
 			return &m.snapshot.PendingInterrupts[index]
 		}
 	}
@@ -947,8 +1023,19 @@ func (m *Model) View() tea.View {
 		return m.providerView(width, height)
 	}
 	completionLines := m.commandCompletionLines(width, max(0, height-6))
-	rows := m.conversationRows(width)
+	pane, hasDiff := m.selectedDiffPane()
+	conversationWidth, diffWidth := diffPaneLayout(width, hasDiff)
+	m.diffPaneActive = diffWidth != 0
+	m.conversationWidth = conversationWidth
+	rows := m.conversationRows(conversationWidth)
 	bodyHeight := m.bodyHeight()
+	diffLines := []string(nil)
+	if m.diffPaneActive {
+		diffLines, m.diffMaxScroll = renderDiffPane(pane, diffWidth, bodyHeight, m.diffScroll)
+		m.diffScroll = min(m.diffScroll, m.diffMaxScroll)
+	} else {
+		m.diffScroll, m.diffMaxScroll = 0, 0
+	}
 	maxScroll := max(0, len(rows)-bodyHeight)
 	if m.followBottom || m.scroll >= maxScroll {
 		m.scroll = maxScroll
@@ -972,8 +1059,9 @@ func (m *Model) View() tea.View {
 	lines := []string{truncateANSI(header, width)}
 	for index := 0; index < bodyHeight; index++ {
 		screenY := index + 1
+		left := ""
 		if index < len(visible) {
-			lines = append(lines, m.renderScrollbarColumn(truncateANSI(visible[index].text, width), screenY, width))
+			left = visible[index].text
 			m.hitTextRows[screenY] = textHit{row: m.scroll + index, text: ansi.Strip(visible[index].text)}
 			if visible[index].selectionID != "" {
 				m.hitBlocks[screenY] = visible[index].selectionID
@@ -981,8 +1069,17 @@ func (m *Model) View() tea.View {
 			if visible[index].toolID != "" {
 				m.hitRows[screenY] = visible[index].toolID
 			}
+		}
+		if m.diffPaneActive {
+			left = m.renderScrollbarColumn(truncateANSI(left, conversationWidth), screenY, conversationWidth)
+			left = padANSI(left, conversationWidth)
+			right := ""
+			if index < len(diffLines) {
+				right = diffLines[index]
+			}
+			lines = append(lines, left+theme.muted.Render("│")+truncateANSI(right, diffWidth))
 		} else {
-			lines = append(lines, m.renderScrollbarColumn("", screenY, width))
+			lines = append(lines, m.renderScrollbarColumn(truncateANSI(left, width), screenY, width))
 		}
 	}
 	lines = append(lines, completionLines...)
@@ -1024,7 +1121,8 @@ func (m *Model) conversationRows(width int) []renderRow {
 		}
 	}
 	seenResults := make(map[string]bool)
-	for itemIndex, item := range m.snapshot.Transcript {
+	for itemIndex := 0; itemIndex < len(m.snapshot.Transcript); itemIndex++ {
+		item := m.snapshot.Transcript[itemIndex]
 		switch item.Kind {
 		case codingagent.TranscriptText:
 			selectionID := messageSelectionKey(item, itemIndex)
@@ -1059,16 +1157,33 @@ func (m *Model) conversationRows(width int) []renderRow {
 			if item.Tool == nil {
 				continue
 			}
-			activity := *item.Tool
-			if result, found := results[activity.CallID]; found {
-				activity = result
+			activity, _ := m.resolvedTranscriptTool(item, results)
+			if activity.Name == createFileToolName {
+				group, next := m.collectConsecutiveCreateFiles(itemIndex, results)
+				for _, grouped := range group.activities {
+					if _, found := results[grouped.CallID]; found {
+						seenResults[grouped.CallID] = true
+					}
+				}
+				rows = append(rows, m.createFileGroupRows(group, contentWidth)...)
+				itemIndex = next - 1
+				continue
+			}
+			if _, found := results[activity.CallID]; found {
 				seenResults[activity.CallID] = true
-			} else if live, found := m.activities[activity.CallID]; found {
-				activity.Status, activity.Summary, activity.Detail, activity.Diff, activity.Resources = live.Status, live.Summary, live.Detail, live.Diff, live.Resources
 			}
 			rows = append(rows, m.toolRows(activity, contentWidth)...)
 		case codingagent.TranscriptToolResult:
 			if item.Tool != nil && !seenResults[item.Tool.CallID] {
+				if item.Tool.Name == createFileToolName {
+					group, next := m.collectConsecutiveCreateFiles(itemIndex, results)
+					for _, grouped := range group.activities {
+						seenResults[grouped.CallID] = true
+					}
+					rows = append(rows, m.createFileGroupRows(group, contentWidth)...)
+					itemIndex = next - 1
+					continue
+				}
 				rows = append(rows, m.toolRows(*item.Tool, contentWidth)...)
 			}
 		case codingagent.TranscriptCompaction:
@@ -1081,14 +1196,27 @@ func (m *Model) conversationRows(width int) []renderRow {
 	if m.liveAssistant != "" {
 		rows = m.appendAssistant(rows, "live-assistant", m.liveAssistant, contentWidth)
 	}
-	for callID, live := range m.activities {
-		if _, durable := results[callID]; durable || transcriptHasCall(m.snapshot.Transcript, callID) {
+	var liveCreates createFileGroup
+	for _, activity := range m.unanchoredLiveTools(results) {
+		if activity.Name == createFileToolName {
+			liveCreates.activities = append(liveCreates.activities, activity)
 			continue
 		}
-		rows = append(rows, m.toolRows(codingagent.TranscriptTool{CallID: callID, Name: live.Name, Status: live.Status, Summary: live.Summary, Detail: live.Detail, Diff: live.Diff, Resources: live.Resources}, contentWidth)...)
+		rows = append(rows, m.toolRows(activity, contentWidth)...)
+	}
+	if len(liveCreates.activities) != 0 {
+		rows = append(rows, m.createFileGroupRows(liveCreates, contentWidth)...)
 	}
 	if pending := m.pendingApproval(); pending != nil {
+		if pending.Kind == "plan_approval" && m.snapshot.ActivePlan != nil {
+			rows = append(rows, m.planRows(*m.snapshot.ActivePlan, contentWidth)...)
+		}
 		rows = append(rows, m.approvalRows(*pending, contentWidth)...)
+	} else if m.snapshot.ActivePlan != nil {
+		rows = append(rows, m.planRows(*m.snapshot.ActivePlan, contentWidth)...)
+	}
+	if pending := m.pendingClarification(); pending != nil {
+		rows = append(rows, m.clarificationRows(*pending, contentWidth)...)
 	}
 	if recovery := m.pendingRecovery(); recovery != nil {
 		title := "  Crash recovery required"
@@ -1224,7 +1352,7 @@ func (m *Model) toolRows(activity codingagent.TranscriptTool, width int) []rende
 			rows = append(rows, renderRow{text: theme.muted.Render("      " + detail), toolID: id, selectionID: selectionID})
 		}
 	}
-	if expanded && activity.Diff != nil && activity.Diff.Text != "" {
+	if expanded && !m.diffPaneActive && activity.Diff != nil && activity.Diff.Text != "" {
 		rows = append(rows, renderRow{text: theme.muted.Render("      Applied changes"), toolID: id, selectionID: selectionID})
 		diffText := strings.ReplaceAll(activity.Diff.Text, "\r\n", "\n")
 		for _, line := range strings.Split(strings.TrimSuffix(diffText, "\n"), "\n") {
@@ -1243,10 +1371,13 @@ func (m *Model) statusLine() string {
 		return theme.warning.Render("Recovery: " + recoveryDecisionHelp(*recovery))
 	}
 	if m.textSelection.hasRange() {
-		return theme.muted.Render("Text selected")
+		return theme.muted.Render("Text selected  •  Ctrl+C copy  •  Esc clear")
 	}
 	if m.selectedBlock != "" {
 		if m.selectedTool != "" {
+			if m.diffPaneActive {
+				return theme.muted.Render("Diff open  •  Wheel over right pane to scroll  •  Y copy  •  ← collapse")
+			}
 			return theme.muted.Render("Tool selected")
 		}
 		return theme.muted.Render("Message selected")
@@ -1319,15 +1450,31 @@ func (m *Model) promptLine() string {
 }
 
 func (m *Model) renderPrompt(width int) (string, int, bool) {
-	prefix := theme.user.Render("❯ ")
-	if m.busy || m.pendingApproval() != nil || m.pendingRecovery() != nil {
+	prefixText := "❯ "
+	if m.planInput {
+		prefixText = "Plan ❯ "
+	} else if m.planFeedback {
+		prefixText = "Revise ❯ "
+	} else if m.clarificationOther {
+		prefixText = "Other ❯ "
+	}
+	prefix := theme.user.Render(prefixText)
+	if m.busy || (m.pendingApproval() != nil && !m.planFeedback) || (m.pendingClarification() != nil && !m.clarificationOther) || m.pendingRecovery() != nil {
 		return truncateANSI(theme.muted.Render("❯ "), width), 0, false
 	}
 	prefixWidth := ansi.StringWidth(prefix)
 	viewport := renderInputViewport(m.input, m.cursor, max(1, width-prefixWidth))
 	line := prefix + theme.assistant.Render(viewport.text)
 	if len(m.input) == 0 {
-		line = prefix + " " + theme.muted.Render("Ask CodePilot anything…")
+		placeholder := "Ask CodePilot anything…"
+		if m.planInput {
+			placeholder = "Describe what should be planned…"
+		} else if m.planFeedback {
+			placeholder = "Describe the Plan changes you want…"
+		} else if m.clarificationOther {
+			placeholder = "Describe the outcome you prefer…"
+		}
+		line = prefix + " " + theme.muted.Render(placeholder)
 	}
 	return truncateANSI(line, width), min(width-1, prefixWidth+viewport.cursorOffset), true
 }
@@ -1397,7 +1544,11 @@ func (m *Model) renderScrollbarColumn(line string, screenY, width int) string {
 }
 
 func (m *Model) beginScrollbarDrag(mouse tea.Mouse) bool {
-	if !m.scrollbar.active || mouse.X != max(20, m.width)-1 || mouse.Y < m.scrollbar.trackTop || mouse.Y >= m.scrollbar.trackTop+m.scrollbar.trackHeight {
+	scrollbarX := max(20, m.width) - 1
+	if m.diffPaneActive && m.conversationWidth > 0 {
+		scrollbarX = m.conversationWidth - 1
+	}
+	if !m.scrollbar.active || mouse.X != scrollbarX || mouse.Y < m.scrollbar.trackTop || mouse.Y >= m.scrollbar.trackTop+m.scrollbar.trackHeight {
 		return false
 	}
 	m.clearAllSelections()

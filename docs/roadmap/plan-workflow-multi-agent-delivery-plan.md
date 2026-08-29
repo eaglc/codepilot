@@ -144,7 +144,8 @@ Coding Session
 | Profile | 主要能力 |
 |---|---|
 | `direct` | 读取、按 PermissionMode 控制的编辑/检查、`EnterPlanMode` |
-| `plan` | 只读文件、搜索、Git 只读、`ExitPlanMode` |
+| `plan` | 初始仅提供需求澄清、工作区相关性声明和 `ExitPlanMode`，不读取仓库 |
+| `plan_workspace` | 经相关性 handoff 后提供只读文件、搜索、Git 只读、需求澄清和 `ExitPlanMode` |
 | `explore` | 节点范围内只读探索 |
 | `implement` | 节点范围内读取和受控修改 |
 | `validate` | 读取、允许的检查计划，不修改产品代码 |
@@ -214,6 +215,7 @@ Profile 是可信代码定义的白名单。模型只能从产品允许的角色
 - 解除 `TurnID == RunID` 的隐式假设。
 - 支持同一 Product Turn 包含多个 Agent Run。
 - 引入能力 Profile 和统一的 Turn Scope 构造入口。
+- 在 Direct/Executing Profile 增加受路径、安全和权限边界控制的 `create_file`，支持在空仓库创建首个 UTF-8 文本文件并自动建立父目录；“本会话允许”采用仅限该工具的工作区新建范围，避免每个新路径重复审批。
 - 保持现有 Direct 单 Agent 用户行为完全不变。
 
 ### 6.2 具体实现与改造步骤
@@ -246,13 +248,15 @@ Turn 至少记录：Session、原始请求引用、当前阶段、关联 Run、P
 
 #### 5. 抽取统一的 Scope/Prompt/Tool 构造
 
-把当前 Start、Resume、Recover 中重复的 Worktree、Permission、Prompt 和 Tool 装配集中为阶段感知的构造器，并引入 `direct` Profile，但此阶段只启用现有工具集合。
+把当前 Start、Resume、Recover 中重复的 Worktree、Permission、Prompt 和 Tool 装配集中为阶段感知的构造器，并引入 `direct` Profile。文件能力区分 `create_file`、`edit_file`、`replace_file` 与多文件 `apply_patch`：新文件由 `create_file` 直接安全写入并自动建立父目录，不让模型为创建文件手写平台相关的 `/dev/null` unified diff。`create_file` 的 session grant 只匹配同一工具的 `modify` 动作和当前会话，后续目标仍逐次执行路径、安全、敏感内容、目标不存在与并发状态校验；其他写工具继续按实际变更范围授权。
 
 为什么：后续每个阶段都需要按 durable TurnPhase 重新构造工具和 Prompt。继续复制装配逻辑容易在 Resume 或 Recover 时错误恢复写能力。
 
 #### 6. 扩展 Snapshot 和 Event，但保持 UI 兼容
 
 Snapshot 增加可选 ActiveTurn；Event 增加 TurnID、RunID、NodeID 等关联字段。旧 UI 在新字段为空时仍按当前行为工作。
+
+TUI 在投影层把连续的 `create_file` 调用聚合为一个工具活动块，并根据每个结果的安全资源路径追加目录树；durable transcript、单次工具结果和审计事实不做合并。宽屏下，选中并展开带 Diff 的工具块后，将对话和文件树保留在左侧，右侧使用带旧/新行号的独立 unified diff 面板展示变更，删除、增加和 hunk 分别使用红、绿和辅助色，鼠标位于右侧时滚轮只滚动 Diff；宽度不足时回退到现有纵向展开。显式文本选区优先于审批、澄清、恢复和 busy 状态的按键路由，使复制在等待和生成期间仍可用；无选区的 `Ctrl+C` 继续承担取消或退出。
 
 为什么：先建立兼容协议，后续 Plan/Workflow UI 才不需要再次破坏产品边界。
 
@@ -267,6 +271,10 @@ Snapshot 增加可选 ActiveTurn；Event 增加 TurnID、RunID、NodeID 等关�
 - 现有 Direct E2E、审批、恢复、取消、分支、摘要和权限测试全部通过。
 - 新 TurnID 与 RunID 可以不同，事件和 Snapshot 仍归属正确。
 - 同一 Product Turn 可以连续运行两个 Agent Run，transcript 中只有一条原始用户请求。
+- Direct/Executing Profile 能在空仓库创建首个文件及嵌套父目录；Ask 模式在批准前零副作用，目标在等待期间被用户创建时不得覆盖。
+- Ask 模式首次为 `create_file` 选择“本会话允许”后，当前会话内后续安全新建文件不再逐路径重复审批；授权不能用于 `edit_file`、`replace_file`、`apply_patch`、命令执行、非法路径、敏感文件或覆盖已有文件。
+- 连续 `create_file` 调用在 TUI 中只显示一个活动块并以目录树追加结果，选择和复制也以该聚合块为单位；底层仍保留逐文件状态和审计。权限审批、澄清、恢复或模型生成期间的显式文本选区可以复制，且不会误触发审批选项或取消当前任务。
+- 宽屏展开普通文件修改或聚合 `create_file` 活动时，右侧 Diff 面板显示对应文件、旧/新行号和变更片段，删除行为红色、增加行为绿色，并支持独立滚动；窄屏不出现横向挤压而使用内联 Diff。
 - 控制类工具与其他工具同时出现在一条 assistant 消息时，整个控制转换被安全拒绝且不会执行后续工具。
 - 解决控制中断后可以 durable 结束当前 Run，并由产品协调器在同一 Turn 启动下一 Run。
 - 在创建 Turn、绑定 Run、Run 完成等写入边界崩溃后，恢复结果唯一且不会重复执行工具。
@@ -280,8 +288,10 @@ Snapshot 增加可选 ActiveTurn；Event 增加 TurnID、RunID、NodeID 等关�
 - 支持 `/plan` 和 `/plan <request>`。
 - Plan 模式进行可信只读探索。
 - 生成结构化、可展示、可修订的 Plan。
+- 对影响交付结果的关键歧义发起可恢复的结构化用户选择。
+- 区分工作区相关的实施型 Plan 与计划本身即交付物的内容型 Plan。
 - 通过 `ExitPlanMode` 请求用户批准。
-- 批准后默认由单 Agent 执行，仍遵循正常权限审批。
+- 实施型 Plan 批准后默认由单 Agent 执行，仍遵循正常权限审批；内容型 Plan 被接受后直接完成。
 - 取消或拒绝后不产生实施副作用。
 
 ### 7.2 具体实现与改造步骤
@@ -294,25 +304,35 @@ UI 命令注册增加 `/plan`。无参数时切换当前输入区为 Plan 状态
 
 #### 2. 定义 Plan 阶段与只读能力 Profile
 
-Turn 增加 Planning、AwaitingPlanApproval、Executing 等阶段。`plan` Profile 只提供文件读取、搜索、Git 只读和退出 Plan 所需能力，不提供文件编辑、检查命令、Git 写或会启动进程的导航能力。
+Turn 增加 Planning、AwaitingPlanApproval、Executing 等阶段。初始 `plan` Profile 不提供任何文件或 Git 工具，只提供澄清、提交 Plan 和声明工作区相关性的控制动作；声明相关性并完成 control handoff 后切换到 `plan_workspace`，后者只提供文件读取、搜索、Git 只读和退出 Plan 所需能力，不提供文件编辑、检查命令、Git 写或会启动进程的导航能力。
 
 为什么：这是 Plan“不会动手”的核心产品承诺，必须通过模型不可见的能力裁剪保证。
 
 #### 3. 建立独立 Plan Prompt
 
-Plan Prompt 要求模型先获取证据，再形成目标、范围、现状、假设、取舍、步骤、风险、验证标准和执行方式建议。仓库 guidance 继续作为不可信上下文。
+Plan Prompt 要求模型先获取必要证据，再形成目标、范围、现状、假设、取舍、步骤、风险、验证标准和执行方式建议。仓库相关 Plan 按需读取 guidance，并继续把它作为不可信上下文处理。
 
 为什么：Direct Prompt 面向实施，无法稳定约束计划质量；不同阶段需要不同的任务目标，但共享相同安全基线。
 
-#### 4. 定义结构化 Plan 和严格校验
+Plan Prompt 同时要求先判断结果是否依赖当前工作区。无关请求不得为了“了解上下文”读取文件、Git 或项目 guidance；只有仓库相关计划调用 `RequestWorkspaceContext` 完成可信 Profile handoff 后才获得按需探索能力。
+
+#### 4. 增加结构化需求澄清中断
+
+在 `plan` Profile 增加 `RequestUserInput` 控制工具。单次调用接受 1～3 个有界且相关的问题；每题包含 2～4 个候选项、`single` 或 `multiple` 选择模式、推荐项或推荐组合及简短取舍。UI 逐题展示：单选确认后前进，多选通过勾选和显式确认前进，并自动增加自由文本“其他”；“其他”编辑状态直接在卡片内实时展示。产品边界对遗漏或重复的推荐标记进行安全规范化，避免把模型可自行修复的参数抖动显示成首轮失败。全部回答作为同一 Run 的一组 durable tool resolution 数据原子恢复；Turn 在等待和恢复后均保持 Planning，不切换 Profile，也不产生权限 grant。后续只有在回答或新证据暴露新的重大歧义时才再次中断，不设置总澄清轮次上限。
+
+为什么：重大歧义如果只写进 Plan 假设会把错误选择推迟到审批阶段；复用权限或 Plan approval 又会混淆用户语义。独立中断可以恢复、审计并精确绑定当前问题。
+
+#### 5. 定义结构化 Plan 和严格校验
 
 Plan 从第一版包含稳定 ID、版本、目标、范围、发现、假设、风险、步骤、验收条件、执行策略建议和工作区基线。步骤允许表达依赖，但 P1 不执行多 Agent。
+
+Plan 额外声明 `workspace_relevant` 与 `completion_mode`。只有工作区相关的 Plan 可以声明文件范围和实施；`deliverable` Plan 的接受动作只完成当前 Turn，不创建执行 Run。
 
 校验 ID 唯一、依赖有效、文本和节点数量有界、路径规范化、写范围只是预期而非授权，并对 canonical 内容计算 digest。
 
 为什么：自由文本无法可靠支持批准绑定、版本 diff、Workflow 编译和崩溃恢复；提前兼容依赖关系可以避免后续重写 Plan 格式。
 
-#### 5. 实现 `ExitPlanMode` 产品控制动作
+#### 6. 实现 `ExitPlanMode` 产品控制动作
 
 将 `ExitPlanMode` 实现为 `codingagent` 拥有的可恢复控制工具。模型提交 Plan 后，产品先校验并持久化 Plan，再进入等待批准。UI 显示批准执行、提出修改和取消任务。调用动作本身不能直接恢复写能力。
 
@@ -320,33 +340,45 @@ Plan 从第一版包含稳定 ID、版本、目标、范围、发现、假设、
 
 为什么：用户批准的是实际展示的 Plan，不是模型尚未持久化的文本。先保存再等待确认可保证重启后一致。
 
-#### 6. 实现 Plan 修订
+#### 7. 实现 Plan 修订
 
 用户反馈作为当前 Turn 的产品输入交给 Plan 阶段继续处理；下一次提交生成新版本。旧版本保留，旧批准不能作用到新版本。
 
 为什么：计划修改是核心用户路径，不能靠编辑一段 Markdown 覆盖旧内容，否则无法审计用户批准了什么。
 
-#### 7. 批准后启动单 Agent 执行
+#### 8. 按 Plan 完成语义决定是否执行
 
-批准绑定 Turn、PlanID、Version、Digest 和基线。Coordinator 切换到 Executing，以正常 PermissionMode 构造执行 Profile，并把已批准 Plan 作为低信任结构化任务上下文交给执行 Run。
+批准绑定 Turn、PlanID、Version、Digest 和基线。`execute` Plan 由 Coordinator 切换到 Executing，以正常 PermissionMode 构造执行 Profile，并把已批准 Plan 作为低信任结构化任务上下文交给执行 Run。`deliverable` Plan 被接受后把当前 Planning Run 和 Product Turn 置为完成，不调用 continuation Provider 请求。
 
 为什么：Plan approval 是方案确认，不是权限提升；执行时必须重新计算真实能力和授权。
 
-#### 8. 增加 Plan Snapshot/Event/UI
+#### 9. 增加 Plan Snapshot/Event/UI
 
 Snapshot 增加 ActivePlan、PendingPlanApproval 和 Plan history 摘要；Event 增加 Plan started/created/revised/approval requested/approved/cancelled。UI 使用结构化 Plan 卡片展示，不从 assistant Markdown 解析。
 
+Snapshot 同时投影当前 clarification 的问题、候选项、推荐项和“其他”输入状态。UI 对 `execute` 显示“批准并实施”，对 `deliverable` 显示“接受并完成”，避免用户误判按钮副作用。
+
 为什么：Snapshot 必须是权威状态，UI 才能在事件丢失和重启后恢复同一确认界面。
+
+#### 10. 细化 Provider 阶段失败分类
+
+连接、超时、鉴权、限流、流式响应中断和未知 Provider 失败使用不同稳定错误码。未知 SDK 异常不得默认展示为“无法连接”；错误展示应让用户识别失败发生在 Plan、澄清恢复还是批准后的执行阶段。
+
+为什么：Plan 可能跨多个 Provider 请求。把后续 Run 的瞬时失败显示成 Base URL 故障，会让用户误以为已经生成或批准的 Plan 丢失。
 
 ### 7.3 验收标准
 
 - `/plan` 与 `/plan <request>` 都能启动当前任务的 Plan 流程，任务结束后恢复普通输入状态。
-- Plan 模式 Tool Definitions 中不存在任何写工具、任意命令或进程启动能力。
+- 初始 Plan 模式 Tool Definitions 中不存在文件或 Git 工具；只有显式相关性 handoff 后才出现只读工作区工具，两个 Profile 均不存在写工具、任意命令或进程启动能力。
 - 恶意用户文本、仓库指令和工具结果不能使 Plan 阶段产生工作区副作用。
 - 计划缺少目标、验收条件、有效步骤或包含非法范围时不能进入可批准状态。
 - 用户可以批准、提出修改或取消；修订后旧版本批准被拒绝。
+- 缺少关键偏好时，单次中断可以逐题展示 1～3 个问题；每题包含 2～4 个候选项，并根据问题语义支持单选或多选。推荐标记异常不会产生用户可见的首次失败，“其他”输入在卡片内实时可见。全部回答后继续同一只读 Planning Run，且不授予权限；后续仍可按需再次澄清。
+- 与仓库无关的内容规划不会读取工作区文件、Git 状态或 project guidance。
 - 未批准 Plan 时工作区内容、Git 状态和外部系统保持不变。
-- 批准后由单 Agent 在同一 Product Turn 中执行，正常文件/命令审批仍会出现。
+- `execute` Plan 批准后由单 Agent 在同一 Product Turn 中执行，正常文件/命令审批仍会出现。
+- `deliverable` Plan 被接受后当前 Turn 直接完成，不创建第二个执行 Run。
+- Provider 流中断和未知 Provider 错误不会被误报为确定的 endpoint 连接失败。
 - 在 Plan 生成、保存、等待批准、批准后尚未执行等边界重启，Snapshot 能恢复准确状态。
 
 ## 8. P2：Agent 主动建议进入 Plan

@@ -130,6 +130,12 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 	if scope.SessionID == "" || scope.WorkspaceID == "" || scope.WorktreeID == "" || strings.TrimSpace(scope.WorktreeRoot) == "" {
 		return nil, errors.New("create Coding tools: complete session and worktree scope is required")
 	}
+	if scope.Profile == "" {
+		scope.Profile = codingagent.CapabilityDirect
+	}
+	if scope.Profile != codingagent.CapabilityDirect && scope.Profile != codingagent.CapabilityPlan && scope.Profile != codingagent.CapabilityPlanWorkspace {
+		return nil, fmt.Errorf("create Coding tools: unsupported capability profile %q", scope.Profile)
+	}
 	root, err := filepath.Abs(scope.WorktreeRoot)
 	if err != nil {
 		return nil, fmt.Errorf("create Coding tools: resolve root: %w", err)
@@ -166,6 +172,7 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 		&gitBranchesTool{root: root, maxOutput: options.MaxOutput},
 		&gitShowCommitTool{root: root, maxOutput: options.MaxOutput},
 		patchOptions("apply_patch"),
+		&createFileTool{root: root, maxTargetSize: options.MaxAutoTargetSize, patch: patchOptions("create_file")},
 		&editFileTool{root: root, maxTargetSize: options.MaxAutoTargetSize, patch: patchOptions("edit_file")},
 		&replaceFileTool{root: root, maxTargetSize: options.MaxAutoTargetSize, patch: patchOptions("replace_file")},
 		&listCheckPlansTool{plans: plans},
@@ -191,6 +198,20 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 				&navigationTool{context: navigation, operation: navigationDocumentSymbols},
 			)
 		}
+	}
+	if scope.Profile == codingagent.CapabilityPlan || scope.Profile == codingagent.CapabilityPlanWorkspace {
+		allowed := map[string]bool{
+			"read_file": scope.Profile == codingagent.CapabilityPlanWorkspace, "list_files": scope.Profile == codingagent.CapabilityPlanWorkspace, "search_code": scope.Profile == codingagent.CapabilityPlanWorkspace,
+			"git_status": scope.Profile == codingagent.CapabilityPlanWorkspace, "git_diff": scope.Profile == codingagent.CapabilityPlanWorkspace, "git_log": scope.Profile == codingagent.CapabilityPlanWorkspace,
+			"git_branches": scope.Profile == codingagent.CapabilityPlanWorkspace, "git_show_commit": scope.Profile == codingagent.CapabilityPlanWorkspace,
+		}
+		readOnly := executables[:0]
+		for _, executable := range executables {
+			if allowed[executable.Definition().Name] {
+				readOnly = append(readOnly, executable)
+			}
+		}
+		executables = readOnly
 	}
 	for index := range executables {
 		executables[index] = withPermissionBoundary(executables[index], scope.PermissionMode, scope.PermissionGrants)
@@ -463,7 +484,8 @@ func (t *gitDiffTool) Execute(ctx context.Context, call tool.Call, _ tool.Progre
 }
 
 func runGit(ctx context.Context, root string, limit int, arguments ...string) (tool.Result, error) {
-	command := exec.CommandContext(ctx, "git", append([]string{"-C", root}, arguments...)...)
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", root, "--no-optional-locks"}, arguments...)...)
+	command.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	output := &boundedBuffer{limit: limit}
 	command.Stdout = output
 	command.Stderr = output

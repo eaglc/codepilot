@@ -14,12 +14,12 @@ import (
 func TestBuilderUsesTrustedScopeAndStableToolOrdering(t *testing.T) {
 	root := t.TempDir()
 	value, err := NewBuilder().BuildSystemPrompt(context.Background(), codingagent.PromptScope{
-		WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root, ToolNames: []string{"search_code", "replace_file", "edit_file", "read_file"},
+		WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root, ToolNames: []string{"search_code", "replace_file", "edit_file", "create_file", "read_file"},
 	})
 	if err != nil {
 		t.Fatalf("build prompt: %v", err)
 	}
-	if strings.Contains(value, `C:\repo`) || !strings.Contains(value, "edit_file, read_file, replace_file, search_code") || !strings.Contains(value, "Prefer edit_file") || !strings.Contains(value, "Use replace_file") || !strings.Contains(value, "worktree-relative") || !strings.Contains(value, "Never request or reveal credentials") {
+	if strings.Contains(value, `C:\repo`) || !strings.Contains(value, "create_file, edit_file, read_file, replace_file, search_code") || !strings.Contains(value, "Prefer edit_file") || !strings.Contains(value, "Use create_file") || !strings.Contains(value, "Use replace_file") || !strings.Contains(value, "worktree-relative") || !strings.Contains(value, "Never request or reveal credentials") {
 		t.Fatalf("prompt = %q", value)
 	}
 }
@@ -76,6 +76,29 @@ func TestBuilderLoadsOnlyBoundedScopedAgentsFilesAsUntrustedGuidance(t *testing.
 		if strings.Contains(systemPrompt, repositoryText) {
 			t.Fatalf("repository-derived value %q entered trusted system prompt: %s", repositoryText, systemPrompt)
 		}
+	}
+}
+
+func TestPlanPromptDoesNotEagerlyReadRepositoryGuidance(t *testing.T) {
+	root := t.TempDir()
+	initializePromptGit(t, root)
+	writeInstructionFixture(t, filepath.Join(root, "AGENTS.md"), "Repository-specific guidance")
+	scope := codingagent.PromptScope{
+		Profile: codingagent.CapabilityPlan, WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+		ToolNames: []string{"read_file", "request_user_input", "exit_plan_mode"},
+	}
+	prompt, err := NewBuilder().BuildSystemPrompt(context.Background(), scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Use workspace tools only when", "request_user_input", "1-3 focused questions", "selection_mode=single", "selection_mode=multiple", "unresolved material decisions remain", "completion_mode=deliverable"} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("Plan prompt does not contain %q: %s", expected, prompt)
+		}
+	}
+	messages, err := NewBuilder().BuildUntrustedContext(context.Background(), scope)
+	if err != nil || len(messages) != 0 {
+		t.Fatalf("Plan context eagerly loaded repository guidance: %#v, %v", messages, err)
 	}
 }
 

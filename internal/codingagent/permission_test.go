@@ -40,6 +40,28 @@ func TestPermissionGrantedRequiresExactToolActionPathAndActiveLifetime(t *testin
 	}
 }
 
+func TestPermissionGrantedSupportsCreateFileSessionScopeWithoutCrossToolAccess(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	grant := PermissionGrant{
+		ID: "grant_create", Scope: PermissionGrantSession, ToolName: "create_file", Action: PermissionActionModify, AllPaths: true,
+		SourceTurnID: "turn", SourceInterruptID: "approval", CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+	}
+	if err := ValidatePermissionGrants([]PermissionGrant{grant}); err != nil {
+		t.Fatalf("validate create grant: %v", err)
+	}
+	for _, target := range []string{"README.md", "cmd/app/main.go", "internal/config/config.go"} {
+		if !PermissionGranted([]PermissionGrant{grant}, PermissionRequest{ToolName: "create_file", Action: PermissionActionModify, Paths: []string{target}}, now) {
+			t.Fatalf("create_file session grant did not cover %q", target)
+		}
+	}
+	if PermissionGranted([]PermissionGrant{grant}, PermissionRequest{ToolName: "edit_file", Action: PermissionActionModify, Paths: []string{"README.md"}}, now) {
+		t.Fatal("create_file grant leaked to edit_file")
+	}
+	if PermissionGranted([]PermissionGrant{grant}, PermissionRequest{ToolName: "create_file", Action: PermissionActionModify, Paths: []string{"../secret"}}, now) {
+		t.Fatal("create_file grant accepted an unsafe path")
+	}
+}
+
 func TestDeriveSessionGrantRejectsUIClaimsAndInvalidDurableScope(t *testing.T) {
 	durable := agentsession.Snapshot{Records: []agentsession.Record{
 		{Type: agentsession.RecordOperationStarted, RunID: "turn", Lane: agentsession.MainLane},
@@ -82,6 +104,25 @@ func TestDeriveSessionGrantSupportsExactSingleFileEditScopes(t *testing.T) {
 	}
 }
 
+func TestDeriveSessionGrantSupportsToolScopedCreateFileAccess(t *testing.T) {
+	durable := agentsession.Snapshot{Records: []agentsession.Record{
+		{Type: agentsession.RecordOperationStarted, RunID: "turn", Lane: agentsession.MainLane},
+		{Type: agentsession.RecordToolStarted, RunID: "turn", Lane: agentsession.MainLane, Tool: &agentsession.ToolData{ToolCallID: "call", ToolName: "create_file"}},
+		{Type: agentsession.RecordInterruptRequested, RunID: "turn", Lane: agentsession.MainLane, Interrupt: &agentsession.InterruptData{
+			InterruptID: "approval", Kind: "approval", ToolCallID: "call",
+			Payload: json.RawMessage(`{"kind":"coding_patch_approval_v1","version":1,"files":["cmd/app/main.go"],"digest":"digest"}`),
+		}},
+	}}
+	request := ResumeTurnRequest{SessionID: "session", TurnID: "turn", InterruptID: "approval", Decision: ResolutionApproved, GrantScope: PermissionGrantSession}
+	grant, err := deriveSessionGrant(Session{ID: "session"}, durable, request, "turn", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("derive create_file grant: %v", err)
+	}
+	if grant.ToolName != "create_file" || grant.Action != PermissionActionModify || !grant.AllPaths || len(grant.Paths) != 0 {
+		t.Fatalf("create_file grant = %#v", grant)
+	}
+}
+
 func TestValidatePermissionGrantsRejectsUnboundedOrNonNormalizedAudit(t *testing.T) {
 	now := time.Now().UTC()
 	base := PermissionGrant{
@@ -100,6 +141,11 @@ func TestValidatePermissionGrantsRejectsUnboundedOrNonNormalizedAudit(t *testing
 	base.ExpiresAt = now.Add(25 * time.Hour)
 	if err := ValidatePermissionGrants([]PermissionGrant{base}); err == nil {
 		t.Fatal("unbounded grant lifetime was accepted")
+	}
+	base.ExpiresAt = now.Add(time.Hour)
+	base.AllPaths = true
+	if err := ValidatePermissionGrants([]PermissionGrant{base}); err == nil {
+		t.Fatal("all-path grant for a non-create tool was accepted")
 	}
 }
 

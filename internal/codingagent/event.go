@@ -52,6 +52,12 @@ const (
 	EventTurnCancelled             EventKind = "turn_cancelled"
 	EventTurnFailed                EventKind = "turn_failed"
 	EventPersistenceWarning        EventKind = "persistence_warning"
+	EventPlanStarted               EventKind = "plan_started"
+	EventPlanCreated               EventKind = "plan_created"
+	EventPlanRevised               EventKind = "plan_revised"
+	EventPlanApprovalRequested     EventKind = "plan_approval_requested"
+	EventPlanApproved              EventKind = "plan_approved"
+	EventPlanCancelled             EventKind = "plan_cancelled"
 )
 
 // AssistantOutputEvent contains only normalized display text.
@@ -99,6 +105,15 @@ type ApprovalEvent struct {
 	Decision  string
 }
 
+// PlanEvent identifies one immutable Plan revision without carrying raw internal state.
+type PlanEvent struct {
+	PlanID   PlanID
+	Version  uint64
+	Digest   string
+	Goal     string
+	Decision string
+}
+
 // WorkspaceEvent contains product workspace state without lower-level runtime objects.
 type WorkspaceEvent struct {
 	WorkspaceID string
@@ -133,6 +148,7 @@ type EventPayload struct {
 	Compaction      *CompactionEvent
 	Turn            *TurnEvent
 	Approval        *ApprovalEvent
+	Plan            *PlanEvent
 	Workspace       *WorkspaceEvent
 	Session         *SessionEvent
 	Error           *ErrorEvent
@@ -272,6 +288,12 @@ func (a *AgentEventAdapter) translate(source agent.Event) (Event, bool) {
 		if source.Interrupt != nil && source.Interrupt.Kind != "" {
 			reason = source.Interrupt.Kind
 		}
+		if source.Interrupt != nil && source.Interrupt.Kind == "plan_approval" {
+			return Event{Kind: EventPlanApprovalRequested, Payload: EventPayload{
+				Approval: &ApprovalEvent{RequestID: source.Interrupt.ID, Kind: source.Interrupt.Kind},
+				Turn:     &TurnEvent{Status: "interrupted", Reason: reason},
+			}}, true
+		}
 		if source.Interrupt != nil && source.Interrupt.Kind == "approval" {
 			return Event{Kind: EventApprovalRequested, Payload: EventPayload{
 				Approval: &ApprovalEvent{RequestID: source.Interrupt.ID, Kind: source.Interrupt.Kind},
@@ -280,6 +302,9 @@ func (a *AgentEventAdapter) translate(source agent.Event) (Event, bool) {
 		}
 		return Event{Kind: EventTurnInterrupted, Payload: EventPayload{Turn: &TurnEvent{Status: "interrupted", Reason: reason}}}, true
 	case agent.EventRunResumed:
+		if source.Interrupt != nil && source.Interrupt.Kind == "plan_approval" {
+			return Event{Kind: EventTurnResumed, Payload: EventPayload{Turn: &TurnEvent{Status: "running"}}}, true
+		}
 		if source.Interrupt != nil && source.Interrupt.Kind == "approval" {
 			return Event{Kind: EventApprovalResolved, Payload: EventPayload{
 				Approval: &ApprovalEvent{RequestID: source.Interrupt.ID, Kind: source.Interrupt.Kind, Decision: source.Interrupt.Decision},
@@ -300,6 +325,9 @@ func terminalProductEvent(source agent.Event, failed bool) (Event, bool) {
 	terminal := source.Terminal
 	if terminal == nil {
 		return Event{}, false
+	}
+	if terminal.Status == "handed_off" {
+		return Event{Kind: EventTurnProgressChanged, Payload: EventPayload{Turn: &TurnEvent{Status: terminal.Status, Reason: boundedUTF8(terminal.Reason, 1024), Steps: terminal.Steps}}}, true
 	}
 	kind := EventTurnCompleted
 	if terminal.Status == "aborted" {
