@@ -38,20 +38,21 @@ import (
 
 // Options contains process-owned CodePilot paths and terminal streams.
 type Options struct {
-	WorkingDirectory    string
-	ConfigDir           string
-	StateDir            string
-	ProviderProfile     string
-	Model               string
-	Permission          string
-	SensitivePaths      []string
-	TrustWorkspace      bool
-	RelocateWorktree    codingagent.WorktreeID
-	SkipRelocation      bool
-	DisableProductTurns bool
-	DisablePlanMode     bool
-	Input               io.Reader
-	Output              io.Writer
+	WorkingDirectory       string
+	ConfigDir              string
+	StateDir               string
+	ProviderProfile        string
+	Model                  string
+	Permission             string
+	SensitivePaths         []string
+	TrustWorkspace         bool
+	RelocateWorktree       codingagent.WorktreeID
+	SkipRelocation         bool
+	DisableProductTurns    bool
+	DisablePlanMode        bool
+	DisablePlanSuggestions bool
+	Input                  io.Reader
+	Output                 io.Writer
 }
 
 // Application owns the composed product lifecycle.
@@ -190,6 +191,9 @@ func New(ctx context.Context, options Options) (*Application, error) {
 	}
 	if options.DisablePlanMode {
 		features.PlanMode = false
+	}
+	if options.DisablePlanSuggestions {
+		features.PlanSuggestions = false
 	}
 	service, err := codingagent.NewService(codingagent.Dependencies{
 		Sessions: productStore, Turns: productStore, Plans: productStore, AgentSessions: agentSessions, Worktrees: workspaceManager, Workspaces: workspaceManager,

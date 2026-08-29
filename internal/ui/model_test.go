@@ -1303,6 +1303,39 @@ func TestPlanApprovalSupportsRevisionFeedbackAtSingleUserBoundary(t *testing.T) 
 	}
 }
 
+func TestAgentPlanEntrySuggestionRequiresExplicitUserChoice(t *testing.T) {
+	bridge, _ := NewEventBridge(4)
+	snapshot := codingagent.Snapshot{
+		Session: codingagent.Session{ID: "session", Title: "repo"}, PendingPlanEntryApproval: true,
+		ActiveTurn: &codingagent.TurnSnapshot{ID: "turn", Phase: codingagent.TurnPhaseAwaitingPlanEntryApproval, Status: codingagent.TurnInterrupted},
+		PendingInterrupts: []codingagent.PendingInterrupt{{
+			TurnID: "turn", InterruptID: "plan-entry", Kind: "plan_entry_approval",
+			Summary:         "This migration crosses public interfaces and needs a reviewed sequence.",
+			PlanEntryReason: codingagent.PlanEntryMigrationCompatibility,
+		}},
+	}
+	client := &approvalClient{fakeClient: fakeClient{snapshot: snapshot}}
+	model, err := NewModel(context.Background(), client, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := model.View().Content
+	for _, expected := range []string{"Plan mode suggested", "This migration crosses public interfaces", "Enter Plan mode", "Continue Direct", "Cancel task"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("Plan entry view does not contain %q: %s", expected, view)
+		}
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if command == nil {
+		t.Fatal("Continue Direct choice did not create a decision command")
+	}
+	_ = command()
+	if client.calls != 1 || client.request.Decision != codingagent.ResolutionDenied || client.request.GrantScope != codingagent.PermissionGrantOnce {
+		t.Fatalf("Plan entry decision = %#v calls=%d", client.request, client.calls)
+	}
+}
+
 func TestPlanClarificationOffersRecommendedChoicesAndFreeFormOther(t *testing.T) {
 	bridge, _ := NewEventBridge(4)
 	prompt := codingagent.ClarificationPrompt{Questions: []codingagent.ClarificationRequest{

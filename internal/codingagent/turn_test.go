@@ -115,3 +115,52 @@ func TestValidateTurnTransitionAllowsHandoffContinuationAndRejectsRollback(t *te
 		t.Fatal("terminal Turn rollback was accepted")
 	}
 }
+
+func TestValidateTurnTransitionKeepsPlanEntryConsentSeparateFromPlanning(t *testing.T) {
+	turn := validTestTurn()
+	turn.Status = TurnRunning
+	turn.Runs[0].Status = RunBindingRunning
+	turn.Runs[0].StartedAt = turn.CreatedAt
+	suggestion := PlanEntrySuggestion{
+		ReasonCode:  PlanEntryCrossModuleChange,
+		Summary:     "The change crosses the coordinator and UI boundaries.",
+		SuggestedAt: turn.CreatedAt.Add(time.Second),
+	}
+	suggestion.Digest = computePlanEntryDigest(suggestion.ReasonCode, suggestion.Summary)
+	waiting := turn
+	waiting.Phase = TurnPhaseAwaitingPlanEntryApproval
+	waiting.PlanEntrySuggestion = &suggestion
+	waiting.UpdatedAt = suggestion.SuggestedAt
+	waiting.Revision++
+	if err := ValidateTurnTransition(turn, waiting); err != nil {
+		t.Fatalf("Direct-to-entry-approval transition rejected: %v", err)
+	}
+
+	declined := waiting
+	declined.Phase = TurnPhaseDirect
+	declined.DeclinedPlanReasons = []PlanEntryReasonCode{suggestion.ReasonCode}
+	declined.UpdatedAt = waiting.UpdatedAt.Add(time.Second)
+	declined.Revision++
+	if err := ValidateTurnTransition(waiting, declined); err != nil {
+		t.Fatalf("declined Plan entry transition rejected: %v", err)
+	}
+
+	handedOff := waiting
+	handedOff.Runs = append([]RunBinding(nil), waiting.Runs...)
+	handedOff.Runs[0].Status = RunBindingHandedOff
+	handedOff.Runs[0].FinishedAt = waiting.UpdatedAt.Add(time.Second)
+	handedOff.UpdatedAt = handedOff.Runs[0].FinishedAt
+	handedOff.Revision++
+	if err := ValidateTurnTransition(waiting, handedOff); err != nil {
+		t.Fatalf("approved Plan entry handoff rejected: %v", err)
+	}
+	planning := handedOff
+	planning.Phase = TurnPhasePlanning
+	planning.Runs = append([]RunBinding(nil), handedOff.Runs...)
+	planning.Runs = append(planning.Runs, RunBinding{RunID: "run-plan", Phase: TurnPhasePlanning, Profile: CapabilityPlan, Status: RunBindingPending})
+	planning.UpdatedAt = handedOff.UpdatedAt.Add(time.Second)
+	planning.Revision++
+	if err := ValidateTurnTransition(handedOff, planning); err != nil {
+		t.Fatalf("approved entry-to-Planning transition rejected: %v", err)
+	}
+}

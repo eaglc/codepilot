@@ -173,7 +173,11 @@ func (t *exitPlanModeTool) Resume(ctx context.Context, _ tool.Call, interrupt to
 	if err != nil {
 		return tool.Result{}, fmt.Errorf("resume Coding plan approval: load Product Turn: %w", err)
 	}
-	if turn.Phase != TurnPhaseAwaitingPlanApproval || turn.PlanID != payload.PlanID || turn.PlanVersion != payload.Revision || turn.PlanDigest != payload.Digest {
+	expectedPhase := turn.Phase == TurnPhaseAwaitingPlanApproval
+	if resolution.Status == tool.ResultDenied {
+		expectedPhase = turn.Phase == TurnPhasePlanning
+	}
+	if !expectedPhase || turn.PlanID != payload.PlanID || turn.PlanVersion != payload.Revision || turn.PlanDigest != payload.Digest {
 		return tool.Result{}, errors.New("resume Coding plan approval: decision does not match the current Plan revision")
 	}
 	plan, err := t.plans.LoadPlan(ctx, payload.PlanID, payload.Revision)
@@ -187,11 +191,13 @@ func (t *exitPlanModeTool) Resume(ctx context.Context, _ tool.Call, interrupt to
 			message = "The user accepted this exact Plan as the requested deliverable. Return control to the coordinator and finish without starting an execution run."
 		}
 		resolution.Content = []llm.Content{{Type: llm.ContentText, Text: message}}
+		resolution.Details = json.RawMessage(`{"decision":"approved"}`)
 		return resolution, nil
 	case tool.ResultDenied:
 		if len(resolution.Content) == 0 {
 			resolution.Content = []llm.Content{{Type: llm.ContentText, Text: "The user requested a revised Plan. Continue read-only planning and submit a new version."}}
 		}
+		resolution.Details = json.RawMessage(`{"decision":"declined"}`)
 		return resolution, nil
 	case tool.ResultCancelled:
 		return tool.Result{Status: tool.ResultCompleted, Content: []llm.Content{{Type: llm.ContentText, Text: "The user cancelled the Plan task. Return control to the coordinator without execution."}}, Details: json.RawMessage(`{"decision":"cancelled"}`)}, nil

@@ -59,7 +59,8 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	relocateWorktree := flags.String("relocate-worktree", "", "explicitly relocate an unavailable stored worktree ID to --workspace")
 	skipRelocation := flags.Bool("skip-relocation", false, "open --workspace as a new binding instead of a detected relocation")
 	disableProductTurns := flags.Bool("disable-product-turns", false, "disable Product Turn persistence and use the legacy Direct execution path")
-	disablePlanMode := flags.Bool("disable-plan-mode", false, "disable starting new explicit Plan tasks")
+	disablePlanMode := flags.Bool("disable-plan-mode", false, "disable starting new Plan tasks, including Agent suggestions")
+	disablePlanSuggestions := flags.Bool("disable-plan-suggestions", false, "disable Agent suggestions to enter Plan mode")
 	if err := flags.Parse(arguments); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -87,20 +88,21 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	// Preserve the original reader so Bubble Tea can recognize an *os.File and
 	// use native Windows console input for arrows and other special keys.
 	options := app.Options{
-		WorkingDirectory:    workingDirectory,
-		ConfigDir:           strings.TrimSpace(*configDir),
-		StateDir:            strings.TrimSpace(*stateDir),
-		ProviderProfile:     strings.TrimSpace(*providerProfile),
-		Model:               strings.TrimSpace(*modelID),
-		Permission:          strings.TrimSpace(*permission),
-		SensitivePaths:      append([]string(nil), sensitivePaths...),
-		TrustWorkspace:      *trustWorkspace,
-		RelocateWorktree:    codingagent.WorktreeID(strings.TrimSpace(*relocateWorktree)),
-		SkipRelocation:      *skipRelocation,
-		DisableProductTurns: *disableProductTurns,
-		DisablePlanMode:     *disablePlanMode,
-		Input:               stdin,
-		Output:              stdout,
+		WorkingDirectory:       workingDirectory,
+		ConfigDir:              strings.TrimSpace(*configDir),
+		StateDir:               strings.TrimSpace(*stateDir),
+		ProviderProfile:        strings.TrimSpace(*providerProfile),
+		Model:                  strings.TrimSpace(*modelID),
+		Permission:             strings.TrimSpace(*permission),
+		SensitivePaths:         append([]string(nil), sensitivePaths...),
+		TrustWorkspace:         *trustWorkspace,
+		RelocateWorktree:       codingagent.WorktreeID(strings.TrimSpace(*relocateWorktree)),
+		SkipRelocation:         *skipRelocation,
+		DisableProductTurns:    *disableProductTurns,
+		DisablePlanMode:        *disablePlanMode,
+		DisablePlanSuggestions: *disablePlanSuggestions,
+		Input:                  stdin,
+		Output:                 stdout,
 	}
 	application, err := app.New(ctx, options)
 	input := bufio.NewReader(stdin)

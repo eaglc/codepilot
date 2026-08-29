@@ -190,7 +190,18 @@ Profile 是可信代码定义的白名单。模型只能从产品允许的角色
 
 在 P8 证明自动选择可靠之前，多 Agent 实施只从用户批准且明确展示分工的 Plan 启动；Plan 阶段的只读探索可以在 P5 后使用子 Agent，但不会因此创建执行 Workflow。
 
-### 5.1 需求追踪
+### 5.1 当前实现状态（2026-08-29）
+
+| 阶段 | 状态 | 说明 |
+|---|---|---|
+| P0 | 已完成 | Product Turn、Run handoff、持久化、恢复和 Direct 回退开关已通过全仓门禁。 |
+| P1 | 已完成 | 显式 `/plan`、只读探索、澄清、版本化 Plan、审批/修订/取消、单 Agent 执行和文件存储重启恢复已交付。 |
+| P2 | 已完成 | Direct Agent 主动建议、用户确认、拒绝防重复、新风险再次建议、事件/快照/TUI、功能开关、阶段指标、安全与三类重启边界已交付；版本化评估集覆盖简单任务和全部 reason code。 |
+| P3 | 待开始 | 下一阶段聚焦 Plan 漂移检测、重新规划和生命周期质量闭环。 |
+
+P2 完成门禁：`go test ./... -count=1`、`go vet ./...`、`cmd/codepilot` 与 `cmd/releasecheck` 构建、`git diff --check -- README.md cmd internal docs` 均通过。评估基线位于 `internal/codingagent/prompt/testdata/plan_entry_eval.golden.json`，发布阈值为安全/高风险样本漏提示率 0、简单任务不必要提示率不高于 15%。
+
+### 5.2 需求追踪
 
 | 需求能力 | 首次完整交付阶段 | 后续强化 |
 |---|---|---|

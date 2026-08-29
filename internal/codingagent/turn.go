@@ -28,6 +28,9 @@ type TurnPhase string
 const (
 	// TurnPhaseDirect executes a request with the existing direct capabilities.
 	TurnPhaseDirect TurnPhase = "direct"
+	// TurnPhaseAwaitingPlanEntryApproval waits for the user to accept or reject
+	// an Agent suggestion to switch the current Direct task into Plan mode.
+	TurnPhaseAwaitingPlanEntryApproval TurnPhase = "awaiting_plan_entry_approval"
 	// TurnPhasePlanning performs read-only exploration and Plan authoring.
 	TurnPhasePlanning TurnPhase = "planning"
 	// TurnPhaseAwaitingPlanApproval waits for a decision on one exact Plan revision.
@@ -101,14 +104,19 @@ type Turn struct {
 	Status      TurnStatus        `json:"status"`
 	Strategy    ExecutionStrategy `json:"strategy"`
 	Runs        []RunBinding      `json:"runs,omitempty"`
-	PlanID      PlanID            `json:"plan_id,omitempty"`
-	PlanVersion uint64            `json:"plan_version,omitempty"`
-	PlanDigest  string            `json:"plan_digest,omitempty"`
-	WorkflowID  string            `json:"workflow_id,omitempty"`
-	Revision    uint64            `json:"revision"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-	CompletedAt time.Time         `json:"completed_at,omitempty"`
+	// PlanEntrySuggestion records the latest bounded Agent proposal to enter
+	// Plan mode. The durable Agent interrupt remains the authority for a pending
+	// user decision; this copy supports validation, recovery, and audit.
+	PlanEntrySuggestion *PlanEntrySuggestion  `json:"plan_entry_suggestion,omitempty"`
+	DeclinedPlanReasons []PlanEntryReasonCode `json:"declined_plan_reasons,omitempty"`
+	PlanID              PlanID                `json:"plan_id,omitempty"`
+	PlanVersion         uint64                `json:"plan_version,omitempty"`
+	PlanDigest          string                `json:"plan_digest,omitempty"`
+	WorkflowID          string                `json:"workflow_id,omitempty"`
+	Revision            uint64                `json:"revision"`
+	CreatedAt           time.Time             `json:"created_at"`
+	UpdatedAt           time.Time             `json:"updated_at"`
+	CompletedAt         time.Time             `json:"completed_at,omitempty"`
 }
 
 // ActiveRun returns the last non-terminal Run binding, if any.
@@ -148,6 +156,9 @@ func ValidateTurn(value Turn) error {
 	}
 	if value.EntrySource == TurnEntryUserPlan && value.Phase == TurnPhaseDirect {
 		return errors.New("User Plan entry cannot use the Direct phase")
+	}
+	if err := validateTurnPlanEntry(value); err != nil {
+		return err
 	}
 	if err := validateTurnPlanReference(value); err != nil {
 		return err
@@ -268,6 +279,9 @@ func ValidateTurnTransition(previous, next Turn) error {
 	if err := validateTurnPlanTransition(previous, next); err != nil {
 		return err
 	}
+	if err := validateTurnPlanEntryTransition(previous, next); err != nil {
+		return err
+	}
 	if next.Revision != previous.Revision+1 {
 		return errors.New("Coding turn revision must advance exactly once")
 	}
@@ -301,7 +315,7 @@ func ValidateTurnTransition(previous, next Turn) error {
 
 func validTurnPhase(value TurnPhase) bool {
 	switch value {
-	case TurnPhaseDirect, TurnPhasePlanning, TurnPhaseAwaitingPlanApproval, TurnPhaseExecuting:
+	case TurnPhaseDirect, TurnPhaseAwaitingPlanEntryApproval, TurnPhasePlanning, TurnPhaseAwaitingPlanApproval, TurnPhaseExecuting:
 		return true
 	default:
 		return false
@@ -312,7 +326,7 @@ func validRunPhaseProfile(phase TurnPhase, profile CapabilityProfile) bool {
 	switch phase {
 	case TurnPhasePlanning:
 		return profile == CapabilityPlan || profile == CapabilityPlanWorkspace
-	case TurnPhaseDirect, TurnPhaseExecuting:
+	case TurnPhaseDirect, TurnPhaseAwaitingPlanEntryApproval, TurnPhaseExecuting:
 		return profile == CapabilityDirect
 	default:
 		return false
@@ -320,6 +334,9 @@ func validRunPhaseProfile(phase TurnPhase, profile CapabilityProfile) bool {
 }
 
 func latestPhaseMatchesTurn(turnPhase, runPhase TurnPhase) bool {
+	if turnPhase == TurnPhaseAwaitingPlanEntryApproval {
+		return runPhase == TurnPhaseDirect
+	}
 	if turnPhase == TurnPhaseAwaitingPlanApproval {
 		return runPhase == TurnPhasePlanning
 	}
@@ -331,6 +348,10 @@ func validTurnPhaseTransition(previous, next TurnPhase) bool {
 		return true
 	}
 	switch previous {
+	case TurnPhaseDirect:
+		return next == TurnPhaseAwaitingPlanEntryApproval
+	case TurnPhaseAwaitingPlanEntryApproval:
+		return next == TurnPhaseDirect || next == TurnPhasePlanning
 	case TurnPhasePlanning:
 		return next == TurnPhaseAwaitingPlanApproval
 	case TurnPhaseAwaitingPlanApproval:

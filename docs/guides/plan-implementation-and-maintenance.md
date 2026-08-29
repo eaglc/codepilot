@@ -12,10 +12,16 @@
 这不是“让模型先回复一段计划文本”，而是一套由产品状态机、工具权限和持久化记录共同约束的流程。
 
 ```text
-/plan <需求>
-  |
-  v
-planning（初始规划，不能读工作区）
+普通输入 -> direct
+              |
+              | enter_plan_mode（仅建议）
+              v
+        awaiting_plan_entry_approval
+          | 进入 Plan       | 继续 Direct      | 取消
+          v                 v                  v
+       planning           direct            cancelled
+
+/plan <需求> ------------> planning（初始规划，不能读工作区）
   |
   |-- 若任务依赖仓库 --> request_workspace_context
   |                         |
@@ -51,6 +57,10 @@ m.submitTurn(request, codingagent.TurnModePlan)
 ```
 
 普通聊天输入则使用默认的 `TurnModeDirect`。UI 不直接操作 Plan、工具或 Agent；它只提交请求，并把后端返回的 Snapshot 和中断渲染出来。
+
+Direct Agent 也可以调用 `enter_plan_mode` 提出进入建议。该工具只接受白名单 reason code 和一行简短摘要，将 Turn 持久化为 `awaiting_plan_entry_approval`，并产生可恢复的产品确认中断。UI 明确提供“进入 Plan”“继续 Direct”“取消任务”：批准后才通过 control handoff 创建只读 Planning Run；拒绝会记录该 reason code 并恢复原 Direct Run，不会追加第二条用户消息；同一理由不能循环提示，只有不同的新重大风险才可再次建议。提示词、仓库内容和工具结果都不能代替用户确认或扩大权限。
+
+`--disable-plan-suggestions` 只阻止新的 Agent 建议，显式 `/plan` 仍可用；`--disable-plan-mode` 同时阻止两种新入口。两个开关都不妨碍恢复已经持久化的等待决策。
 
 ### 第二步：Service 创建 Turn 和第一个 Run
 
@@ -368,9 +378,10 @@ Plan 存储由 `PlanRepository` 抽象定义（`internal/codingagent/repository.
 
 - `ActivePlan`：当前或最近一个 Plan；
 - `PendingPlanApproval`：是否正等待 Plan 审批；
+- `PendingPlanEntryApproval`：是否正等待用户决定 Agent 的 Plan 建议；
 - `PlanHistory`：版本历史摘要。
 
-`publishPlanEvent` 还会发布 started、created、revised、approved、cancelled 等 Plan 事件。事件载荷只带必要标识和经过敏感信息脱敏的目标文本。
+`publishPlanEvent` 会发布 started、created、revised、approved、cancelled 等 Plan 事件；Plan 建议另有 suggested、approved、declined、cancelled 事件。事件载荷只带必要标识和经过敏感信息脱敏的目标文本。`SessionMetrics.ByPhase` 根据可信 Run binding 分别聚合 Direct、Planning 和 Executing 的耗时、token、cost 与失败数，避免把同一用户 Turn 的多个 Run 误算为多个请求。
 
 ## 维护时从哪里改
 
@@ -379,6 +390,7 @@ Plan 存储由 `PlanRepository` 抽象定义（`internal/codingagent/repository.
 | 增加 Plan 字段 | `plan.go` | `PlanSubmission`、JSON Schema、规范化、摘要、快照、UI、文件兼容和测试 |
 | 增加新的规划工具 | `prepareRunEnvironment`、`tools/factory.go` | 工具在两个 Plan profile 中的可见性，绝不能意外授予副作用能力 |
 | 改变审批行为 | `plan_control.go`、`service.go` | `Turn` 状态转换、恢复逻辑、UI 文案和旧中断兼容 |
+| 改变 Agent 进入建议 | `plan_entry.go`、Direct Prompt | reason code 白名单、拒绝防重复、控制工具独占性、事件/快照、崩溃恢复和评估集 |
 | 增加执行策略 | `turn.go`、`plan.go`、协调器 | 当前策略校验明确只接受 `single`；不能只放宽 enum 而不实现调度 |
 | 改变 Plan 存储 | `codingstore/file/plan.go` | 不可变性、顺序版本、摘要验证、兼容读和崩溃恢复 |
 | 改变界面内容 | `ui/plan.go`、`ui/approval_picker.go` | Service 的 `PlanSnapshot` 投影和 UI 测试 |
@@ -416,9 +428,11 @@ go test ./internal/codingagent ./internal/codingagent/tools ./internal/codingsto
 重点阅读和扩展以下测试：
 
 - `internal/codingagent/plan_test.go`：结构、路径、依赖、摘要与兼容性。
-- `internal/codingagent/service_test.go`：工作区 handoff、审批、修订、交付型 Plan 和同一 Turn 内执行。
+- `internal/codingagent/service_test.go`：主动进入、拒绝防重复、工作区 handoff、审批、修订、交付型 Plan 和同一 Turn 内执行。
+- `internal/codingagent/plan_restart_e2e_test.go`、`recovery_control_test.go`：文件存储重启和批准/取消 handoff 的恢复边界。
+- `internal/codingagent/prompt/testdata/plan_entry_eval.golden.json`：简单任务与高风险任务的版本化建议评估基线和发布阈值。
 - `internal/codingagent/tools/factory_test.go`：规划 profile 的只读工具边界。
 - `internal/codingstore/repository_contract_test.go`：Plan 版本存储契约。
 - `internal/ui/model_test.go`：Plan 命令、审批及修订输入。
 
-修改时的底线是：**规划期不能产生副作用；审批必须精确绑定一个不可变版本；批准执行后仍必须经过普通权限控制；恢复后不得把旧审批应用到新版本。**
+修改时的底线是：**Agent 只能建议、不能自行切换；规划期不能产生副作用；审批必须精确绑定一个不可变版本；批准执行后仍必须经过普通权限控制；拒绝后不得循环提示；恢复后不得把旧审批应用到新版本。**

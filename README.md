@@ -8,6 +8,7 @@ CodePilot is a terminal AI coding agent for working with a local Git repository.
 - Persistent sessions with create, switch, fork, rename, archive, and restore support.
 - OpenAI, DeepSeek, Ollama, and custom OpenAI-compatible providers.
 - Safe file reading, search, exact or whole-file editing, multi-file patches, Git inspection, and approved checks.
+- Explicit `/plan` tasks plus Agent-suggested Plan entry with a user confirmation boundary and read-only planning tools.
 - `read-only`, `ask`, and `auto-edit` permission modes.
 - Optional Go and Python language-server navigation.
 
@@ -54,6 +55,7 @@ Common commands:
 /permissions
 /session
 /workspace
+/plan [request]
 /rename <title>
 /fork
 /clear
@@ -63,6 +65,8 @@ Common commands:
 ```
 
 `/fork` opens the conversation history so no internal entry ID is required. `/clear` starts a new persisted session without deleting the previous session or changing worktree files.
+
+Plan mode is scoped to one task. An Agent suggestion offers **Enter Plan mode**, **Continue Direct**, or **Cancel task**; it never switches modes or grants write permission without the user's choice. `--disable-plan-suggestions` disables new Agent suggestions while preserving explicit `/plan`; `--disable-plan-mode` disables both new Plan entry paths while keeping previously persisted Plan decisions recoverable.
 
 ## Permissions and safety
 

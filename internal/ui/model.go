@@ -953,7 +953,7 @@ func eventNeedsSnapshot(kind codingagent.EventKind) bool {
 
 func (m *Model) pendingApproval() *codingagent.PendingInterrupt {
 	for index := range m.snapshot.PendingInterrupts {
-		if m.snapshot.PendingInterrupts[index].Kind == "approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_approval" {
+		if m.snapshot.PendingInterrupts[index].Kind == "approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_entry_approval" {
 			return &m.snapshot.PendingInterrupts[index]
 		}
 	}

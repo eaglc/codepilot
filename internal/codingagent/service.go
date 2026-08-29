@@ -33,13 +33,14 @@ type ContinuationRunner interface {
 
 // FeatureFlags controls independently reversible product capabilities.
 type FeatureFlags struct {
-	ProductTurns bool
-	PlanMode     bool
+	ProductTurns    bool
+	PlanMode        bool
+	PlanSuggestions bool
 }
 
 // DefaultFeatureFlags returns the current stable product defaults.
 func DefaultFeatureFlags() FeatureFlags {
-	return FeatureFlags{ProductTurns: true, PlanMode: true}
+	return FeatureFlags{ProductTurns: true, PlanMode: true, PlanSuggestions: true}
 }
 
 // ToolScope contains immutable trusted Coding facts captured before model-controlled execution.
@@ -133,6 +134,10 @@ func NewService(deps Dependencies) (*Service, error) {
 	}
 	if !features.ProductTurns {
 		features.PlanMode = false
+		features.PlanSuggestions = false
+	}
+	if !features.PlanMode {
+		features.PlanSuggestions = false
 	}
 	if deps.Sessions == nil || (features.ProductTurns && deps.Turns == nil) || (features.PlanMode && deps.Plans == nil) || deps.AgentSessions == nil || deps.Worktrees == nil || deps.Agent == nil || deps.Tools == nil || deps.Prompts == nil || deps.Events == nil {
 		return nil, errors.New("create Coding Agent service: dependencies are incomplete")
@@ -334,6 +339,11 @@ func (s *Service) StartTurn(ctx context.Context, request TurnRequest) (TurnResul
 			return productResult, fmt.Errorf("start Coding Agent turn: publish Plan creation: %w", err)
 		}
 	}
+	if request.Mode == TurnModeDirect && turn.Phase == TurnPhaseAwaitingPlanEntryApproval && turn.PlanEntrySuggestion != nil {
+		if err := s.publishPlanEntryEvent(context.WithoutCancel(ctx), product, turn, *turn.PlanEntrySuggestion, EventPlanEntrySuggested, ""); err != nil {
+			return productResult, fmt.Errorf("start Coding Agent turn: publish Plan entry suggestion: %w", err)
+		}
+	}
 	if result.Status == agent.RunHandedOff && turn.Status == TurnRunning && turn.Phase == TurnPhasePlanning && turn.Runs[len(turn.Runs)-1].Profile == CapabilityPlan {
 		if touchErr != nil {
 			return productResult, fmt.Errorf("start Coding Agent turn: update product session: %w", touchErr)
@@ -426,8 +436,30 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 		return TurnResult{}, errors.New("resume Coding Agent turn: interrupt is not the current durable decision boundary")
 	}
 	planProfile := binding.Profile == CapabilityPlan || binding.Profile == CapabilityPlanWorkspace
-	planApproval := s.features.ProductTurns && pendingKind == "plan_approval" && turn.Phase == TurnPhaseAwaitingPlanApproval && planProfile
+	planApproval := s.features.ProductTurns && pendingKind == "plan_approval" && (turn.Phase == TurnPhaseAwaitingPlanApproval || turn.Phase == TurnPhasePlanning) && planProfile
+	planEntryApproval := s.features.ProductTurns && pendingKind == planEntryApprovalKind && (turn.Phase == TurnPhaseAwaitingPlanEntryApproval || turn.Phase == TurnPhaseDirect) && binding.Profile == CapabilityDirect
 	clarification := s.features.ProductTurns && pendingKind == clarificationInterruptKind && turn.Phase == TurnPhasePlanning && planProfile
+	if pendingKind == planEntryApprovalKind && !planEntryApproval {
+		return TurnResult{}, errors.New("resume Coding Agent turn: Plan entry suggestion is not attached to the active Direct Run")
+	}
+	if planEntryApproval && turn.PlanEntrySuggestion == nil {
+		return TurnResult{}, errors.New("resume Coding Agent turn: durable Plan entry suggestion is unavailable")
+	}
+	if planApproval && turn.Phase == TurnPhasePlanning && request.Decision != ResolutionDenied {
+		return TurnResult{}, errors.New("resume Coding Agent turn: only the already-recorded Plan revision request can continue")
+	}
+	if planEntryApproval && turn.Phase == TurnPhaseDirect && request.Decision != ResolutionDenied {
+		return TurnResult{}, errors.New("resume Coding Agent turn: only the already-recorded Direct continuation can proceed")
+	}
+	if planEntryApproval && turn.Phase == TurnPhaseDirect {
+		declined := false
+		for _, reason := range turn.DeclinedPlanReasons {
+			declined = declined || reason == turn.PlanEntrySuggestion.ReasonCode
+		}
+		if !declined {
+			return TurnResult{}, errors.New("resume Coding Agent turn: Direct continuation is missing its durable decline record")
+		}
+	}
 	if pendingKind == clarificationInterruptKind && !clarification {
 		return TurnResult{}, errors.New("resume Coding Agent turn: clarification is not attached to the active Planning Run")
 	}
@@ -439,10 +471,24 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 			return TurnResult{}, errors.New("resume Coding Agent turn: clarification requires one selected or free-form answer")
 		}
 	}
-	if planApproval && request.GrantScope == PermissionGrantSession {
-		return TurnResult{}, errors.New("resume Coding Agent turn: Plan approval cannot create a permission grant")
+	if (planApproval || planEntryApproval) && request.GrantScope == PermissionGrantSession {
+		return TurnResult{}, errors.New("resume Coding Agent turn: Plan decisions cannot create a permission grant")
 	}
-	if planApproval && request.Decision == ResolutionDenied {
+	entrySuggestion := PlanEntrySuggestion{}
+	if planEntryApproval && turn.PlanEntrySuggestion != nil {
+		entrySuggestion = *turn.PlanEntrySuggestion
+	}
+	if planEntryApproval && request.Decision == ResolutionDenied && turn.Phase == TurnPhaseAwaitingPlanEntryApproval {
+		expected := turn.Revision
+		turn.Phase = TurnPhaseDirect
+		turn.DeclinedPlanReasons = append(turn.DeclinedPlanReasons, entrySuggestion.ReasonCode)
+		turn.UpdatedAt = time.Now().UTC()
+		turn.Revision++
+		if err := s.deps.Turns.SaveTurn(ctx, turn, expected); err != nil {
+			return TurnResult{}, fmt.Errorf("resume Coding Agent turn: decline Plan entry: %w", err)
+		}
+	}
+	if planApproval && request.Decision == ResolutionDenied && turn.Phase == TurnPhaseAwaitingPlanApproval {
 		expected := turn.Revision
 		turn.Phase = TurnPhasePlanning
 		turn.UpdatedAt = time.Now().UTC()
@@ -517,6 +563,10 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 		result.Status = agent.RunAborted
 		result.Reason = "plan_cancelled"
 	}
+	if planEntryApproval && request.Decision == ResolutionCancelled && result.Status == agent.RunHandedOff {
+		result.Status = agent.RunAborted
+		result.Reason = "plan_entry_cancelled"
+	}
 	if planApproval && request.Decision == ResolutionApproved && planCompletion == PlanCompletionDeliverable && result.Status == agent.RunHandedOff {
 		result.Status = agent.RunCompleted
 		result.Reason = "plan_delivered"
@@ -556,6 +606,32 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 				return productResult, fmt.Errorf("resume Coding Agent turn: publish Plan decision: %w", err)
 			}
 		}
+	}
+	if planEntryApproval {
+		kind := EventPlanEntryDeclined
+		switch request.Decision {
+		case ResolutionApproved:
+			kind = EventPlanEntryApproved
+		case ResolutionCancelled:
+			kind = EventPlanEntryCancelled
+		}
+		if err := s.publishPlanEntryEvent(context.WithoutCancel(ctx), product, turn, entrySuggestion, kind, string(request.Decision)); err != nil {
+			return productResult, fmt.Errorf("resume Coding Agent turn: publish Plan entry decision: %w", err)
+		}
+		if request.Decision == ResolutionDenied && turn.Phase == TurnPhaseAwaitingPlanEntryApproval && turn.PlanEntrySuggestion != nil && turn.PlanEntrySuggestion.Digest != entrySuggestion.Digest {
+			if err := s.publishPlanEntryEvent(context.WithoutCancel(ctx), product, turn, *turn.PlanEntrySuggestion, EventPlanEntrySuggested, ""); err != nil {
+				return productResult, fmt.Errorf("resume Coding Agent turn: publish renewed Plan entry suggestion: %w", err)
+			}
+		}
+	}
+	if planEntryApproval && request.Decision == ResolutionApproved {
+		if result.Status != agent.RunHandedOff || turn.Status != TurnRunning {
+			return productResult, errors.New("resume Coding Agent turn: approved Plan entry did not reach a durable control handoff")
+		}
+		if err := s.publishPlanEvent(context.WithoutCancel(ctx), product, turn, EventPlanStarted, "agent_suggestion"); err != nil {
+			return productResult, fmt.Errorf("resume Coding Agent turn: publish Plan start: %w", err)
+		}
+		return s.continueTurnLocked(ctx, product, turn)
 	}
 	if planApproval && request.Decision == ResolutionApproved {
 		if planCompletion == PlanCompletionDeliverable {

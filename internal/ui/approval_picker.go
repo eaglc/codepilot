@@ -25,6 +25,13 @@ type approvalChoice struct {
 }
 
 func (m *Model) approvalChoices(pending codingagent.PendingInterrupt) []approvalChoice {
+	if pending.Kind == "plan_entry_approval" {
+		return []approvalChoice{
+			{kind: approvalAllowOnce, label: "Enter Plan mode"},
+			{kind: approvalDeny, label: "Continue Direct"},
+			{kind: approvalCancel, label: "Cancel task"},
+		}
+	}
 	if pending.Kind == "plan_approval" {
 		approveLabel := "Approve Plan and execute"
 		if pending.PlanCompletion == codingagent.PlanCompletionDeliverable {
@@ -105,6 +112,9 @@ func (m *Model) applyApprovalChoice(pending codingagent.PendingInterrupt, choice
 	switch choice.kind {
 	case approvalAllowOnce:
 		m.status = "Applying approved action..."
+		if pending.Kind == "plan_entry_approval" {
+			m.status = "Entering Plan mode..."
+		}
 		if pending.Kind == "plan_approval" && pending.PlanCompletion == codingagent.PlanCompletionDeliverable {
 			m.status = "Accepting Plan..."
 		}
@@ -119,6 +129,10 @@ func (m *Model) applyApprovalChoice(pending codingagent.PendingInterrupt, choice
 			m.clearInput()
 			m.status = "Enter Plan revision feedback."
 			return nil
+		}
+		if pending.Kind == "plan_entry_approval" {
+			m.status = "Continuing Direct task..."
+			return m.resume(pending, codingagent.ResolutionDenied, codingagent.PermissionGrantOnce)
 		}
 		m.status = "Declining action..."
 		return m.resume(pending, codingagent.ResolutionDenied, codingagent.PermissionGrantOnce)
@@ -143,6 +157,9 @@ func (m *Model) approvalRows(pending codingagent.PendingInterrupt, width int) []
 		summary = "The agent needs permission before continuing."
 	}
 	title := "Permission required"
+	if pending.Kind == "plan_entry_approval" {
+		title = "Plan mode suggested"
+	}
 	if pending.Kind == "plan_approval" {
 		title = "Plan approval required"
 	}
@@ -167,7 +184,11 @@ func (m *Model) approvalRows(pending codingagent.PendingInterrupt, width int) []
 	if m.busy {
 		lines = append(lines, theme.muted.Render("Applying selection..."))
 	}
-	lines = append(lines, theme.muted.Render("↑/↓ choose  •  Enter confirm  •  1-9 choose directly  •  Esc cancel action"))
+	help := "↑/↓ choose  •  Enter confirm  •  1-9 choose directly  •  Esc cancel action"
+	if pending.Kind == "plan_entry_approval" || pending.Kind == "plan_approval" {
+		help = "↑/↓ choose  •  Enter confirm  •  1-9 choose directly  •  Esc cancel task"
+	}
+	lines = append(lines, theme.muted.Render(help))
 	rows := make([]renderRow, 0, len(lines)+1)
 	for _, line := range lines {
 		rows = append(rows, renderRow{text: truncateANSI(line, width)})

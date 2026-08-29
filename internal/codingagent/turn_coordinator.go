@@ -42,6 +42,13 @@ func (s *Service) prepareRunEnvironment(ctx context.Context, product Session, tu
 	if err != nil {
 		return runEnvironment{}, fmt.Errorf("create %s tools: %w", profile, err)
 	}
+	resolvingPlanEntry := turn.PlanEntrySuggestion != nil && (turn.Phase == TurnPhaseDirect || turn.Phase == TurnPhaseAwaitingPlanEntryApproval)
+	if profile == CapabilityDirect && (turn.Phase == TurnPhaseDirect || turn.Phase == TurnPhaseAwaitingPlanEntryApproval) && (s.features.PlanSuggestions || resolvingPlanEntry) {
+		tools, err = mergeToolRegistry(tools, &enterPlanModeTool{turns: s.deps.Turns, turnID: turn.ID, allowNew: s.features.PlanSuggestions})
+		if err != nil {
+			return runEnvironment{}, err
+		}
+	}
 	if profile == CapabilityPlan || profile == CapabilityPlanWorkspace {
 		if s.deps.Plans == nil {
 			return runEnvironment{}, errors.New("create Plan tools: Plan repository is unavailable")
@@ -245,7 +252,9 @@ func (s *Service) continueTurnLocked(ctx context.Context, product Session, turn 
 	now := time.Now().UTC()
 	expected := turn.Revision
 	nextPhase, nextProfile := turn.Phase, CapabilityDirect
-	if turn.Phase == TurnPhaseAwaitingPlanApproval {
+	if turn.Phase == TurnPhaseAwaitingPlanEntryApproval {
+		nextPhase, nextProfile = TurnPhasePlanning, CapabilityPlan
+	} else if turn.Phase == TurnPhaseAwaitingPlanApproval {
 		nextPhase = TurnPhaseExecuting
 	} else if turn.Phase == TurnPhasePlanning && len(turn.Runs) != 0 && turn.Runs[len(turn.Runs)-1].Profile == CapabilityPlan {
 		nextProfile = CapabilityPlanWorkspace
@@ -288,6 +297,17 @@ func (s *Service) continueTurnLocked(ctx context.Context, product Session, turn 
 	}
 	if finishErr != nil {
 		return productResult, fmt.Errorf("continue Coding Agent turn: persist terminal Product Turn: %w", finishErr)
+	}
+	if turn.Phase == TurnPhaseAwaitingPlanApproval && turn.PlanVersion != 0 {
+		if err := s.publishPlanEvent(context.WithoutCancel(ctx), product, turn, EventPlanCreated, ""); err != nil {
+			return productResult, fmt.Errorf("continue Coding Agent turn: publish Plan creation: %w", err)
+		}
+	}
+	if result.Status == agent.RunHandedOff && turn.Status == TurnRunning && turn.Phase == TurnPhasePlanning && turn.Runs[len(turn.Runs)-1].Profile == CapabilityPlan {
+		if touchErr != nil {
+			return productResult, fmt.Errorf("continue Coding Agent turn: update product session: %w", touchErr)
+		}
+		return s.continueTurnLocked(ctx, product, turn)
 	}
 	if touchErr != nil {
 		return productResult, fmt.Errorf("continue Coding Agent turn: update product session: %w", touchErr)

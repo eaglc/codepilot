@@ -3,6 +3,7 @@ package codingagent
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	agentsession "github.com/eaglc/codepilot/internal/agent/session"
@@ -28,6 +29,8 @@ func ProjectSnapshot(product Session, durable agentsession.Snapshot, lane agents
 		projected := PendingInterrupt{TurnID: TurnID(pending.RunID), InterruptID: pending.InterruptID, Kind: pending.Kind, ToolCallID: pending.ToolCallID}
 		if pending.Kind == "approval" && len(pending.Payload) != 0 {
 			projectApprovalInterrupt(&projected, pending.Payload)
+		} else if pending.Kind == planEntryApprovalKind && len(pending.Payload) != 0 {
+			projectPlanEntryApprovalInterrupt(&projected, pending.Payload)
 		} else if pending.Kind == "plan_approval" && len(pending.Payload) != 0 {
 			projectPlanApprovalInterrupt(&projected, pending.Payload)
 		} else if pending.Kind == clarificationInterruptKind && len(pending.Payload) != 0 {
@@ -94,6 +97,18 @@ func ProjectSnapshot(product Session, durable agentsession.Snapshot, lane agents
 	return snapshot, nil
 }
 
+func projectPlanEntryApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage) {
+	if target == nil || len(raw) == 0 || !json.Valid(raw) {
+		return
+	}
+	var payload planEntryApprovalPayload
+	if json.Unmarshal(raw, &payload) != nil || payload.Kind != "coding_plan_entry_approval_v1" || payload.Version != 1 || validatePlanEntrySubmission(planEntrySubmission{ReasonCode: payload.ReasonCode, Summary: payload.Summary}) != nil || !isHexDigest(payload.Digest, 64, 64) || payload.Digest != computePlanEntryDigest(payload.ReasonCode, payload.Summary) {
+		return
+	}
+	target.Summary = boundedUTF8(redactSensitiveText(payload.Summary), maxPlanEntrySummaryBytes)
+	target.PlanEntryReason = payload.ReasonCode
+}
+
 func projectPlanApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage) {
 	if target == nil || len(raw) == 0 || !json.Valid(raw) {
 		return
@@ -130,6 +145,7 @@ func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, la
 		if turn.Status == TurnPending || turn.Status == TurnRunning || turn.Status == TurnInterrupted {
 			value := TurnSnapshot{ID: turn.ID, Phase: turn.Phase, Status: turn.Status, Strategy: turn.Strategy, RunCount: len(turn.Runs), Revision: turn.Revision}
 			snapshot.ActiveTurn = &value
+			snapshot.PendingPlanEntryApproval = turn.Phase == TurnPhaseAwaitingPlanEntryApproval && turn.Status == TurnInterrupted
 		}
 	}
 	for index := range snapshot.Transcript {
@@ -168,7 +184,68 @@ func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, la
 		snapshot.Metrics.LatestProfile = runProfiles[runID]
 		snapshot.Metrics.LatestTurnStatus = runStatuses[runID]
 	}
+	snapshot.Metrics.ByPhase = projectPhaseMetrics(durable, lane, turns)
 	return snapshot, nil
+}
+
+func projectPhaseMetrics(durable agentsession.Snapshot, lane agentsession.Lane, turns []Turn) []PhaseMetrics {
+	entries, err := agentsession.BranchEntries(durable, lane)
+	if err != nil {
+		return nil
+	}
+	includedRuns := make(map[agentsession.RunID]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.RunID != "" {
+			includedRuns[entry.RunID] = struct{}{}
+		}
+	}
+	byRun := make(map[agentsession.RunID]*PhaseMetrics)
+	for _, turn := range turns {
+		for _, binding := range turn.Runs {
+			if _, included := includedRuns[binding.RunID]; !included {
+				continue
+			}
+			metric := &PhaseMetrics{Phase: binding.Phase, Runs: 1}
+			if binding.Status == RunBindingFailed {
+				metric.FailedRuns = 1
+			}
+			if !binding.StartedAt.IsZero() && !binding.FinishedAt.IsZero() && !binding.FinishedAt.Before(binding.StartedAt) {
+				metric.Elapsed = binding.FinishedAt.Sub(binding.StartedAt)
+			}
+			byRun[binding.RunID] = metric
+		}
+	}
+	for _, record := range durable.Records {
+		metric := byRun[record.RunID]
+		if metric == nil || record.Type != agentsession.RecordUsage || record.Usage == nil {
+			continue
+		}
+		total := record.Usage.TotalTokens
+		if total <= 0 {
+			total = record.Usage.InputTokens + record.Usage.OutputTokens
+		}
+		metric.TotalTokens += max(0, total)
+		if record.Usage.Cost > 0 {
+			metric.Cost += record.Usage.Cost
+		}
+	}
+	byPhase := make(map[TurnPhase]PhaseMetrics)
+	for _, metric := range byRun {
+		value := byPhase[metric.Phase]
+		value.Phase = metric.Phase
+		value.Runs += metric.Runs
+		value.FailedRuns += metric.FailedRuns
+		value.TotalTokens += metric.TotalTokens
+		value.Cost += metric.Cost
+		value.Elapsed += metric.Elapsed
+		byPhase[metric.Phase] = value
+	}
+	values := make([]PhaseMetrics, 0, len(byPhase))
+	for _, value := range byPhase {
+		values = append(values, value)
+	}
+	sort.Slice(values, func(left, right int) bool { return values[left].Phase < values[right].Phase })
+	return values
 }
 
 func projectSessionMetrics(entries []agentsession.Entry, records []agentsession.Record) SessionMetrics {

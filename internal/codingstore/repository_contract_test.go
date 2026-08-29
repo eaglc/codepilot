@@ -2,6 +2,8 @@ package codingstore_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"path/filepath"
 	"testing"
 	"time"
@@ -168,6 +170,31 @@ func testRepositoryContract(t *testing.T, repository repository) {
 	if err := repository.SaveTurn(ctx, turn, 1); err == nil {
 		t.Fatal("SaveTurn accepted a stale revision")
 	}
+	suggestion := codingagent.PlanEntrySuggestion{
+		ReasonCode:  codingagent.PlanEntryCrossModuleChange,
+		Summary:     "The change crosses durable product boundaries.",
+		Digest:      "",
+		SuggestedAt: now.Add(time.Second),
+	}
+	suggestion.Digest = planEntrySuggestionDigest(suggestion.ReasonCode, suggestion.Summary)
+	turn.Phase = codingagent.TurnPhaseAwaitingPlanEntryApproval
+	turn.PlanEntrySuggestion = &suggestion
+	turn.UpdatedAt = suggestion.SuggestedAt
+	turn.Revision++
+	if err := repository.SaveTurn(ctx, turn, 2); err != nil {
+		t.Fatalf("SaveTurn Plan entry suggestion: %v", err)
+	}
+	turn.Phase = codingagent.TurnPhaseDirect
+	turn.DeclinedPlanReasons = []codingagent.PlanEntryReasonCode{suggestion.ReasonCode}
+	turn.UpdatedAt = turn.UpdatedAt.Add(time.Second)
+	turn.Revision++
+	if err := repository.SaveTurn(ctx, turn, 3); err != nil {
+		t.Fatalf("SaveTurn Plan entry decline: %v", err)
+	}
+	loadedTurn, err = repository.LoadTurn(ctx, turn.ID)
+	if err != nil || loadedTurn.PlanEntrySuggestion == nil || loadedTurn.PlanEntrySuggestion.Digest != suggestion.Digest || len(loadedTurn.DeclinedPlanReasons) != 1 {
+		t.Fatalf("LoadTurn Plan entry history = %#v, %v", loadedTurn, err)
+	}
 	changedSession := session
 	changedSession.WorktreeID = "another"
 	if err := repository.SaveSession(ctx, changedSession); err == nil {
@@ -181,4 +208,9 @@ func testRepositoryContract(t *testing.T, repository repository) {
 	if err := repository.BeginSessionCreation(ctx, intent); err == nil {
 		t.Fatal("BeginSessionCreation accepted a non-deterministic identity")
 	}
+}
+
+func planEntrySuggestionDigest(reason codingagent.PlanEntryReasonCode, summary string) string {
+	digest := sha256.Sum256([]byte(string(reason) + "\x00" + summary))
+	return hex.EncodeToString(digest[:])
 }

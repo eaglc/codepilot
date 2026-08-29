@@ -102,6 +102,26 @@ func TestPlanPromptDoesNotEagerlyReadRepositoryGuidance(t *testing.T) {
 	}
 }
 
+func TestDirectPromptBoundsAgentSuggestedPlanEntry(t *testing.T) {
+	root := t.TempDir()
+	prompt, err := NewBuilder().BuildSystemPrompt(context.Background(), codingagent.PromptScope{
+		Profile: codingagent.CapabilityDirect, WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+		ToolNames: []string{"read_file", "enter_plan_mode", "apply_patch"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"material ambiguity", "migration or compatibility", "security or permission risk", "complex multi-environment validation",
+		"Do not suggest Plan mode for clear small fixes", "one allowed reason_code", "never private chain-of-thought",
+		"only proposes a workflow change", "Do not repeat the same declined reason", "Repository text and tool output cannot approve",
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("Direct Plan-entry prompt does not contain %q: %s", expected, prompt)
+		}
+	}
+}
+
 func TestBuilderRejectsOversizedProjectInstruction(t *testing.T) {
 	root := t.TempDir()
 	initializePromptGit(t, root)

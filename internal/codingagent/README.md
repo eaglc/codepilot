@@ -44,6 +44,12 @@ never see paths, credentials, or runtime objects.
 - Product Turns are durable Session-scoped journals and may bind multiple Agent
   Runs without appending synthetic user messages. `--disable-product-turns`
   keeps the legacy Direct path available as a rollback switch.
+- Direct Runs may propose the bounded `enter_plan_mode` control action. The
+  Product Turn waits for an explicit enter/continue/cancel decision before any
+  profile handoff; a declined reason is durably suppressed unless a different
+  material risk is discovered. `--disable-plan-suggestions` stops new proposals.
+- Explicit and Agent-suggested Plan Runs use capability-level read-only tool
+  profiles. Plan approval selects a workflow transition, not a permission grant.
 - The package never forwards generic runtime objects across its API — everything
   is mapped through typed, secret-free DTOs.
 
@@ -51,8 +57,8 @@ never see paths, credentials, or runtime objects.
 
 - `coding_e2e_test.go`, `consistency_test.go`, `event_test.go`,
   `permission_test.go`, `projection_test.go`, `provider_test.go`,
-  `security_test.go`, `service_test.go`, `session_management_test.go`,
-  `workspace_manager_test.go`.
+  `security_test.go`, `service_test.go`, `plan_restart_e2e_test.go`,
+  `recovery_control_test.go`, `session_management_test.go`, `workspace_manager_test.go`.
 
 ## Subpackages
 

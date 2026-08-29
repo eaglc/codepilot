@@ -39,6 +39,42 @@ func TestProjectSnapshotDerivesUsageContextStepAndTimingFromActiveBranch(t *test
 	}
 }
 
+func TestProjectSnapshotAggregatesTimeCostAndFailureByProductPhase(t *testing.T) {
+	started := time.Date(2026, time.August, 29, 10, 0, 0, 0, time.UTC)
+	user := agentsession.Entry{ID: "user-phase", RunID: "run-direct", Lane: agentsession.MainLane, Timestamp: started, Type: agentsession.EntryMessage,
+		Message: &llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "complex task"}}}}
+	direct := agentsession.Entry{ID: "assistant-direct", ParentID: user.ID, RunID: "run-direct", Lane: agentsession.MainLane, Timestamp: started.Add(time.Second), Type: agentsession.EntryMessage,
+		Message: &llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "suggest Plan"}}}}
+	planning := agentsession.Entry{ID: "assistant-plan", ParentID: direct.ID, RunID: "run-plan", Lane: agentsession.MainLane, Timestamp: started.Add(4 * time.Second), Type: agentsession.EntryMessage,
+		Message: &llm.Message{Role: llm.RoleAssistant, Content: []llm.Content{{Type: llm.ContentText, Text: "failed Plan"}}}}
+	durable := agentsession.Snapshot{
+		Metadata: agentsession.Metadata{ID: "agent-phase"}, Entries: []agentsession.Entry{user, direct, planning},
+		Lanes: []agentsession.LanePointer{{Lane: agentsession.MainLane, LeafID: planning.ID}},
+		Records: []agentsession.Record{
+			{RunID: "run-direct", Type: agentsession.RecordUsage, Usage: &llm.Usage{TotalTokens: 100, Cost: .01}},
+			{RunID: "run-plan", Type: agentsession.RecordUsage, Usage: &llm.Usage{TotalTokens: 250, Cost: .04}},
+		},
+	}
+	turn := Turn{
+		ID: "turn-phase", SessionID: "coding-phase", RequestText: "complex task", Phase: TurnPhasePlanning, Status: TurnFailed, Strategy: ExecutionSingle,
+		Runs: []RunBinding{
+			{RunID: "run-direct", Phase: TurnPhaseDirect, Profile: CapabilityDirect, Status: RunBindingHandedOff, StartedAt: started, FinishedAt: started.Add(2 * time.Second)},
+			{RunID: "run-plan", Phase: TurnPhasePlanning, Profile: CapabilityPlan, Status: RunBindingFailed, StartedAt: started.Add(2 * time.Second), FinishedAt: started.Add(5 * time.Second)},
+		},
+	}
+	snapshot, err := ProjectSnapshotWithTurns(Session{ID: "coding-phase", AgentSessionID: "agent-phase"}, durable, agentsession.MainLane, RuntimeIdle, 1, []Turn{turn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := snapshot.Metrics.ByPhase
+	if len(metrics) != 2 || metrics[0].Phase != TurnPhaseDirect || metrics[0].Runs != 1 || metrics[0].FailedRuns != 0 || metrics[0].TotalTokens != 100 || metrics[0].Cost != .01 || metrics[0].Elapsed != 2*time.Second {
+		t.Fatalf("Direct phase metrics = %#v", metrics)
+	}
+	if metrics[1].Phase != TurnPhasePlanning || metrics[1].Runs != 1 || metrics[1].FailedRuns != 1 || metrics[1].TotalTokens != 250 || metrics[1].Cost != .04 || metrics[1].Elapsed != 3*time.Second {
+		t.Fatalf("Planning phase metrics = %#v", metrics)
+	}
+}
+
 func TestProjectSnapshotDoesNotExposeThinkingOrToolArguments(t *testing.T) {
 	durable := agentsession.Snapshot{
 		Metadata: agentsession.Metadata{ID: "agent-session-1"},

@@ -97,6 +97,7 @@ type PendingInterrupt struct {
 	PlanVersion     uint64
 	PlanDigest      string
 	PlanCompletion  PlanCompletionMode
+	PlanEntryReason PlanEntryReasonCode
 	Clarification   *ClarificationPrompt
 }
 
@@ -146,6 +147,18 @@ type SessionMetrics struct {
 	StartedAt        time.Time
 	FinishedAt       time.Time
 	Elapsed          time.Duration
+	ByPhase          []PhaseMetrics
+}
+
+// PhaseMetrics aggregates durable Run cost, elapsed time, and failures by the
+// trusted Product Turn phase that produced them.
+type PhaseMetrics struct {
+	Phase       TurnPhase
+	Runs        int
+	FailedRuns  int
+	TotalTokens int
+	Cost        float64
+	Elapsed     time.Duration
 }
 
 // TurnSnapshot is the bounded Product Turn state shown by presentation layers.
@@ -187,16 +200,17 @@ type PlanSnapshot struct {
 
 // Snapshot is the authoritative Coding Agent state exposed to UI and future clients.
 type Snapshot struct {
-	Revision            uint64
-	Session             Session
-	RuntimeState        RuntimeState
-	Transcript          []TranscriptItem
-	PendingInterrupts   []PendingInterrupt
-	RecoveryActions     []RecoveryAction
-	RecoveryWarnings    []string
-	Metrics             SessionMetrics
-	ActiveTurn          *TurnSnapshot
-	ActivePlan          *PlanSnapshot
-	PlanHistory         []PlanVersionSummary
-	PendingPlanApproval bool
+	Revision                 uint64
+	Session                  Session
+	RuntimeState             RuntimeState
+	Transcript               []TranscriptItem
+	PendingInterrupts        []PendingInterrupt
+	RecoveryActions          []RecoveryAction
+	RecoveryWarnings         []string
+	Metrics                  SessionMetrics
+	ActiveTurn               *TurnSnapshot
+	ActivePlan               *PlanSnapshot
+	PlanHistory              []PlanVersionSummary
+	PendingPlanApproval      bool
+	PendingPlanEntryApproval bool
 }

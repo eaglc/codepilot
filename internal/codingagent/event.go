@@ -53,6 +53,10 @@ const (
 	EventTurnFailed                EventKind = "turn_failed"
 	EventPersistenceWarning        EventKind = "persistence_warning"
 	EventPlanStarted               EventKind = "plan_started"
+	EventPlanEntrySuggested        EventKind = "plan_entry_suggested"
+	EventPlanEntryApproved         EventKind = "plan_entry_approved"
+	EventPlanEntryDeclined         EventKind = "plan_entry_declined"
+	EventPlanEntryCancelled        EventKind = "plan_entry_cancelled"
 	EventPlanCreated               EventKind = "plan_created"
 	EventPlanRevised               EventKind = "plan_revised"
 	EventPlanApprovalRequested     EventKind = "plan_approval_requested"
@@ -114,6 +118,15 @@ type PlanEvent struct {
 	Decision string
 }
 
+// PlanEntryEvent describes a bounded Agent suggestion and the product decision
+// without exposing model reasoning or tool arguments.
+type PlanEntryEvent struct {
+	ReasonCode PlanEntryReasonCode
+	Summary    string
+	Digest     string
+	Decision   string
+}
+
 // WorkspaceEvent contains product workspace state without lower-level runtime objects.
 type WorkspaceEvent struct {
 	WorkspaceID string
@@ -148,6 +161,7 @@ type EventPayload struct {
 	Compaction      *CompactionEvent
 	Turn            *TurnEvent
 	Approval        *ApprovalEvent
+	PlanEntry       *PlanEntryEvent
 	Plan            *PlanEvent
 	Workspace       *WorkspaceEvent
 	Session         *SessionEvent

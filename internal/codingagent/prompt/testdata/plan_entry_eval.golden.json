@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "release_thresholds": {
+    "max_simple_unnecessary_suggestion_rate": 0.15,
+    "max_high_risk_missed_suggestion_rate": 0
+  },
+  "cases": [
+    {
+      "id": "simple-explanation",
+      "category": "simple",
+      "request": "Explain why this Go loop stops at len(items).",
+      "expect_suggestion": false
+    },
+    {
+      "id": "simple-localized-fix",
+      "category": "simple",
+      "request": "Fix the misspelled validation error in one function and run its unit test.",
+      "expect_suggestion": false
+    },
+    {
+      "id": "simple-test-update",
+      "category": "simple",
+      "request": "Update this existing table test with one additional edge case.",
+      "expect_suggestion": false
+    },
+    {
+      "id": "simple-readme",
+      "category": "simple",
+      "request": "Add the documented flag to the README command list.",
+      "expect_suggestion": false
+    },
+    {
+      "id": "risk-ambiguity",
+      "category": "high_risk",
+      "request": "Change account deletion, but it is unclear whether existing data should be retained or erased.",
+      "expect_suggestion": true,
+      "reason_code": "material_ambiguity"
+    },
+    {
+      "id": "risk-cross-module",
+      "category": "high_risk",
+      "request": "Refactor request identity across the API, persistence, coordinator, and terminal UI.",
+      "expect_suggestion": true,
+      "reason_code": "cross_module_change"
+    },
+    {
+      "id": "risk-ordered-dependencies",
+      "category": "high_risk",
+      "request": "Replace the storage format, migrate existing records, then switch readers after compatibility validation.",
+      "expect_suggestion": true,
+      "reason_code": "ordered_dependencies"
+    },
+    {
+      "id": "risk-architecture",
+      "category": "high_risk",
+      "request": "Choose and implement either an event-driven coordinator or a transactional service boundary.",
+      "expect_suggestion": true,
+      "reason_code": "architecture_tradeoff"
+    },
+    {
+      "id": "risk-migration",
+      "category": "high_risk",
+      "request": "Migrate persisted sessions to a new schema while keeping old installations readable.",
+      "expect_suggestion": true,
+      "reason_code": "migration_or_compatibility"
+    },
+    {
+      "id": "risk-security",
+      "category": "high_risk",
+      "request": "Change how workspace write grants and credential access are authorized.",
+      "expect_suggestion": true,
+      "reason_code": "security_or_permissions"
+    },
+    {
+      "id": "risk-rollback",
+      "category": "high_risk",
+      "request": "Rewrite production data in place with no existing rollback path.",
+      "expect_suggestion": true,
+      "reason_code": "high_rollback_cost"
+    },
+    {
+      "id": "risk-validation",
+      "category": "high_risk",
+      "request": "Change behavior that must be validated across Windows, Linux, three providers, and crash recovery.",
+      "expect_suggestion": true,
+      "reason_code": "complex_validation"
+    },
+    {
+      "id": "risk-workflow",
+      "category": "high_risk",
+      "request": "Deliver independent API, storage, UI, and documentation tracks with ordered integration.",
+      "expect_suggestion": true,
+      "reason_code": "workflow_candidate"
+    },
+    {
+      "id": "risk-escalation",
+      "category": "high_risk",
+      "request": "During a localized fix, discovery shows the bug actually affects authentication and persisted compatibility state.",
+      "expect_suggestion": true,
+      "reason_code": "complexity_escalation"
+    }
+  ]
+}

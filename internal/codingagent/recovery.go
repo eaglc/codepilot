@@ -2,6 +2,7 @@ package codingagent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -221,7 +222,7 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 			} else if outcome == string(agent.RunHandedOff) {
 				status = agent.RunHandedOff
 			}
-			status, statusErr := s.normalizeRecoveredPlanHandoff(ctx, turn, status)
+			status, statusErr := s.normalizeRecoveredControlHandoff(ctx, turn, status, durable)
 			if statusErr != nil {
 				return completed, fmt.Errorf("coordinate Coding Agent recovery: inspect Plan completion for Turn %q: %w", turn.ID, statusErr)
 			}
@@ -278,7 +279,7 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 		if result.RunID == "" {
 			result.RunID = binding.RunID
 		}
-		result.Status, err = s.normalizeRecoveredPlanHandoff(ctx, turn, result.Status)
+		result.Status, err = s.normalizeRecoveredControlHandoff(ctx, turn, result.Status, durable)
 		if err != nil {
 			return completed, fmt.Errorf("coordinate Coding Agent recovery: inspect Plan completion for Turn %q: %w", turn.ID, err)
 		}
@@ -300,9 +301,34 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 	return completed, nil
 }
 
-func (s *Service) normalizeRecoveredPlanHandoff(ctx context.Context, turn Turn, status agent.RunStatus) (agent.RunStatus, error) {
-	if status != agent.RunHandedOff || turn.Phase != TurnPhaseAwaitingPlanApproval || turn.PlanID == "" || s.deps.Plans == nil {
+func (s *Service) normalizeRecoveredControlHandoff(ctx context.Context, turn Turn, status agent.RunStatus, durable agentsession.Snapshot) (agent.RunStatus, error) {
+	if status != agent.RunHandedOff || len(turn.Runs) == 0 {
 		return status, nil
+	}
+	runID := turn.Runs[len(turn.Runs)-1].RunID
+	switch turn.Phase {
+	case TurnPhaseAwaitingPlanEntryApproval:
+		decision := recoveredControlDecision(durable, runID, planEntryApprovalKind)
+		if decision == "cancelled" {
+			return agent.RunAborted, nil
+		}
+		if decision != "" && decision != "approved" {
+			return status, fmt.Errorf("recovered Plan entry handoff has unexpected decision %q", decision)
+		}
+		return status, nil
+	case TurnPhaseAwaitingPlanApproval:
+		decision := recoveredControlDecision(durable, runID, "plan_approval")
+		if decision == "cancelled" {
+			return agent.RunAborted, nil
+		}
+		if decision != "" && decision != "approved" {
+			return status, fmt.Errorf("recovered Plan approval handoff has unexpected decision %q", decision)
+		}
+	default:
+		return status, nil
+	}
+	if turn.PlanID == "" || s.deps.Plans == nil {
+		return status, errors.New("approved Plan revision is unavailable")
 	}
 	plan, err := s.deps.Plans.LoadPlan(ctx, turn.PlanID, turn.PlanVersion)
 	if err != nil || plan.Digest != turn.PlanDigest {
@@ -312,6 +338,23 @@ func (s *Service) normalizeRecoveredPlanHandoff(ctx context.Context, turn Turn, 
 		return agent.RunCompleted, nil
 	}
 	return status, nil
+}
+
+func recoveredControlDecision(durable agentsession.Snapshot, runID agentsession.RunID, kind string) string {
+	for index := len(durable.Records) - 1; index >= 0; index-- {
+		record := durable.Records[index]
+		if record.RunID != runID || record.Type != agentsession.RecordInterruptResolved || record.Interrupt == nil || record.Interrupt.Kind != kind || len(record.Interrupt.Payload) == 0 {
+			continue
+		}
+		var payload struct {
+			Decision string `json:"decision"`
+		}
+		if json.Unmarshal(record.Interrupt.Payload, &payload) == nil {
+			return payload.Decision
+		}
+		return ""
+	}
+	return ""
 }
 
 func runTerminalFacts(snapshot agentsession.Snapshot, runID agentsession.RunID) (started, finished bool, outcome string) {
