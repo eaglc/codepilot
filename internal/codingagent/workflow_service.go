@@ -24,6 +24,21 @@ func (s *Service) beginWorkflowLocked(ctx context.Context, product Session, turn
 	if err != nil {
 		return TurnResult{}, err
 	}
+	if compiled.Strategy == workflow.StrategyMultiAgentParallelReadOnly {
+		compiled.Budget.MaxConcurrency = min(compiled.Budget.MaxConcurrency, s.deps.MaxParallelAgents)
+		if s.deps.Limits.MaxTotalTokens > 0 {
+			compiled.Budget.MaxTotalTokens = s.deps.Limits.MaxTotalTokens
+		}
+		if s.deps.Limits.MaxCost > 0 {
+			compiled.Budget.MaxCost = s.deps.Limits.MaxCost
+		}
+		if s.deps.Limits.MaxDuration > 0 {
+			compiled.Budget.MaxDurationSeconds = int64((s.deps.Limits.MaxDuration + time.Second - 1) / time.Second)
+		}
+		if err := workflow.Validate(compiled); err != nil {
+			return TurnResult{}, fmt.Errorf("start Coding workflow: configured parallel limits: %w", err)
+		}
+	}
 	durable, err := s.deps.Workflows.LoadWorkflow(ctx, compiled.ID)
 	if errors.Is(err, workflow.ErrNotFound) {
 		if !s.features.Workflows {
@@ -61,6 +76,12 @@ func (s *Service) continueWorkflowLocked(ctx context.Context, product Session, t
 
 func (s *Service) continueWorkflowWithRevisionLocked(ctx context.Context, product Session, turn Turn, durable workflow.Workflow, expectedTurnRevision uint64, last TurnResult) (TurnResult, error) {
 	for transitions := 0; transitions < workflow.MaxNodes*4; transitions++ {
+		if durable.Strategy == workflow.StrategyMultiAgentParallelReadOnly && durable.Status == workflow.StatusRunning {
+			result, handled, parallelErr := s.continueParallelWorkflowLocked(ctx, product, turn, durable, last)
+			if handled || parallelErr != nil {
+				return result, parallelErr
+			}
+		}
 		action, err := workflow.NextAction(durable)
 		if err != nil {
 			return last, fmt.Errorf("continue Coding workflow: schedule: %w", err)
@@ -268,6 +289,40 @@ func workflowNodeRunLimits(base agent.RunLimits, budget workflow.Budget) (agent.
 	}
 	if base.MaxSteps <= 0 || base.MaxSteps > remaining {
 		base.MaxSteps = remaining
+	}
+	return base, nil
+}
+
+func parallelWorkflowNodeRunLimits(base agent.RunLimits, budget workflow.Budget, count int) (agent.RunLimits, error) {
+	if count <= 0 {
+		return agent.RunLimits{}, errors.New("parallel Workflow requires at least one scheduled node")
+	}
+	remaining := budget.MaxAgentSteps - budget.UsedAgentSteps
+	share := remaining / count
+	if share <= 0 {
+		return agent.RunLimits{}, errors.New("parent Workflow Agent step budget cannot cover the parallel runnable set")
+	}
+	if base.MaxSteps <= 0 || base.MaxSteps > share {
+		base.MaxSteps = share
+	}
+	remainingTokens := budget.MaxTotalTokens - budget.UsedTotalTokens
+	tokenShare := remainingTokens / count
+	if tokenShare <= 0 {
+		return agent.RunLimits{}, errors.New("parent Workflow token budget cannot cover the parallel runnable set")
+	}
+	if base.MaxTotalTokens <= 0 || base.MaxTotalTokens > tokenShare {
+		base.MaxTotalTokens = tokenShare
+	}
+	if base.MaxOutputTokens <= 0 || base.MaxOutputTokens > tokenShare {
+		base.MaxOutputTokens = tokenShare
+	}
+	remainingCost := budget.MaxCost - budget.UsedCost
+	costShare := remainingCost / float64(count)
+	if costShare <= 0 {
+		return agent.RunLimits{}, errors.New("parent Workflow cost budget cannot cover the parallel runnable set")
+	}
+	if base.MaxCost <= 0 || base.MaxCost > costShare {
+		base.MaxCost = costShare
 	}
 	return base, nil
 }

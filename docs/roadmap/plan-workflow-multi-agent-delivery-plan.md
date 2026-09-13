@@ -190,7 +190,7 @@ Profile 是可信代码定义的白名单。模型只能从产品允许的角色
 
 在 P8 证明自动选择可靠之前，多 Agent 实施只从用户批准且明确展示分工的 Plan 启动；Plan 阶段的只读探索可以在 P5 后使用子 Agent，但不会因此创建执行 Workflow。
 
-### 5.1 当前实现状态（2026-08-31）
+### 5.1 当前实现状态（2026-09-13）
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
@@ -200,6 +200,7 @@ Profile 是可信代码定义的白名单。模型只能从产品允许的角色
 | P3 | 已完成 | 不可变版本差异、精确批准绑定、WorkspaceRevision、漂移分级、执行偏差检查点、恢复、指标与 TUI 已交付。Plan 数据采用严格新格式，不兼容实验期旧 Plan 文件。 |
 | P4 | 已完成 | 单 Agent 串行 Workflow、可信 Plan Compiler、append-only/CAS 状态机、节点范围、父级预算、失败策略、取消、恢复、Snapshot/Event/TUI 和阶段指标已交付。 |
 | P5 | 已完成 | 串行子 Agent、独立 Session/Run、版本化角色策略 Registry、结构化终态结果、父界面统一审批、主 Agent 汇总、预算/取消/恢复和降级策略已交付。 |
+| P6 | 验收中 | 并行只读 Workflow 与 Plan 探索、runnable 集合、全局/单 Workflow 配额、父级预算、取消、失败隔离、漂移检测、CAS 汇总和恢复已实现；本机功能门禁通过，等待支持 race 的环境完成最终验收。 |
 
 P2 完成门禁：`go test ./... -count=1`、`go vet ./...`、`cmd/codepilot` 与 `cmd/releasecheck` 构建、`git diff --check -- README.md cmd internal docs` 均通过。评估基线位于 `internal/codingagent/prompt/testdata/plan_entry_eval.golden.json`，发布阈值为安全/高风险样本漏提示率 0、简单任务不必要提示率不高于 15%。
 
@@ -207,7 +208,9 @@ P3 生命周期覆盖关键文件内容在 Git 状态不变时继续变化、无
 
 P4 覆盖 Direct 与 Workflow 策略选择、三节点依赖顺序、DAG/角色/范围拒绝、重试/阻塞/重新规划/终止、活动取消、父级 Run/Step 预算、节点读写负面权限、节点开始/完成/失败和 Workflow 终态写入间隙恢复，以及文件型 Product Store、真实 Git Worktree 和真实工具链端到端重启验证。关闭 Workflow 功能开关后仍可读取和恢复已创建实例，但不能创建新实例。P4 完成门禁：`go test ./... -count=1`、`go vet ./...`、`cmd/codepilot` 与 `cmd/releasecheck` 构建均通过。
 
-P5 覆盖至少两个不同角色子 Agent 的串行执行、Plan 内单次只读 Explore 委派、独立 Agent Session/Run、父上下文结构化摘要、版本化角色 Prompt/工具/结果策略注册、角色与节点范围负向权限、父界面审批投影、父级剩余预算、取消传播、确定性子 Agent 身份与重启结果对账，以及失败后的重试、主 Agent 降级、重新规划和终止。Workflow Node 与 Child Agent 固定策略版本，已有任务恢复时不会静默切换到新版本。Direct 与普通 Plan 不自动创建子 Agent；关闭串行子 Agent 功能开关后仍可读取、取消和恢复已有对象，但不能创建新委派。P5 完成门禁：`go test ./... -count=1`、`go vet ./...`、`cmd/codepilot` 与 `cmd/releasecheck` 构建均通过。
+P5 覆盖至少两个不同角色子 Agent 的串行执行、Plan 内单次只读 Explore 委派、独立 Agent Session/Run、父上下文结构化摘要、版本化角色 Prompt/工具/结果策略注册、角色与节点范围负向权限、父界面审批、父级剩余预算、取消传播、确定性子 Agent 身份与重启结果对账，以及失败后的重试、主 Agent 降级、重新规划和终止。Workflow Node 与 Child Agent 固定策略版本，已有任务恢复时不会静默切换到新版本。Direct 与普通 Plan 不自动创建子 Agent；关闭串行子 Agent 功能开关后仍可读取、取消和恢复已有对象，但不能创建新委派。P5 完成门禁：`go test ./... -count=1`、`go vet ./...`、`cmd/codepilot` 与 `cmd/releasecheck` 构建均通过。
+
+P6 已实现稳定顺序的 runnable 集合和最多两个节点的单 Workflow 并发波次；Plan 可显式委派 2–4 个独立只读 Explore 子任务。所有并行节点固定为 Explore/Validate/Review 子 Agent 且无写范围，进程级 semaphore 限制全局并发；Workflow 在启动前分配 Agent、Node、Run、Step、token、cost 和持续时间额度，每一波按剩余额度预留子 Run 上限并在终态事件中记入实际用量。并发结果经 Workflow revision/CAS 串行汇总，父取消广播到整批子 Agent，失败只阻塞依赖链，无关结果保留；每波汇总前复核 Plan WorkspaceRevision，相关漂移转为 `needs_replan`。确定性 Child ID 和恢复扫描避免重启后重复创建。新增 `--disable-parallel-subagents` 与 `--max-parallel-agents`，关闭新能力后仍保留已有对象恢复。P6 本机门禁已通过全仓测试；最终完成状态以 race 门禁通过为准。
 
 ### 5.2 需求追踪
 

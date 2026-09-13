@@ -73,6 +73,9 @@ func NextAction(value Workflow) (Action, error) {
 	if value.Budget.UsedAgentSteps >= value.Budget.MaxAgentSteps {
 		return Action{Kind: ActionFailWorkflow, Reason: "workflow exhausted its Agent step budget"}, nil
 	}
+	if value.Strategy == StrategyMultiAgentParallelReadOnly && (value.Budget.UsedTotalTokens >= value.Budget.MaxTotalTokens || value.Budget.UsedCost >= value.Budget.MaxCost) {
+		return Action{Kind: ActionFailWorkflow, Reason: "workflow exhausted its Agent token or cost budget"}, nil
+	}
 	if totalAttempts(value) >= value.Budget.MaxRuns {
 		return Action{Kind: ActionFailWorkflow, Reason: "workflow exhausted its Agent Run budget"}, nil
 	}
@@ -80,9 +83,6 @@ func NextAction(value Workflow) (Action, error) {
 		if node.Status == NodePending && dependenciesCompleted(value, node) {
 			return Action{Kind: ActionStartNode, NodeID: node.ID}, nil
 		}
-	}
-	if hasNodeStatus(value, NodeBlocked) {
-		return Action{Kind: ActionBlockWorkflow, Reason: "one or more nodes are blocked"}, nil
 	}
 	for _, node := range value.Nodes {
 		if node.Status != NodePending {
@@ -95,7 +95,59 @@ func NextAction(value Workflow) (Action, error) {
 			}
 		}
 	}
+	if hasNodeStatus(value, NodeBlocked) {
+		return Action{Kind: ActionBlockWorkflow, Reason: "one or more nodes are blocked"}, nil
+	}
 	return Action{}, errors.New("workflow has no valid serial scheduling action")
+}
+
+// RunnableNodes returns a stable, bounded set of dependency-ready nodes. For
+// serial strategies it returns at most one node. Parallel Workflows fill only
+// the currently available concurrency slots.
+func RunnableNodes(value Workflow) ([]NodeID, error) {
+	if err := Validate(value); err != nil {
+		return nil, err
+	}
+	if value.Status != StatusRunning {
+		return nil, nil
+	}
+	capacity := 1
+	if value.Strategy == StrategyMultiAgentParallelReadOnly {
+		capacity = value.Budget.MaxConcurrency - runningNodeCount(value)
+	}
+	if capacity <= 0 || totalAttempts(value) >= value.Budget.MaxRuns || value.Budget.UsedAgentSteps >= value.Budget.MaxAgentSteps {
+		return nil, nil
+	}
+	remainingSteps := value.Budget.MaxAgentSteps - value.Budget.UsedAgentSteps
+	if capacity > remainingSteps {
+		capacity = remainingSteps
+	}
+	if value.Strategy == StrategyMultiAgentParallelReadOnly {
+		remainingTokens := value.Budget.MaxTotalTokens - value.Budget.UsedTotalTokens
+		if capacity > remainingTokens {
+			capacity = remainingTokens
+		}
+		if value.Budget.UsedCost >= value.Budget.MaxCost {
+			capacity = 0
+		}
+	}
+	if capacity <= 0 {
+		return nil, nil
+	}
+	remainingRuns := value.Budget.MaxRuns - totalAttempts(value)
+	if capacity > remainingRuns {
+		capacity = remainingRuns
+	}
+	result := make([]NodeID, 0, capacity)
+	for _, node := range value.Nodes {
+		if node.Status == NodePending && dependenciesCompleted(value, node) {
+			result = append(result, node.ID)
+			if len(result) == capacity {
+				break
+			}
+		}
+	}
+	return result, nil
 }
 
 func findNode(value Workflow, id NodeID) (Node, bool) {

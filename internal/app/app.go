@@ -39,23 +39,25 @@ import (
 
 // Options contains process-owned CodePilot paths and terminal streams.
 type Options struct {
-	WorkingDirectory       string
-	ConfigDir              string
-	StateDir               string
-	ProviderProfile        string
-	Model                  string
-	Permission             string
-	SensitivePaths         []string
-	TrustWorkspace         bool
-	RelocateWorktree       codingagent.WorktreeID
-	SkipRelocation         bool
-	DisableProductTurns    bool
-	DisablePlanMode        bool
-	DisablePlanSuggestions bool
-	DisableWorkflows       bool
-	DisableSubagents       bool
-	Input                  io.Reader
-	Output                 io.Writer
+	WorkingDirectory         string
+	ConfigDir                string
+	StateDir                 string
+	ProviderProfile          string
+	Model                    string
+	Permission               string
+	SensitivePaths           []string
+	TrustWorkspace           bool
+	RelocateWorktree         codingagent.WorktreeID
+	SkipRelocation           bool
+	DisableProductTurns      bool
+	DisablePlanMode          bool
+	DisablePlanSuggestions   bool
+	DisableWorkflows         bool
+	DisableSubagents         bool
+	DisableParallelSubagents bool
+	MaxParallelAgents        int
+	Input                    io.Reader
+	Output                   io.Writer
 }
 
 // Application owns the composed product lifecycle.
@@ -204,6 +206,9 @@ func New(ctx context.Context, options Options) (*Application, error) {
 	if options.DisableSubagents {
 		features.Subagents = false
 	}
+	if options.DisableParallelSubagents {
+		features.ParallelSubagents = false
+	}
 	roles, err := roleprofile.NewDefaultRegistry()
 	if err != nil {
 		_ = bridge.Close()
@@ -212,7 +217,7 @@ func New(ctx context.Context, options Options) (*Application, error) {
 	service, err := codingagent.NewService(codingagent.Dependencies{
 		Sessions: productStore, Turns: productStore, Plans: productStore, Workflows: productStore, Children: productStore, AgentSessions: agentSessions, Worktrees: workspaceManager, Workspaces: workspaceManager,
 		Agent: agentRuntime, Tools: codingtools.NewFactory(codingtools.Options{Artifacts: productStore, Security: securityPolicy, Languages: language.NewDefaultRegistry(), Navigator: languageServers, Roles: roles}), Prompts: prompt.NewBuilderWithRegistry(roles), Events: bridge,
-		Providers: providerManager, Limits: agent.RunLimits{MaxSteps: 32, MaxDuration: 30 * time.Minute}, Features: &features, Roles: roles,
+		Providers: providerManager, Limits: agent.RunLimits{MaxSteps: 32, MaxDuration: 30 * time.Minute}, MaxParallelAgents: options.MaxParallelAgents, Features: &features, Roles: roles,
 	})
 	if err != nil {
 		_ = bridge.Close()

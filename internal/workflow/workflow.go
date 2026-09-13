@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path"
 	"sort"
 	"strings"
@@ -32,6 +33,9 @@ type Strategy string
 const (
 	StrategySingleAgent      Strategy = "workflow_single"
 	StrategyMultiAgentSerial Strategy = "workflow_multi_serial"
+	// StrategyMultiAgentParallelReadOnly permits concurrent child Agents only
+	// for capability profiles that cannot mutate the shared Worktree.
+	StrategyMultiAgentParallelReadOnly Strategy = "workflow_multi_parallel_readonly"
 )
 
 // Executor identifies whether the parent Agent or an independent child Agent
@@ -108,6 +112,15 @@ type Budget struct {
 	MaxAttempts    int `json:"max_attempts"`
 	MaxAgentSteps  int `json:"max_agent_steps"`
 	UsedAgentSteps int `json:"used_agent_steps,omitempty"`
+	// MaxAgents and MaxConcurrency are mandatory for parallel Workflows. They
+	// remain zero in P4/P5 records, preserving their serialized contract.
+	MaxAgents          int     `json:"max_agents,omitempty"`
+	MaxConcurrency     int     `json:"max_concurrency,omitempty"`
+	MaxTotalTokens     int     `json:"max_total_tokens,omitempty"`
+	UsedTotalTokens    int     `json:"used_total_tokens,omitempty"`
+	MaxCost            float64 `json:"max_cost,omitempty"`
+	UsedCost           float64 `json:"used_cost,omitempty"`
+	MaxDurationSeconds int64   `json:"max_duration_seconds,omitempty"`
 }
 
 type Scope struct {
@@ -168,13 +181,15 @@ const (
 )
 
 type Event struct {
-	ID         string    `json:"id"`
-	Type       EventType `json:"type"`
-	NodeID     NodeID    `json:"node_id,omitempty"`
-	ResultRef  string    `json:"result_ref,omitempty"`
-	Summary    string    `json:"summary,omitempty"`
-	AgentSteps int       `json:"agent_steps,omitempty"`
-	OccurredAt time.Time `json:"occurred_at"`
+	ID          string    `json:"id"`
+	Type        EventType `json:"type"`
+	NodeID      NodeID    `json:"node_id,omitempty"`
+	ResultRef   string    `json:"result_ref,omitempty"`
+	Summary     string    `json:"summary,omitempty"`
+	AgentSteps  int       `json:"agent_steps,omitempty"`
+	AgentTokens int       `json:"agent_tokens,omitempty"`
+	AgentCost   float64   `json:"agent_cost,omitempty"`
+	OccurredAt  time.Time `json:"occurred_at"`
 }
 
 type Repository interface {
@@ -191,7 +206,7 @@ func Validate(value Workflow) error {
 	if strings.TrimSpace(value.Plan.ID) == "" || value.Plan.Version == 0 || !hexDigest(value.Plan.Digest, 64) {
 		return errors.New("workflow requires an exact immutable Plan reference")
 	}
-	if value.Strategy != StrategySingleAgent && value.Strategy != StrategyMultiAgentSerial {
+	if value.Strategy != StrategySingleAgent && value.Strategy != StrategyMultiAgentSerial && value.Strategy != StrategyMultiAgentParallelReadOnly {
 		return fmt.Errorf("workflow strategy %q is unsupported", value.Strategy)
 	}
 	if !validStatus(value.Status) || value.Revision == 0 || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() || value.UpdatedAt.Before(value.CreatedAt) {
@@ -237,15 +252,36 @@ func Validate(value Workflow) error {
 		if value.Strategy == StrategyMultiAgentSerial && node.Role == RoleExplore && NodeExecutor(node) != ExecutorChild {
 			return errors.New("Workflow Explore nodes must be assigned to child Agents")
 		}
+		if value.Strategy == StrategyMultiAgentParallelReadOnly {
+			if NodeExecutor(node) != ExecutorChild || !node.Delegated {
+				return errors.New("parallel read-only Workflow nodes must be delegated to child Agents")
+			}
+			if !ReadOnlyCapability(node.Capability) || len(node.Scope.WritePaths) != 0 {
+				return errors.New("parallel Workflow nodes must use read-only capabilities without write scope")
+			}
+		}
 		if NodeExecutor(node) == ExecutorChild || node.Delegated {
 			childNodes++
 		}
 	}
-	if value.Strategy == StrategyMultiAgentSerial && childNodes == 0 {
-		return errors.New("multi-Agent serial workflow requires at least one child Agent node")
+	if (value.Strategy == StrategyMultiAgentSerial || value.Strategy == StrategyMultiAgentParallelReadOnly) && childNodes == 0 {
+		return errors.New("multi-Agent workflow requires at least one child Agent node")
 	}
-	if running > 1 {
+	if value.Strategy != StrategyMultiAgentParallelReadOnly && running > 1 {
 		return errors.New("single-Agent workflow cannot contain multiple running nodes")
+	}
+	if value.Strategy == StrategyMultiAgentParallelReadOnly {
+		if value.Budget.MaxAgents < len(value.Nodes) || value.Budget.MaxAgents > MaxNodes || value.Budget.MaxConcurrency < 2 || value.Budget.MaxConcurrency > value.Budget.MaxAgents {
+			return errors.New("parallel Workflow requires bounded Agent and concurrency quotas")
+		}
+		if value.Budget.MaxTotalTokens <= 0 || value.Budget.UsedTotalTokens < 0 || value.Budget.UsedTotalTokens > value.Budget.MaxTotalTokens || value.Budget.MaxCost <= 0 || value.Budget.UsedCost < 0 || value.Budget.UsedCost > value.Budget.MaxCost || math.IsNaN(value.Budget.MaxCost) || math.IsInf(value.Budget.MaxCost, 0) || math.IsNaN(value.Budget.UsedCost) || math.IsInf(value.Budget.UsedCost, 0) || value.Budget.MaxDurationSeconds <= 0 {
+			return errors.New("parallel Workflow requires valid token, cost, and duration budgets")
+		}
+		if running > value.Budget.MaxConcurrency {
+			return errors.New("parallel Workflow exceeds its concurrency quota")
+		}
+	} else if value.Budget.MaxAgents != 0 || value.Budget.MaxConcurrency != 0 || value.Budget.MaxTotalTokens != 0 || value.Budget.UsedTotalTokens != 0 || value.Budget.MaxCost != 0 || value.Budget.UsedCost != 0 || value.Budget.MaxDurationSeconds != 0 {
+		return errors.New("serial Workflow cannot declare parallel Agent quotas")
 	}
 	if usedRuns > value.Budget.MaxRuns {
 		return errors.New("workflow consumed more Agent runs than its parent budget")
@@ -394,11 +430,11 @@ func ApplyEvent(current Workflow, event Event) (Workflow, error) {
 	if err := Validate(current); err != nil {
 		return Workflow{}, fmt.Errorf("apply workflow event to invalid state: %w", err)
 	}
-	if !validIdentifier(event.ID) || event.OccurredAt.IsZero() || event.OccurredAt.Before(current.UpdatedAt) || event.AgentSteps < 0 {
+	if !validIdentifier(event.ID) || event.OccurredAt.IsZero() || event.OccurredAt.Before(current.UpdatedAt) || event.AgentSteps < 0 || event.AgentTokens < 0 || event.AgentCost < 0 || math.IsNaN(event.AgentCost) || math.IsInf(event.AgentCost, 0) {
 		return Workflow{}, errors.New("workflow event identity and ordered timestamp are required")
 	}
-	if event.AgentSteps != 0 && event.Type != EventNodeCompleted && event.Type != EventNodeFailed && event.Type != EventWorkflowCancelled {
-		return Workflow{}, errors.New("only a terminal Agent Run event can consume Workflow steps")
+	if (event.AgentSteps != 0 || event.AgentTokens != 0 || event.AgentCost != 0) && event.Type != EventNodeCompleted && event.Type != EventNodeFailed && event.Type != EventWorkflowCancelled {
+		return Workflow{}, errors.New("only a terminal Agent Run event can consume Workflow budget")
 	}
 	next := Clone(current)
 	nodeIndex := func(required bool) (int, error) {
@@ -421,6 +457,13 @@ func ApplyEvent(current Workflow, event Event) (Workflow, error) {
 			return errors.New("workflow Agent step budget was exceeded")
 		}
 		next.Budget.UsedAgentSteps += event.AgentSteps
+		if event.AgentTokens != 0 || event.AgentCost != 0 {
+			if next.Strategy != StrategyMultiAgentParallelReadOnly || next.Budget.UsedTotalTokens+event.AgentTokens > next.Budget.MaxTotalTokens || next.Budget.UsedCost+event.AgentCost > next.Budget.MaxCost {
+				return errors.New("workflow Agent token or cost budget was exceeded")
+			}
+			next.Budget.UsedTotalTokens += event.AgentTokens
+			next.Budget.UsedCost += event.AgentCost
+		}
 		return nil
 	}
 	switch event.Type {
@@ -434,7 +477,8 @@ func ApplyEvent(current Workflow, event Event) (Workflow, error) {
 		if err != nil {
 			return Workflow{}, err
 		}
-		if current.Status != StatusRunning || current.Nodes[index].Status != NodePending || activeNode(current) != "" || !dependenciesCompleted(current, current.Nodes[index]) || totalAttempts(current) >= current.Budget.MaxRuns || current.Budget.UsedAgentSteps >= current.Budget.MaxAgentSteps {
+		parallelCapacity := current.Strategy == StrategyMultiAgentParallelReadOnly && runningNodeCount(current) < current.Budget.MaxConcurrency
+		if current.Status != StatusRunning || current.Nodes[index].Status != NodePending || (!parallelCapacity && activeNode(current) != "") || !dependenciesCompleted(current, current.Nodes[index]) || totalAttempts(current) >= current.Budget.MaxRuns || current.Budget.UsedAgentSteps >= current.Budget.MaxAgentSteps {
 			return Workflow{}, fmt.Errorf("workflow node %q is not runnable", event.NodeID)
 		}
 		next.Nodes[index].Status = NodeRunning
@@ -631,6 +675,12 @@ func validRoleCapability(role Role, capability Capability) bool {
 		role == RoleIntegrate && capability == CapabilityIntegrate
 }
 
+// ReadOnlyCapability reports whether a node can safely share the active
+// Worktree with other concurrent readers.
+func ReadOnlyCapability(value Capability) bool {
+	return value == CapabilityExplore || value == CapabilityValidate || value == CapabilityReview
+}
+
 func validStatus(value Status) bool {
 	switch value {
 	case StatusPending, StatusRunning, StatusBlocked, StatusNeedsReplan, StatusCompleted, StatusCancelled, StatusFailed:
@@ -690,6 +740,16 @@ func activeNode(value Workflow) NodeID {
 		}
 	}
 	return ""
+}
+
+func runningNodeCount(value Workflow) int {
+	count := 0
+	for _, node := range value.Nodes {
+		if node.Status == NodeRunning {
+			count++
+		}
+	}
+	return count
 }
 
 func dependenciesCompleted(value Workflow, node Node) bool {

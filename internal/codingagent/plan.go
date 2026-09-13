@@ -210,8 +210,17 @@ func validatePlanSubmission(value PlanSubmission) error {
 		if step.Role != "" && step.Role != workflow.RoleExplore && step.Role != workflow.RoleImplement && step.Role != workflow.RoleValidate && step.Role != workflow.RoleReview && step.Role != workflow.RoleIntegrate {
 			return fmt.Errorf("Coding plan step %q has unknown role %q", step.ID, step.Role)
 		}
-		if step.Role == workflow.RoleExplore && value.RecommendedStrategy != ExecutionWorkflowMultiSerial {
-			return fmt.Errorf("Coding plan step %q can use Explore only with serial multi-Agent execution", step.ID)
+		if step.Role == workflow.RoleExplore && value.RecommendedStrategy != ExecutionWorkflowMultiSerial && value.RecommendedStrategy != ExecutionWorkflowMultiParallelReadOnly {
+			return fmt.Errorf("Coding plan step %q can use Explore only with multi-Agent execution", step.ID)
+		}
+		if value.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly {
+			role := step.Role
+			if role == "" {
+				role = workflow.RoleImplement
+			}
+			if role != workflow.RoleExplore && role != workflow.RoleValidate && role != workflow.RoleReview {
+				return fmt.Errorf("Coding plan step %q uses a write-capable role in parallel read-only execution", step.ID)
+			}
 		}
 		if step.FailureAction != "" && step.FailureAction != workflow.FailureRetry && step.FailureAction != workflow.FailureBlock && step.FailureAction != workflow.FailureReplan && step.FailureAction != workflow.FailureTerminate && step.FailureAction != workflow.FailureFallbackMain {
 			return fmt.Errorf("Coding plan step %q has unknown failure action %q", step.ID, step.FailureAction)

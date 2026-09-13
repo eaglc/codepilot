@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -98,6 +99,9 @@ const (
 	// ExecutionWorkflowMultiSerial delegates bounded nodes to independent child
 	// Agent sessions while keeping one active Agent at a time.
 	ExecutionWorkflowMultiSerial ExecutionStrategy = "workflow_multi_serial"
+	// ExecutionWorkflowMultiParallelReadOnly runs dependency-ready read-only
+	// child Agents concurrently against one shared Worktree.
+	ExecutionWorkflowMultiParallelReadOnly ExecutionStrategy = "workflow_multi_parallel_readonly"
 )
 
 // RunBinding explicitly relates one generic Agent Run to its Product Turn.
@@ -146,11 +150,14 @@ type Turn struct {
 	// PendingPlanExploreID is the one serial read-only child delegation requested
 	// by the parent Planning Agent. It is cleared only after the child is terminal.
 	PendingPlanExploreID ChildAgentID `json:"pending_plan_explore_id,omitempty"`
-	WorkflowID           string       `json:"workflow_id,omitempty"`
-	Revision             uint64       `json:"revision"`
-	CreatedAt            time.Time    `json:"created_at"`
-	UpdatedAt            time.Time    `json:"updated_at"`
-	CompletedAt          time.Time    `json:"completed_at,omitempty"`
+	// PendingPlanExploreIDs is one bounded parallel read-only exploration wave.
+	// The legacy singular field remains the persisted P5 compatibility path.
+	PendingPlanExploreIDs []ChildAgentID `json:"pending_plan_explore_ids,omitempty"`
+	WorkflowID            string         `json:"workflow_id,omitempty"`
+	Revision              uint64         `json:"revision"`
+	CreatedAt             time.Time      `json:"created_at"`
+	UpdatedAt             time.Time      `json:"updated_at"`
+	CompletedAt           time.Time      `json:"completed_at,omitempty"`
 }
 
 // ActiveRun returns the last non-terminal Run binding, if any.
@@ -206,6 +213,24 @@ func ValidateTurn(value Turn) error {
 	if value.PendingPlanExploreID != "" && (value.Phase != TurnPhasePlanning || value.Status != TurnRunning || value.Strategy != ExecutionSingle) {
 		return errors.New("pending Plan exploration requires one running read-only Planning turn")
 	}
+	if value.PendingPlanExploreID != "" && len(value.PendingPlanExploreIDs) != 0 {
+		return errors.New("serial and parallel Plan explorations cannot be pending together")
+	}
+	if len(value.PendingPlanExploreIDs) != 0 {
+		if len(value.PendingPlanExploreIDs) < 2 || len(value.PendingPlanExploreIDs) > maxParallelPlanExplorations || value.Phase != TurnPhasePlanning || value.Status != TurnRunning || value.Strategy != ExecutionSingle {
+			return errors.New("parallel Plan exploration requires a bounded running read-only Planning turn")
+		}
+		seen := make(map[ChildAgentID]struct{}, len(value.PendingPlanExploreIDs))
+		for _, childID := range value.PendingPlanExploreIDs {
+			if childID == "" {
+				return errors.New("parallel Plan exploration child identity is required")
+			}
+			if _, exists := seen[childID]; exists {
+				return errors.New("parallel Plan exploration child identities must be unique")
+			}
+			seen[childID] = struct{}{}
+		}
+	}
 	if isWorkflowStrategy(value.Strategy) && (value.Phase == TurnPhaseExecuting || value.Phase == TurnPhaseNeedsReplan) && value.WorkflowID == "" {
 		return errors.New("executing Workflow turn requires a durable Workflow identity")
 	}
@@ -235,14 +260,15 @@ func ValidateTurn(value Turn) error {
 		if binding.RunID == "" || !validRunPhaseProfile(binding.Phase, binding.Profile) {
 			return fmt.Errorf("Coding turn run binding %d has invalid identity, phase, or profile", index)
 		}
-		if binding.NodeID != "" && (!isWorkflowStrategy(value.Strategy) || binding.Phase != TurnPhaseExecuting || binding.Profile == CapabilityDirect || binding.Profile == CapabilityPlan || binding.Profile == CapabilityPlanWorkspace || binding.Profile == CapabilityExplore) {
+		invalidWorkflowProfile := binding.Profile == CapabilityDirect || binding.Profile == CapabilityPlan || binding.Profile == CapabilityPlanWorkspace || binding.Profile == CapabilityExplore && binding.ChildAgentID == ""
+		if binding.NodeID != "" && (!isWorkflowStrategy(value.Strategy) || binding.Phase != TurnPhaseExecuting || invalidWorkflowProfile) {
 			return fmt.Errorf("Coding turn run %q has an invalid Workflow node binding", binding.RunID)
 		}
 		if binding.NodeID == "" && (binding.Profile == CapabilityImplement || binding.Profile == CapabilityValidate || binding.Profile == CapabilityReview || binding.Profile == CapabilityIntegrate) {
 			return fmt.Errorf("Coding turn run %q requires a Workflow node binding", binding.RunID)
 		}
 		planExploreChild := binding.ChildAgentID != "" && binding.NodeID == "" && binding.Phase == TurnPhasePlanning && binding.Profile == CapabilityExplore
-		workflowChild := binding.ChildAgentID != "" && binding.NodeID != "" && value.Strategy == ExecutionWorkflowMultiSerial && binding.Phase == TurnPhaseExecuting
+		workflowChild := binding.ChildAgentID != "" && binding.NodeID != "" && (value.Strategy == ExecutionWorkflowMultiSerial || value.Strategy == ExecutionWorkflowMultiParallelReadOnly) && binding.Phase == TurnPhaseExecuting
 		if binding.ChildAgentID != "" && !planExploreChild && !workflowChild || binding.ChildAgentID == "" && binding.Profile == CapabilityExplore {
 			return fmt.Errorf("Coding turn run %q has an invalid child Agent binding", binding.RunID)
 		}
@@ -297,10 +323,11 @@ func ValidateTurn(value Turn) error {
 			lastActiveIndex = index
 		}
 	}
-	if activeRuns > 1 {
+	parallelPlanExploration := len(value.PendingPlanExploreIDs) >= 2 && value.Phase == TurnPhasePlanning
+	if activeRuns > 1 && value.Strategy != ExecutionWorkflowMultiParallelReadOnly && !parallelPlanExploration {
 		return errors.New("Coding turn cannot contain multiple active Runs")
 	}
-	if lastActiveIndex >= 0 && lastActiveIndex != len(value.Runs)-1 {
+	if lastActiveIndex >= 0 && lastActiveIndex != len(value.Runs)-1 && value.Strategy != ExecutionWorkflowMultiParallelReadOnly && !parallelPlanExploration {
 		return fmt.Errorf("Coding turn Run %q is active before the latest binding", value.Runs[lastActiveIndex].RunID)
 	}
 	latest := value.Runs[len(value.Runs)-1]
@@ -316,9 +343,9 @@ func ValidateTurn(value Turn) error {
 	case RunBindingInterrupted:
 		statusMatches = value.Status == TurnInterrupted
 	case RunBindingCompleted:
-		statusMatches = value.Status == TurnCompleted || isWorkflowStrategy(value.Strategy) && (value.Status == TurnRunning || value.Status == TurnCancelled) || latest.Profile == CapabilityExplore && value.Status == TurnRunning
+		statusMatches = value.Status == TurnCompleted || isWorkflowStrategy(value.Strategy) && (value.Status == TurnRunning || value.Status == TurnCancelled || value.Status == TurnFailed) || latest.Profile == CapabilityExplore && value.Status == TurnRunning
 	case RunBindingCancelled:
-		statusMatches = value.Status == TurnCancelled
+		statusMatches = value.Status == TurnCancelled || value.Status == TurnRunning && (value.Strategy == ExecutionWorkflowMultiParallelReadOnly || len(value.PendingPlanExploreIDs) != 0)
 	case RunBindingFailed:
 		statusMatches = value.Status == TurnFailed || isWorkflowStrategy(value.Strategy) && (value.Status == TurnRunning || value.Status == TurnCancelled) || latest.Profile == CapabilityExplore && value.Status == TurnRunning
 	}
@@ -348,6 +375,22 @@ func ValidateTurnTransition(previous, next Turn) error {
 	}
 	if previous.PendingPlanExploreID != "" && next.PendingPlanExploreID != "" && previous.PendingPlanExploreID != next.PendingPlanExploreID {
 		return errors.New("pending Plan exploration identity cannot be replaced")
+	}
+	if len(previous.PendingPlanExploreIDs) != 0 && len(next.PendingPlanExploreIDs) != 0 && !slices.Equal(previous.PendingPlanExploreIDs, next.PendingPlanExploreIDs) {
+		return errors.New("pending parallel Plan exploration identities cannot be replaced")
+	}
+	if len(previous.PendingPlanExploreIDs) != 0 && len(next.PendingPlanExploreIDs) == 0 && next.Status != TurnCancelled {
+		terminal := make(map[ChildAgentID]bool, len(previous.PendingPlanExploreIDs))
+		for _, binding := range next.Runs {
+			if binding.Profile == CapabilityExplore && binding.ChildAgentID != "" && (binding.Status == RunBindingCompleted || binding.Status == RunBindingFailed || binding.Status == RunBindingCancelled) {
+				terminal[binding.ChildAgentID] = true
+			}
+		}
+		for _, childID := range previous.PendingPlanExploreIDs {
+			if !terminal[childID] {
+				return errors.New("pending parallel Plan explorations cannot clear before every child Run is terminal")
+			}
+		}
 	}
 	if !validTurnPhaseTransition(previous.Phase, next.Phase) {
 		return fmt.Errorf("Coding turn phase cannot transition from %q to %q", previous.Phase, next.Phase)
@@ -391,8 +434,8 @@ func ValidateTurnTransition(previous, next Turn) error {
 	if len(next.Runs) != len(previous.Runs) {
 		latest := previous.Runs[len(previous.Runs)-1]
 		appended := next.Runs[len(next.Runs)-1]
-		workflowContinuation := isWorkflowStrategy(previous.Strategy) && previous.Phase == TurnPhaseExecuting && previous.Status == TurnRunning && (latest.Status == RunBindingCompleted || latest.Status == RunBindingFailed)
-		planExploreContinuation := previous.Phase == TurnPhasePlanning && latest.Profile == CapabilityExplore && (latest.Status == RunBindingCompleted || latest.Status == RunBindingFailed)
+		workflowContinuation := isWorkflowStrategy(previous.Strategy) && previous.Phase == TurnPhaseExecuting && previous.Status == TurnRunning && (latest.Status == RunBindingCompleted || latest.Status == RunBindingFailed || previous.Strategy == ExecutionWorkflowMultiParallelReadOnly && (latest.Status == RunBindingPending || latest.Status == RunBindingRunning))
+		planExploreContinuation := previous.Phase == TurnPhasePlanning && latest.Profile == CapabilityExplore && (latest.Status == RunBindingCompleted || latest.Status == RunBindingFailed || len(previous.PendingPlanExploreIDs) >= 2 && (latest.Status == RunBindingPending || latest.Status == RunBindingRunning))
 		if previous.Status != TurnRunning || (latest.Status != RunBindingHandedOff && !workflowContinuation && !planExploreContinuation) || appended.Status != RunBindingPending || appended.UserEntryID != "" || appended.Phase != next.Phase {
 			return errors.New("Coding turn can append a continuation Run only after a control handoff")
 		}
@@ -414,18 +457,18 @@ func validRunPhaseProfile(phase TurnPhase, profile CapabilityProfile) bool {
 	case TurnPhasePlanning:
 		return profile == CapabilityPlan || profile == CapabilityPlanWorkspace || profile == CapabilityExplore
 	case TurnPhaseDirect, TurnPhaseAwaitingPlanEntryApproval, TurnPhaseExecuting:
-		return profile == CapabilityDirect || phase == TurnPhaseExecuting && (profile == CapabilityImplement || profile == CapabilityValidate || profile == CapabilityReview || profile == CapabilityIntegrate)
+		return profile == CapabilityDirect || phase == TurnPhaseExecuting && (profile == CapabilityExplore || profile == CapabilityImplement || profile == CapabilityValidate || profile == CapabilityReview || profile == CapabilityIntegrate)
 	default:
 		return false
 	}
 }
 
 func validExecutionStrategy(value ExecutionStrategy) bool {
-	return value == ExecutionSingle || value == ExecutionWorkflowSingle || value == ExecutionWorkflowMultiSerial
+	return value == ExecutionSingle || value == ExecutionWorkflowSingle || value == ExecutionWorkflowMultiSerial || value == ExecutionWorkflowMultiParallelReadOnly
 }
 
 func isWorkflowStrategy(value ExecutionStrategy) bool {
-	return value == ExecutionWorkflowSingle || value == ExecutionWorkflowMultiSerial
+	return value == ExecutionWorkflowSingle || value == ExecutionWorkflowMultiSerial || value == ExecutionWorkflowMultiParallelReadOnly
 }
 
 func latestPhaseMatchesTurn(turnPhase, runPhase TurnPhase) bool {

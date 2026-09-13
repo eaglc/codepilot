@@ -104,6 +104,9 @@ func (s *Service) prepareRunEnvironment(ctx context.Context, product Session, tu
 		}
 		if profile == CapabilityPlanWorkspace && s.features.Subagents && s.deps.Children != nil {
 			extra = append(extra, &delegatePlanExploreTool{children: s.deps.Children, turns: s.deps.Turns, roles: s.deps.Roles, session: product.ID, turnID: turn.ID})
+			if s.features.ParallelSubagents {
+				extra = append(extra, &delegatePlanExploresTool{children: s.deps.Children, turns: s.deps.Turns, roles: s.deps.Roles, session: product.ID, turnID: turn.ID})
+			}
 		}
 		tools, err = mergeToolRegistry(tools, extra...)
 		if err != nil {
@@ -204,7 +207,7 @@ func (s *Service) prepareRunEnvironment(ctx context.Context, product Session, tu
 			if encodeErr != nil {
 				return runEnvironment{}, fmt.Errorf("build Planning context: encode child Agent result: %w", encodeErr)
 			}
-			untrustedContext = append(untrustedContext, llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "This is the product-validated structured result from the one read-only Plan exploration child. Its transcript is intentionally excluded. Use the evidence as planning context and verify important facts before submitting the Plan.\n" + string(encoded)}}})
+			untrustedContext = append(untrustedContext, llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "This is a product-validated structured result from a read-only Plan exploration child. Its transcript is intentionally excluded. Combine independent evidence carefully and verify important facts before submitting the Plan.\n" + string(encoded)}}})
 		}
 	}
 	revisions := productRevisionSource{service: s}
@@ -273,9 +276,13 @@ func (s *Service) finishProductRun(ctx context.Context, turn Turn, result agent.
 			switch bindingStatus {
 			case RunBindingCompleted, RunBindingFailed, RunBindingHandedOff:
 				turnStatus = TurnRunning
+			case RunBindingCancelled:
+				if turn.Strategy == ExecutionWorkflowMultiParallelReadOnly {
+					turnStatus = TurnRunning
+				}
 			}
 		}
-		if turn.Runs[index].ChildAgentID != "" && turn.Runs[index].Profile == CapabilityExplore && (bindingStatus == RunBindingCompleted || bindingStatus == RunBindingFailed) {
+		if turn.Runs[index].ChildAgentID != "" && turn.Runs[index].Profile == CapabilityExplore && (bindingStatus == RunBindingCompleted || bindingStatus == RunBindingFailed || bindingStatus == RunBindingCancelled && len(turn.PendingPlanExploreIDs) != 0) {
 			turnStatus = TurnRunning
 		}
 		turn.Runs[index].Status = bindingStatus
@@ -370,6 +377,9 @@ func (s *Service) ContinueTurn(ctx context.Context, sessionID SessionID, turnID 
 
 // continueTurnLocked requires the caller to hold the product Session operation lock.
 func (s *Service) continueTurnLocked(ctx context.Context, product Session, turn Turn) (TurnResult, error) {
+	if len(turn.PendingPlanExploreIDs) != 0 {
+		return s.runParallelPlanExploreChildrenLocked(ctx, product, turn)
+	}
 	if turn.PendingPlanExploreID != "" {
 		return s.runPlanExploreChildLocked(ctx, product, turn)
 	}
@@ -483,7 +493,7 @@ func (s *Service) continueTurnLocked(ctx context.Context, product Session, turn 
 			return productResult, fmt.Errorf("continue Coding Agent turn: publish Plan creation: %w", err)
 		}
 	}
-	if result.Status == agent.RunHandedOff && turn.Status == TurnRunning && turn.Phase == TurnPhasePlanning && (turn.Runs[len(turn.Runs)-1].Profile == CapabilityPlan || turn.PendingPlanExploreID != "") {
+	if result.Status == agent.RunHandedOff && turn.Status == TurnRunning && turn.Phase == TurnPhasePlanning && (turn.Runs[len(turn.Runs)-1].Profile == CapabilityPlan || turn.PendingPlanExploreID != "" || len(turn.PendingPlanExploreIDs) != 0) {
 		if touchErr != nil {
 			return productResult, fmt.Errorf("continue Coding Agent turn: update product session: %w", touchErr)
 		}

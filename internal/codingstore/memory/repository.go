@@ -642,6 +642,7 @@ func cloneSession(value codingagent.Session) codingagent.Session {
 
 func cloneTurn(value codingagent.Turn) codingagent.Turn {
 	value.Runs = append([]codingagent.RunBinding(nil), value.Runs...)
+	value.PendingPlanExploreIDs = append([]codingagent.ChildAgentID(nil), value.PendingPlanExploreIDs...)
 	for index := range value.Runs {
 		value.Runs[index].TerminalOutput = append([]byte(nil), value.Runs[index].TerminalOutput...)
 	}

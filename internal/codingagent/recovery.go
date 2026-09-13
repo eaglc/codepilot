@@ -272,6 +272,13 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 	}
 	completed := 0
 	for _, turn := range turns {
+		if len(turn.PendingPlanExploreIDs) != 0 && turn.Status == TurnRunning && turn.Phase == TurnPhasePlanning {
+			if _, continueErr := s.runParallelPlanExploreChildrenLocked(ctx, product, turn); continueErr != nil {
+				return completed, fmt.Errorf("coordinate Coding Agent recovery: continue parallel Plan explorations: %w", continueErr)
+			}
+			completed++
+			continue
+		}
 		binding, active := turn.ActiveRun()
 		if !active {
 			if turn.PendingPlanExploreID != "" && len(turn.Runs) != 0 {

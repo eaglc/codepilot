@@ -113,6 +113,75 @@ func TestTerminalRunCannotOverconsumeParentStepBudget(t *testing.T) {
 	}
 }
 
+func TestParallelReadOnlySchedulerReturnsIndependentRunnableSet(t *testing.T) {
+	value := parallelReadOnlyWorkflow()
+	now := value.CreatedAt
+	value = apply(t, value, Event{ID: "parallel-start", Type: EventWorkflowStarted, OccurredAt: now.Add(time.Second)})
+	runnable, err := RunnableNodes(value)
+	if err != nil || len(runnable) != 2 || runnable[0] != "explore-api" || runnable[1] != "explore-ui" {
+		t.Fatalf("RunnableNodes = %#v, %v", runnable, err)
+	}
+	value = apply(t, value, Event{ID: "start-api", Type: EventNodeStarted, NodeID: "explore-api", OccurredAt: now.Add(2 * time.Second)})
+	value = apply(t, value, Event{ID: "start-ui", Type: EventNodeStarted, NodeID: "explore-ui", OccurredAt: now.Add(3 * time.Second)})
+	if runnable, err = RunnableNodes(value); err != nil || len(runnable) != 0 {
+		t.Fatalf("RunnableNodes at capacity = %#v, %v", runnable, err)
+	}
+	value = apply(t, value, Event{ID: "complete-ui", Type: EventNodeCompleted, NodeID: "explore-ui", ResultRef: "child:ui", OccurredAt: now.Add(4 * time.Second)})
+	if runnable, err = RunnableNodes(value); err != nil || len(runnable) != 0 {
+		t.Fatalf("dependent node ran before every dependency: %#v, %v", runnable, err)
+	}
+	value = apply(t, value, Event{ID: "complete-api", Type: EventNodeCompleted, NodeID: "explore-api", ResultRef: "child:api", OccurredAt: now.Add(5 * time.Second)})
+	if runnable, err = RunnableNodes(value); err != nil || len(runnable) != 1 || runnable[0] != "review" {
+		t.Fatalf("dependent runnable set = %#v, %v", runnable, err)
+	}
+}
+
+func TestParallelReadOnlyWorkflowRejectsWritesAndQuotaOverflow(t *testing.T) {
+	base := parallelReadOnlyWorkflow()
+	tests := []struct {
+		name   string
+		mutate func(*Workflow)
+	}{
+		{name: "write capability", mutate: func(value *Workflow) {
+			value.Nodes[0].Role, value.Nodes[0].Capability = RoleImplement, CapabilityImplement
+			value.Nodes[0].Scope.WritePaths = []string{"internal"}
+		}},
+		{name: "main executor", mutate: func(value *Workflow) { value.Nodes[0].Executor = ExecutorMain }},
+		{name: "one concurrency slot", mutate: func(value *Workflow) { value.Budget.MaxConcurrency = 1 }},
+		{name: "too few Agents", mutate: func(value *Workflow) { value.Budget.MaxAgents = 2 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := Clone(base)
+			test.mutate(&value)
+			if err := Validate(value); err == nil {
+				t.Fatal("Validate accepted unsafe parallel Workflow")
+			}
+		})
+	}
+}
+
+func TestParallelReadOnlyFailureIsolatedUntilDependencyPropagation(t *testing.T) {
+	value := parallelReadOnlyWorkflow()
+	now := value.CreatedAt
+	value = apply(t, value, Event{ID: "start-isolation", Type: EventWorkflowStarted, OccurredAt: now.Add(time.Second)})
+	value = apply(t, value, Event{ID: "start-api-isolation", Type: EventNodeStarted, NodeID: "explore-api", OccurredAt: now.Add(2 * time.Second)})
+	value = apply(t, value, Event{ID: "start-ui-isolation", Type: EventNodeStarted, NodeID: "explore-ui", OccurredAt: now.Add(3 * time.Second)})
+	value = apply(t, value, Event{ID: "fail-api-isolation", Type: EventNodeFailed, NodeID: "explore-api", Summary: "API inspection failed", AgentSteps: 2, AgentTokens: 200, AgentCost: 0.2, OccurredAt: now.Add(4 * time.Second)})
+	value = apply(t, value, Event{ID: "complete-ui-isolation", Type: EventNodeCompleted, NodeID: "explore-ui", ResultRef: "child:ui", AgentSteps: 3, AgentTokens: 300, AgentCost: 0.3, OccurredAt: now.Add(5 * time.Second)})
+	if value.Nodes[1].Status != NodeCompleted || value.Nodes[1].ResultRef != "child:ui" {
+		t.Fatalf("unrelated node result was lost after peer failure: %#v", value.Nodes[1])
+	}
+	if value.Budget.UsedAgentSteps != 5 || value.Budget.UsedTotalTokens != 500 || value.Budget.UsedCost != 0.5 {
+		t.Fatalf("parallel usage accounting = %#v", value.Budget)
+	}
+	assertAction(t, value, ActionBlockNode, "explore-api")
+	value = apply(t, value, Event{ID: "block-api-isolation", Type: EventNodeBlocked, NodeID: "explore-api", Summary: "API inspection failed", OccurredAt: now.Add(6 * time.Second)})
+	assertAction(t, value, ActionBlockNode, "review")
+	value = apply(t, value, Event{ID: "block-review-isolation", Type: EventNodeBlocked, NodeID: "review", Summary: "dependency explore-api did not complete", OccurredAt: now.Add(7 * time.Second)})
+	assertAction(t, value, ActionBlockWorkflow, "")
+}
+
 func testWorkflow() Workflow {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	return Workflow{
@@ -122,6 +191,21 @@ func testWorkflow() Workflow {
 			{ID: "implement", Goal: "Implement the bounded change.", Role: RoleImplement, Capability: CapabilityImplement, Scope: Scope{ReadPaths: []string{"internal"}, WritePaths: []string{"internal"}}, AcceptanceCriteria: []string{"Implementation is complete."}, FailureAction: FailureRetry, MaxAttempts: 2, Status: NodePending},
 			{ID: "validate", Goal: "Validate the implementation.", DependsOn: []NodeID{"implement"}, Role: RoleValidate, Capability: CapabilityValidate, Scope: Scope{ReadPaths: []string{"internal"}}, AcceptanceCriteria: []string{"Tests pass."}, FailureAction: FailureBlock, MaxAttempts: 1, Status: NodePending},
 			{ID: "review", Goal: "Review the final result.", DependsOn: []NodeID{"validate"}, Role: RoleReview, Capability: CapabilityReview, Scope: Scope{ReadPaths: []string{"internal"}}, AcceptanceCriteria: []string{"Approved scope is satisfied."}, FailureAction: FailureReplan, MaxAttempts: 1, Status: NodePending},
+		},
+		Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func parallelReadOnlyWorkflow() Workflow {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	return Workflow{
+		ID: "parallel-workflow", OwnerID: "turn-1", Plan: PlanReference{ID: "plan-1", Version: 3, Digest: strings.Repeat("a", 64)},
+		Strategy: StrategyMultiAgentParallelReadOnly, Status: StatusPending,
+		Budget: Budget{MaxNodes: 3, MaxRuns: 3, MaxAttempts: 1, MaxAgentSteps: 96, MaxAgents: 3, MaxConcurrency: 2, MaxTotalTokens: 3000, MaxCost: 3, MaxDurationSeconds: 60},
+		Nodes: []Node{
+			{ID: "explore-api", Goal: "Explore API.", Role: RoleExplore, Capability: CapabilityExplore, Executor: ExecutorChild, Delegated: true, Scope: Scope{ReadPaths: []string{"internal/api"}}, AcceptanceCriteria: []string{"API evidence collected."}, FailureAction: FailureBlock, MaxAttempts: 1, Status: NodePending},
+			{ID: "explore-ui", Goal: "Explore UI.", Role: RoleExplore, Capability: CapabilityExplore, Executor: ExecutorChild, Delegated: true, Scope: Scope{ReadPaths: []string{"internal/ui"}}, AcceptanceCriteria: []string{"UI evidence collected."}, FailureAction: FailureBlock, MaxAttempts: 1, Status: NodePending},
+			{ID: "review", Goal: "Review evidence.", DependsOn: []NodeID{"explore-api", "explore-ui"}, Role: RoleReview, Capability: CapabilityReview, Executor: ExecutorChild, Delegated: true, Scope: Scope{ReadPaths: []string{"internal"}}, AcceptanceCriteria: []string{"Evidence reviewed."}, FailureAction: FailureBlock, MaxAttempts: 1, Status: NodePending},
 		},
 		Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}

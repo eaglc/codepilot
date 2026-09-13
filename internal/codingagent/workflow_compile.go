@@ -60,7 +60,7 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 			dependencies[index] = workflow.NodeID(dependency)
 		}
 		executor := workflow.ExecutorMain
-		if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial {
+		if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial || plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly {
 			executor = workflow.ExecutorChild
 		}
 		nodes = append(nodes, workflow.Node{
@@ -80,12 +80,12 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 	}
 	nodes = append(nodes, workflow.Node{
 		ID: finalID, Goal: "Validate the combined result against the approved Plan acceptance criteria.", DependsOn: leaves,
-		Role: validateDefinition.Role, Capability: validateDefinition.Workflow.Capability, Executor: workflow.ExecutorMain, PolicyVersion: validateDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
+		Role: validateDefinition.Role, Capability: validateDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(plan.RecommendedStrategy), Delegated: plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly, PolicyVersion: validateDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
 		AcceptanceCriteria: append([]string(nil), plan.AcceptanceCriteria...), FailureAction: validateDefinition.Workflow.DefaultFailure, MaxAttempts: validateDefinition.Workflow.DefaultAttempts, Status: workflow.NodePending,
 	})
 	totalRuns += validateDefinition.Workflow.DefaultAttempts
 	maximumAttempts = max(maximumAttempts, validateDefinition.Workflow.DefaultAttempts)
-	if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial {
+	if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial || plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly {
 		reviewDefinition, resolveErr := roles.ResolveRole(workflow.RoleReview)
 		if resolveErr != nil {
 			return workflow.Workflow{}, fmt.Errorf("compile Coding workflow: final review role: %w", resolveErr)
@@ -93,7 +93,7 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 		reviewID := uniqueFinalNodeID(nodes, "workflow-final-review")
 		nodes = append(nodes, workflow.Node{
 			ID: reviewID, Goal: "Review and summarize the complete multi-Agent result for the user.", DependsOn: []workflow.NodeID{finalID},
-			Role: reviewDefinition.Role, Capability: reviewDefinition.Workflow.Capability, Executor: workflow.ExecutorMain, PolicyVersion: reviewDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
+			Role: reviewDefinition.Role, Capability: reviewDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(plan.RecommendedStrategy), Delegated: plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly, PolicyVersion: reviewDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
 			AcceptanceCriteria: append([]string(nil), plan.AcceptanceCriteria...), FailureAction: reviewDefinition.Workflow.DefaultFailure, MaxAttempts: reviewDefinition.Workflow.DefaultAttempts, Status: workflow.NodePending,
 		})
 		totalRuns += reviewDefinition.Workflow.DefaultAttempts
@@ -105,6 +105,13 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 		Plan: workflow.PlanReference{ID: string(plan.ID), Version: plan.Version, Digest: plan.Digest}, Strategy: workflowStrategyForExecution(plan.RecommendedStrategy),
 		Status: workflow.StatusPending, Budget: workflow.Budget{MaxNodes: len(nodes), MaxRuns: totalRuns, MaxAttempts: maximumAttempts, MaxAgentSteps: totalRuns * 32},
 		Nodes: nodes, Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly {
+		value.Budget.MaxAgents = len(nodes)
+		value.Budget.MaxConcurrency = min(2, len(nodes))
+		value.Budget.MaxTotalTokens = 2_000_000
+		value.Budget.MaxCost = 50
+		value.Budget.MaxDurationSeconds = int64((30 * time.Minute) / time.Second)
 	}
 	if err := workflow.Validate(value); err != nil {
 		return workflow.Workflow{}, fmt.Errorf("compile Coding workflow: %w", err)
@@ -165,5 +172,15 @@ func workflowStrategyForExecution(value ExecutionStrategy) workflow.Strategy {
 	if value == ExecutionWorkflowMultiSerial {
 		return workflow.StrategyMultiAgentSerial
 	}
+	if value == ExecutionWorkflowMultiParallelReadOnly {
+		return workflow.StrategyMultiAgentParallelReadOnly
+	}
 	return workflow.StrategySingleAgent
+}
+
+func workflowExecutorForStrategy(value ExecutionStrategy) workflow.Executor {
+	if value == ExecutionWorkflowMultiParallelReadOnly {
+		return workflow.ExecutorChild
+	}
+	return workflow.ExecutorMain
 }

@@ -35,16 +35,17 @@ type ContinuationRunner interface {
 
 // FeatureFlags controls independently reversible product capabilities.
 type FeatureFlags struct {
-	ProductTurns    bool
-	PlanMode        bool
-	PlanSuggestions bool
-	Workflows       bool
-	Subagents       bool
+	ProductTurns      bool
+	PlanMode          bool
+	PlanSuggestions   bool
+	Workflows         bool
+	Subagents         bool
+	ParallelSubagents bool
 }
 
 // DefaultFeatureFlags returns the current stable product defaults.
 func DefaultFeatureFlags() FeatureFlags {
-	return FeatureFlags{ProductTurns: true, PlanMode: true, PlanSuggestions: true, Workflows: true, Subagents: true}
+	return FeatureFlags{ProductTurns: true, PlanMode: true, PlanSuggestions: true, Workflows: true, Subagents: true, ParallelSubagents: true}
 }
 
 // ToolScope contains immutable trusted Coding facts captured before model-controlled execution.
@@ -114,21 +115,25 @@ type Dependencies struct {
 	Events        EventSink
 	Providers     ProviderManager
 	Limits        agent.RunLimits
-	Features      *FeatureFlags
-	Roles         *roleprofile.Registry
+	// MaxParallelAgents bounds child Agent executions across all sessions owned
+	// by this Service. Zero selects the product default.
+	MaxParallelAgents int
+	Features          *FeatureFlags
+	Roles             *roleprofile.Registry
 }
 
 // Service owns Coding session lifecycle while delegating model/tool loops to generic Agent.
 type Service struct {
-	deps        Dependencies
-	mu          sync.RWMutex
-	states      map[SessionID]RuntimeState
-	operations  map[SessionID]*sync.Mutex
-	activeTurns map[SessionID]activeTurn
-	activeSeq   uint64
-	active      SessionID
-	eventSeq    uint64
-	features    FeatureFlags
+	deps          Dependencies
+	mu            sync.RWMutex
+	states        map[SessionID]RuntimeState
+	operations    map[SessionID]*sync.Mutex
+	activeTurns   map[SessionID]activeTurn
+	activeSeq     uint64
+	active        SessionID
+	eventSeq      uint64
+	features      FeatureFlags
+	parallelSlots chan struct{}
 }
 
 // NewService validates and creates a Coding Agent product service.
@@ -174,17 +179,40 @@ func NewService(deps Dependencies) (*Service, error) {
 		features.PlanSuggestions = false
 		features.Workflows = false
 		features.Subagents = false
+		features.ParallelSubagents = false
 	}
 	if !features.PlanMode {
 		features.PlanSuggestions = false
 	}
 	if deps.Children == nil {
 		features.Subagents = false
+		features.ParallelSubagents = false
+	}
+	if !features.Subagents {
+		features.ParallelSubagents = false
+	}
+	if deps.MaxParallelAgents == 0 {
+		deps.MaxParallelAgents = 8
+	}
+	if deps.MaxParallelAgents < 1 || deps.MaxParallelAgents > workflow.MaxNodes {
+		return nil, errors.New("create Coding Agent service: global parallel Agent limit must be between 1 and 64")
+	}
+	if features.ParallelSubagents && deps.MaxParallelAgents < 2 {
+		return nil, errors.New("create Coding Agent service: parallel subagents require a global Agent limit of at least 2")
 	}
 	if deps.Sessions == nil || (features.ProductTurns && deps.Turns == nil) || (features.PlanMode && deps.Plans == nil) || (features.Workflows && deps.Workflows == nil) || deps.AgentSessions == nil || deps.Worktrees == nil || deps.Agent == nil || deps.Tools == nil || deps.Prompts == nil || deps.Events == nil {
 		return nil, errors.New("create Coding Agent service: dependencies are incomplete")
 	}
-	return &Service{deps: deps, features: features, states: make(map[SessionID]RuntimeState), operations: make(map[SessionID]*sync.Mutex), activeTurns: make(map[SessionID]activeTurn)}, nil
+	return &Service{deps: deps, features: features, states: make(map[SessionID]RuntimeState), operations: make(map[SessionID]*sync.Mutex), activeTurns: make(map[SessionID]activeTurn), parallelSlots: make(chan struct{}, deps.MaxParallelAgents)}, nil
+}
+
+func (s *Service) acquireParallelAgent(ctx context.Context) (func(), error) {
+	select {
+	case s.parallelSlots <- struct{}{}:
+		return func() { <-s.parallelSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 type activeTurn struct {
@@ -593,8 +621,11 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 		if isWorkflowStrategy(selected) && (!s.features.Workflows || s.deps.Workflows == nil) {
 			return TurnResult{}, errors.New("resume Coding Agent turn: Workflow execution is disabled")
 		}
-		if selected == ExecutionWorkflowMultiSerial && (!s.features.Subagents || s.deps.Children == nil) {
-			return TurnResult{}, errors.New("resume Coding Agent turn: multi-Agent serial execution is disabled")
+		if (selected == ExecutionWorkflowMultiSerial || selected == ExecutionWorkflowMultiParallelReadOnly) && (!s.features.Subagents || s.deps.Children == nil) {
+			return TurnResult{}, errors.New("resume Coding Agent turn: multi-Agent execution is disabled")
+		}
+		if selected == ExecutionWorkflowMultiParallelReadOnly && !s.features.ParallelSubagents {
+			return TurnResult{}, errors.New("resume Coding Agent turn: parallel read-only execution is disabled")
 		}
 		if turn.Strategy != selected {
 			expected := turn.Revision
@@ -1074,6 +1105,8 @@ func (s *Service) projectWorkflowSnapshot(ctx context.Context, snapshot *Snapsho
 	strategy := ExecutionWorkflowSingle
 	if durable.Strategy == workflow.StrategyMultiAgentSerial {
 		strategy = ExecutionWorkflowMultiSerial
+	} else if durable.Strategy == workflow.StrategyMultiAgentParallelReadOnly {
+		strategy = ExecutionWorkflowMultiParallelReadOnly
 	}
 	value := WorkflowSnapshot{
 		ID: string(durable.ID), TurnID: selected.ID, PlanID: selected.PlanID, PlanVersion: durable.Plan.Version, PlanDigest: durable.Plan.Digest,
@@ -1328,11 +1361,23 @@ func (s *Service) CancelTurn(ctx context.Context, id SessionID) error {
 			if turn.Status == TurnCompleted || turn.Status == TurnCancelled || turn.Status == TurnFailed {
 				continue
 			}
-			childID := turn.PendingPlanExploreID
-			if binding, active := turn.ActiveRun(); active && binding.ChildAgentID != "" {
-				childID = binding.ChildAgentID
+			childIDs := append([]ChildAgentID(nil), turn.PendingPlanExploreIDs...)
+			if turn.PendingPlanExploreID != "" {
+				childIDs = append(childIDs, turn.PendingPlanExploreID)
 			}
-			if childID != "" && s.deps.Children != nil {
+			if binding, active := turn.ActiveRun(); active && binding.ChildAgentID != "" {
+				found := false
+				for _, childID := range childIDs {
+					found = found || childID == binding.ChildAgentID
+				}
+				if !found {
+					childIDs = append(childIDs, binding.ChildAgentID)
+				}
+			}
+			for _, childID := range childIDs {
+				if childID == "" || s.deps.Children == nil {
+					continue
+				}
 				child, loadErr := s.deps.Children.LoadChildAgent(ctx, childID)
 				if loadErr != nil {
 					return fmt.Errorf("cancel Coding child Agent: load state: %w", loadErr)
@@ -1375,9 +1420,9 @@ func (s *Service) CancelTurn(ctx context.Context, id SessionID) error {
 func (s *Service) cancelProductTurn(ctx context.Context, turn Turn, reason string) (Turn, error) {
 	now := time.Now().UTC()
 	expected := turn.Revision
-	if binding, active := turn.ActiveRun(); active {
+	if _, active := turn.ActiveRun(); active {
 		for index := range turn.Runs {
-			if turn.Runs[index].RunID != binding.RunID {
+			if turn.Runs[index].Status != RunBindingPending && turn.Runs[index].Status != RunBindingRunning && turn.Runs[index].Status != RunBindingInterrupted {
 				continue
 			}
 			turn.Runs[index].Status = RunBindingCancelled
@@ -1386,13 +1431,13 @@ func (s *Service) cancelProductTurn(ctx context.Context, turn Turn, reason strin
 				turn.Runs[index].StartedAt = now
 			}
 			turn.Runs[index].FinishedAt = now
-			break
 		}
-	} else if len(turn.Runs) != 0 && turn.Runs[len(turn.Runs)-1].Status == RunBindingHandedOff && turn.PendingPlanExploreID != "" {
+	} else if len(turn.Runs) != 0 && turn.Runs[len(turn.Runs)-1].Status == RunBindingHandedOff && (turn.PendingPlanExploreID != "" || len(turn.PendingPlanExploreIDs) != 0) {
 		turn.Runs[len(turn.Runs)-1].Status = RunBindingCancelled
 		turn.Runs[len(turn.Runs)-1].Reason = reason
 	}
 	turn.PendingPlanExploreID = ""
+	turn.PendingPlanExploreIDs = nil
 	turn.Status = TurnCancelled
 	turn.CompletedAt = now
 	turn.UpdatedAt = now
