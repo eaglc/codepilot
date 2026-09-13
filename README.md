@@ -66,7 +66,7 @@ Common commands:
 
 `/fork` opens the conversation history so no internal entry ID is required. `/clear` starts a new persisted session without deleting the previous session or changing worktree files.
 
-Plan mode is scoped to one task. An Agent suggestion offers **Enter Plan mode**, **Continue Direct**, or **Cancel task**; it never switches modes or grants write permission without the user's choice. `--disable-plan-suggestions` disables new Agent suggestions while preserving explicit `/plan`; `--disable-plan-mode` disables both new Plan entry paths while keeping previously persisted Plan decisions recoverable.
+Plan mode is scoped to one task. An Agent suggestion offers **Enter Plan mode**, **Continue Direct**, or **Cancel task**; it never switches modes or grants write permission without the user's choice. Every submitted Plan is an immutable version bound to an exact workspace baseline and digest. Before approval and execution, CodePilot distinguishes unrelated workspace drift from changes to Plan-relevant files or worktree identity; material drift returns to read-only planning and requires a new version. During execution, a material assumption, scope, risk, strategy, or workspace deviation pauses at an explicit **Return to Plan mode / Continue approved Plan / Cancel task** boundary. `--disable-plan-suggestions` disables new Agent suggestions while preserving explicit `/plan`; `--disable-plan-mode` disables both new Plan entry paths while keeping previously persisted Plan decisions recoverable.
 
 ## Permissions and safety
 

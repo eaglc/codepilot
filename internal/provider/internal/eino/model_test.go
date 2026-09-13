@@ -2,7 +2,9 @@ package einoadapter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -103,6 +105,47 @@ func TestStreamNormalizesMessagesToolsAndTerminalResponse(t *testing.T) {
 	}
 }
 
+func TestStreamKeepsToolCallIdentityAcrossArgumentChunks(t *testing.T) {
+	index := 0
+	inner := &fakeModel{streamChunks: []*schema.Message{
+		{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{Index: &index, ID: "call-plan", Type: "function", Function: schema.FunctionCall{Name: "exit_plan_mode", Arguments: `{"goal":"`}}}},
+		{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{Index: &index, Function: schema.FunctionCall{Arguments: `trip"}`}}}},
+	}}
+	ref := llm.ModelRef{Provider: "profile", Model: "model"}
+	wrapped, err := New(inner, ref, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := wrapped.Stream(context.Background(), llm.ChatRequest{
+		Model: ref, Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "plan"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deltas []llm.StreamEvent
+	for {
+		event, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			break
+		}
+		if recvErr != nil {
+			t.Fatal(recvErr)
+		}
+		if event.Kind == llm.StreamToolCallDelta {
+			deltas = append(deltas, event)
+		}
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("tool deltas = %#v", deltas)
+	}
+	if deltas[1].ToolCallID != "call-plan" || deltas[1].ToolName != "exit_plan_mode" {
+		t.Fatalf("continued tool identity = %#v", deltas[1])
+	}
+	if deltas[0].Delta+deltas[1].Delta != `{"goal":"trip"}` {
+		t.Fatalf("continued arguments = %q", deltas[0].Delta+deltas[1].Delta)
+	}
+}
+
 func TestStreamRejectsUnboundedBufferedResponse(t *testing.T) {
 	inner := &fakeModel{streamChunks: []*schema.Message{{Role: schema.Assistant, Content: strings.Repeat("x", maxStreamResponseBytes+1)}}}
 	ref := llm.ModelRef{Provider: "profile", Model: "model"}
@@ -134,5 +177,39 @@ func TestToolResultErrorIsMadeVisibleToTheModel(t *testing.T) {
 	}
 	if converted.Content != "[tool_error]\npermission denied" {
 		t.Fatalf("tool content = %q", converted.Content)
+	}
+}
+
+func TestResponseUnwrapsJSONStringToolArguments(t *testing.T) {
+	response, err := fromEinoResponse(&schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			ID: "call-encoded", Type: "function",
+			Function: schema.FunctionCall{Name: "request_user_input", Arguments: `"{\"questions\":[]}"`},
+		}},
+	}, llm.ModelRef{Provider: "profile", Model: "model"})
+	if err != nil {
+		t.Fatalf("convert response: %v", err)
+	}
+	calls := response.ToolCalls()
+	if len(calls) != 1 || string(calls[0].Arguments) != `{"questions":[]}` {
+		t.Fatalf("tool calls = %#v", calls)
+	}
+}
+
+func TestResponseTurnsMalformedToolArgumentsIntoSafeRepairCall(t *testing.T) {
+	response, err := fromEinoResponse(&schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			ID: "call-truncated", Type: "function",
+			Function: schema.FunctionCall{Name: "exit_plan_mode", Arguments: `{"goal":"Beijing"`},
+		}},
+	}, llm.ModelRef{Provider: "profile", Model: "model"})
+	if err != nil {
+		t.Fatalf("convert response: %v", err)
+	}
+	calls := response.ToolCalls()
+	if len(calls) != 1 || !llm.HasInvalidToolArguments(calls[0].Arguments) || !json.Valid(calls[0].Arguments) {
+		t.Fatalf("tool calls = %#v", calls)
 	}
 }

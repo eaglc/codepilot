@@ -24,13 +24,9 @@ func (r *Repository) CreatePlanVersion(ctx context.Context, value codingagent.Pl
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	turns, err := r.loadTurnsLocked(ctx, "")
+	turn, err := r.loadTurnLocked(ctx, value.TurnID)
 	if err != nil {
 		return fmt.Errorf("create Coding plan %q: %w", value.ID, err)
-	}
-	turn, found := turns[value.TurnID]
-	if !found {
-		return fmt.Errorf("create Coding plan %q: turn %q not found", value.ID, value.TurnID)
 	}
 	if turn.PlanID != "" && turn.PlanID != value.ID {
 		return fmt.Errorf("create Coding plan %q: Product Turn references another Plan", value.ID)
@@ -82,7 +78,6 @@ func (r *Repository) LoadPlan(ctx context.Context, id codingagent.PlanID, versio
 	if !found {
 		return codingagent.Plan{}, fmt.Errorf("load Coding plan %q version %d: %w", id, version, codingagent.ErrPlanNotFound)
 	}
-	value = codingagent.ApplyPlanCompatibilityDefaults(value)
 	if err := codingagent.ValidatePlan(value); err != nil {
 		return codingagent.Plan{}, fmt.Errorf("load Coding plan %q version %d: %w", id, version, err)
 	}
@@ -126,7 +121,6 @@ func (r *Repository) listPlanVersionsLocked(ctx context.Context, id codingagent.
 		if !found {
 			continue
 		}
-		value = codingagent.ApplyPlanCompatibilityDefaults(value)
 		if value.ID != id {
 			return nil, fmt.Errorf("list Coding plan %q versions: stored identity mismatch", id)
 		}

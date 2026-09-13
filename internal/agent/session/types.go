@@ -136,11 +136,12 @@ const (
 
 // OperationData stores operation start or terminal facts.
 type OperationData struct {
-	Intent       OperationIntent `json:"intent,omitempty"`
-	SourceLeafID EntryID         `json:"source_leaf_id,omitempty"`
-	Outcome      string          `json:"outcome,omitempty"`
-	ErrorCode    string          `json:"error_code,omitempty"`
-	ErrorMessage string          `json:"error_message,omitempty"`
+	Intent         OperationIntent `json:"intent,omitempty"`
+	SourceLeafID   EntryID         `json:"source_leaf_id,omitempty"`
+	Outcome        string          `json:"outcome,omitempty"`
+	ErrorCode      string          `json:"error_code,omitempty"`
+	ErrorMessage   string          `json:"error_message,omitempty"`
+	TerminalOutput json.RawMessage `json:"terminal_output,omitempty"`
 }
 
 // StepData stores one model-step attempt and its assistant entry.

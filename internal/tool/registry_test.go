@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/eaglc/codepilot/internal/llm"
@@ -11,6 +12,7 @@ import (
 type testTool struct {
 	name   string
 	result Result
+	calls  *int
 }
 
 func (t testTool) Definition() llm.ToolDefinition {
@@ -20,6 +22,9 @@ func (t testTool) Definition() llm.ToolDefinition {
 func (testTool) ReplayPolicy() ReplayPolicy { return ReplayNever }
 
 func (t testTool) Execute(context.Context, Call, ProgressSink) (Result, error) {
+	if t.calls != nil {
+		(*t.calls)++
+	}
 	return t.result, nil
 }
 
@@ -44,5 +49,24 @@ func TestRegistryRejectsDuplicateNames(t *testing.T) {
 	executable := testTool{name: "read", result: Result{Status: ResultCompleted, Content: []llm.Content{{Type: llm.ContentText, Text: "ok"}}}}
 	if _, err := NewRegistry(executable, executable); err == nil {
 		t.Fatal("expected duplicate tool name error")
+	}
+}
+
+func TestRegistryDoesNotDispatchProviderInvalidToolArguments(t *testing.T) {
+	calls := 0
+	registry, err := NewRegistry(testTool{name: "write", calls: &calls, result: Result{
+		Status: ResultCompleted, Content: []llm.Content{{Type: llm.ContentText, Text: "executed"}},
+	}})
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+	result, err := registry.Execute(context.Background(), Call{
+		ID: "call-invalid", Name: "write", Arguments: llm.InvalidToolArguments(),
+	}, nil)
+	if err != nil {
+		t.Fatalf("execute invalid call: %v", err)
+	}
+	if calls != 0 || result.Status != ResultInvalid || !strings.Contains(result.Content[0].Text, "complete JSON object") {
+		t.Fatalf("calls = %d, result = %#v", calls, result)
 	}
 }

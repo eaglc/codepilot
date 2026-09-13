@@ -2,6 +2,7 @@
 package einoadapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -66,9 +67,10 @@ func (m *Model) Stream(ctx context.Context, request llm.ChatRequest) (llm.Stream
 		return nil, provider.ClassifyTransportError("provider.stream", err)
 	}
 	return &stream{
-		reader:  reader,
-		ref:     m.ref,
-		pending: []llm.StreamEvent{{Kind: llm.StreamResponseStarted}},
+		reader:    reader,
+		ref:       m.ref,
+		pending:   []llm.StreamEvent{{Kind: llm.StreamResponseStarted}},
+		toolCalls: make(map[int]streamedToolCall),
 	}, nil
 }
 
@@ -219,10 +221,7 @@ func fromEinoResponse(response *schema.Message, ref llm.ModelRef) (llm.Message, 
 		converted.Content = append(converted.Content, llm.Content{Type: llm.ContentThinking, Text: response.ReasoningContent})
 	}
 	for _, call := range response.ToolCalls {
-		arguments := json.RawMessage(call.Function.Arguments)
-		if len(arguments) == 0 {
-			arguments = json.RawMessage("{}")
-		}
+		arguments := normalizeEinoToolArguments(call.Function.Arguments)
 		converted.Content = append(converted.Content, llm.Content{Type: llm.ContentToolCall, ToolCall: &llm.ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: arguments}})
 	}
 	if response.ResponseMeta != nil {
@@ -233,6 +232,37 @@ func fromEinoResponse(response *schema.Message, ref llm.ModelRef) (llm.Message, 
 		return llm.Message{}, fmt.Errorf("convert Eino response: %w", err)
 	}
 	return converted, nil
+}
+
+// normalizeEinoToolArguments accepts the object form required by CodePilot and
+// one unambiguous interoperability variant used by some OpenAI-compatible
+// providers: a JSON string containing that object. Everything else becomes a
+// reserved safe marker so the Agent can ask the model to repair the call
+// without executing it or failing the entire run.
+func normalizeEinoToolArguments(value string) json.RawMessage {
+	trimmed := bytes.TrimSpace([]byte(value))
+	if len(trimmed) == 0 {
+		return json.RawMessage("{}")
+	}
+	if isJSONObject(trimmed) {
+		return append(json.RawMessage(nil), trimmed...)
+	}
+	var encoded string
+	if json.Unmarshal(trimmed, &encoded) == nil {
+		nested := bytes.TrimSpace([]byte(encoded))
+		if isJSONObject(nested) {
+			return append(json.RawMessage(nil), nested...)
+		}
+	}
+	return llm.InvalidToolArguments()
+}
+
+func isJSONObject(value []byte) bool {
+	if len(value) == 0 || value[0] != '{' {
+		return false
+	}
+	var decoded map[string]json.RawMessage
+	return json.Unmarshal(value, &decoded) == nil
 }
 
 func normalizeStopReason(reason string) llm.StopReason {
@@ -270,6 +300,12 @@ type stream struct {
 	bytes     int
 	sequence  uint64
 	exhausted bool
+	toolCalls map[int]streamedToolCall
+}
+
+type streamedToolCall struct {
+	id   string
+	name string
 }
 
 func (s *stream) Recv() (llm.StreamEvent, error) {
@@ -321,9 +357,21 @@ func (s *stream) Recv() (llm.StreamEvent, error) {
 		if chunk.ReasoningContent != "" {
 			s.pending = append(s.pending, llm.StreamEvent{Kind: llm.StreamThinkingDelta, Delta: chunk.ReasoningContent})
 		}
-		for _, call := range chunk.ToolCalls {
+		for position, call := range chunk.ToolCalls {
+			index := position
+			if call.Index != nil {
+				index = *call.Index
+			}
+			identity := s.toolCalls[index]
 			if call.ID != "" {
-				s.pending = append(s.pending, llm.StreamEvent{Kind: llm.StreamToolCallDelta, ToolCallID: call.ID, ToolName: call.Function.Name, Delta: call.Function.Arguments})
+				identity.id = call.ID
+			}
+			if call.Function.Name != "" {
+				identity.name = call.Function.Name
+			}
+			s.toolCalls[index] = identity
+			if identity.id != "" {
+				s.pending = append(s.pending, llm.StreamEvent{Kind: llm.StreamToolCallDelta, ToolCallID: identity.id, ToolName: identity.name, Delta: call.Function.Arguments})
 			}
 		}
 		if chunk.ResponseMeta != nil && chunk.ResponseMeta.Usage != nil {

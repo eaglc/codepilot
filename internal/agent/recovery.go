@@ -322,6 +322,22 @@ func (r *Runtime) continueAfterAssistant(ctx context.Context, request RunRequest
 	started, finished := runToolFacts(snapshot, request.RunID)
 	for index, call := range calls {
 		if finished[call.ID] {
+			if _, terminal := request.Tools.TerminalOutputPolicy(call.Name); terminal {
+				result, resultErr := recoveredFinishedToolResult(snapshot, request.RunID, call)
+				if resultErr != nil {
+					return r.failRun(ctx, request, dispatcher, step, "load_terminal_output_during_recovery", resultErr)
+				}
+				output, completed, outputErr := r.terminalOutput(request, call.Name, result)
+				if outputErr != nil {
+					return r.failRun(ctx, request, dispatcher, step, "validate_terminal_output_during_recovery", outputErr)
+				}
+				if completed {
+					if err := r.finishRunWithTerminalOutput(ctx, request, dispatcher, step, RunCompleted, "recovered_terminal_output", output); err != nil {
+						return RunResult{}, err
+					}
+					return RunResult{RunID: request.RunID, Status: RunCompleted, TerminalOutput: output, Steps: step, Reason: "recovered_terminal_output"}, nil
+				}
+			}
 			continue
 		}
 		if started[call.ID] {
@@ -347,7 +363,7 @@ func (r *Runtime) continueAfterAssistant(ctx context.Context, request RunRequest
 			}
 			return RunResult{RunID: request.RunID, Status: RunLimitReached, Steps: step, Reason: reason}, nil
 		}
-		_, interrupted, err := r.executeTool(ctx, request, dispatcher, assistantEntryID, index, call)
+		result, interrupted, err := r.executeTool(ctx, request, dispatcher, assistantEntryID, index, call)
 		if err != nil {
 			return r.failRun(ctx, request, dispatcher, step, "execute_tool_during_recovery", err)
 		}
@@ -356,6 +372,14 @@ func (r *Runtime) continueAfterAssistant(ctx context.Context, request RunRequest
 				return r.failRun(ctx, request, dispatcher, step, "publish_recovered_interrupt", err)
 			}
 			return RunResult{RunID: request.RunID, Status: RunInterrupted, Steps: step, Reason: "tool_interrupted", Interrupt: interrupted}, nil
+		}
+		if output, terminal, terminalErr := r.terminalOutput(request, call.Name, result); terminalErr != nil {
+			return r.failRun(ctx, request, dispatcher, step, "validate_terminal_output_during_recovery", terminalErr)
+		} else if terminal {
+			if err := r.finishRunWithTerminalOutput(ctx, request, dispatcher, step, RunCompleted, "recovered_terminal_output", output); err != nil {
+				return RunResult{}, err
+			}
+			return RunResult{RunID: request.RunID, Status: RunCompleted, TerminalOutput: output, Steps: step, Reason: "recovered_terminal_output"}, nil
 		}
 	}
 	if step >= request.Limits.MaxSteps {
@@ -369,6 +393,19 @@ func (r *Runtime) continueAfterAssistant(ctx context.Context, request RunRequest
 		return r.failRun(ctx, request, dispatcher, step, "create_model_after_recovery", err)
 	}
 	return r.runSteps(ctx, request, dispatcher, model, step+1)
+}
+
+func recoveredFinishedToolResult(snapshot agentsession.Snapshot, runID agentsession.RunID, call llm.ToolCall) (tool.Result, error) {
+	for _, record := range snapshot.Records {
+		if record.RunID != runID || record.Type != agentsession.RecordToolStarted || record.Tool == nil || record.Tool.ToolCallID != call.ID || record.Tool.ToolName != call.Name {
+			continue
+		}
+		return recoveredResultEntry(snapshot, agentsession.PendingTool{
+			RunID: runID, Lane: record.Lane, AssistantEntryID: record.Tool.AssistantEntryID,
+			ToolIndex: record.Tool.ToolIndex, ToolCallID: call.ID, ToolName: call.Name, ResultEntryID: record.Tool.ResultEntryID,
+		})
+	}
+	return tool.Result{}, fmt.Errorf("recover agent terminal Tool %q: durable start was not found", call.Name)
 }
 
 func unfinishedAssistantEntry(snapshot agentsession.Snapshot, runID agentsession.RunID, afterSequence uint64) (agentsession.Entry, bool) {

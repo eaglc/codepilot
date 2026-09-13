@@ -85,20 +85,25 @@ type TranscriptItem struct {
 
 // PendingInterrupt is a product-safe resumable input request.
 type PendingInterrupt struct {
-	TurnID          TurnID
-	RunID           RunID
-	InterruptID     string
-	Kind            string
-	ToolCallID      string
-	Summary         string
-	Proposed        *ProposedChange
-	CanGrantSession bool
-	PlanID          PlanID
-	PlanVersion     uint64
-	PlanDigest      string
-	PlanCompletion  PlanCompletionMode
-	PlanEntryReason PlanEntryReasonCode
-	Clarification   *ClarificationPrompt
+	TurnID           TurnID
+	RunID            RunID
+	ChildAgentID     ChildAgentID
+	NodeID           NodeID
+	Role             string
+	InterruptID      string
+	Kind             string
+	ToolCallID       string
+	Summary          string
+	Proposed         *ProposedChange
+	CanGrantSession  bool
+	PlanID           PlanID
+	PlanVersion      uint64
+	PlanDigest       string
+	PlanCompletion   PlanCompletionMode
+	PlanStrategy     ExecutionStrategy
+	PlanEntryReason  PlanEntryReasonCode
+	PlanReplanReason PlanReplanReasonCode
+	Clarification    *ClarificationPrompt
 }
 
 // RecoveryDecision is a product-level operator choice for unfinished work.
@@ -148,6 +153,30 @@ type SessionMetrics struct {
 	FinishedAt       time.Time
 	Elapsed          time.Duration
 	ByPhase          []PhaseMetrics
+	PlanTurns        int
+	PlanApprovals    int
+	PlanRevisions    int
+	PlanApprovalRate float64
+	PlanRevisionRate float64
+	WorkspaceDrifts  int
+	Replans          int
+	Workflow         WorkflowMetrics
+}
+
+// WorkflowMetrics separates serial Workflow cost and reliability from Direct
+// execution while still counting one user request as one Product Turn.
+type WorkflowMetrics struct {
+	Turns          int
+	CompletedTurns int
+	FailedTurns    int
+	CancelledTurns int
+	NodeRuns       int
+	FailedNodeRuns int
+	Retries        int
+	Steps          int
+	TotalTokens    int
+	Cost           float64
+	Elapsed        time.Duration
 }
 
 // PhaseMetrics aggregates durable Run cost, elapsed time, and failures by the
@@ -163,12 +192,13 @@ type PhaseMetrics struct {
 
 // TurnSnapshot is the bounded Product Turn state shown by presentation layers.
 type TurnSnapshot struct {
-	ID       TurnID
-	Phase    TurnPhase
-	Status   TurnStatus
-	Strategy ExecutionStrategy
-	RunCount int
-	Revision uint64
+	ID                  TurnID
+	Phase               TurnPhase
+	Status              TurnStatus
+	Strategy            ExecutionStrategy
+	RunCount            int
+	Revision            uint64
+	ApprovedPlanVersion uint64
 }
 
 // PlanVersionSummary identifies one immutable Plan revision in history.
@@ -177,6 +207,7 @@ type PlanVersionSummary struct {
 	Version   uint64
 	Digest    string
 	Goal      string
+	Changes   []string
 	CreatedAt time.Time
 }
 
@@ -196,6 +227,73 @@ type PlanSnapshot struct {
 	RecommendedStrategy ExecutionStrategy
 	WorkspaceRelevant   bool
 	CompletionMode      PlanCompletionMode
+	Changes             []string
+	RevisionReason      string
+	ApprovedVersion     uint64
+	WorkspaceDrift      *WorkspaceDrift
+	Replan              *PlanReplanRequest
+}
+
+// WorkflowNodeSnapshot is the bounded, product-safe progress of one durable node.
+type WorkflowNodeSnapshot struct {
+	ID                 NodeID
+	Goal               string
+	DependsOn          []NodeID
+	Role               string
+	Capability         string
+	Executor           string
+	PolicyVersion      uint32
+	Status             string
+	Attempts           int
+	MaxAttempts        int
+	AcceptanceCriteria []string
+	ResultRef          string
+	Failure            string
+}
+
+// ChildAgentSnapshot is the bounded lifecycle and structured output shown to
+// users. It intentionally excludes the child Agent transcript and raw prompts.
+type ChildAgentSnapshot struct {
+	ID            ChildAgentID
+	Kind          ChildAgentKind
+	TurnID        TurnID
+	WorkflowID    string
+	NodeID        NodeID
+	Role          string
+	Profile       CapabilityProfile
+	PolicyVersion uint32
+	Status        ChildAgentStatus
+	Attempt       int
+	Goal          string
+	Conclusion    string
+	Evidence      []AgentTaskEvidence
+	Validation    []string
+	Artifacts     []string
+	Unresolved    []string
+	Failure       string
+	StartedAt     time.Time
+	CompletedAt   time.Time
+}
+
+// WorkflowSnapshot is sufficient to reconstruct progress without live Events.
+type WorkflowSnapshot struct {
+	ID             string
+	TurnID         TurnID
+	PlanID         PlanID
+	PlanVersion    uint64
+	PlanDigest     string
+	Strategy       ExecutionStrategy
+	Status         string
+	Revision       uint64
+	CurrentNode    NodeID
+	CompletedNodes int
+	BlockedNodes   int
+	MaxRuns        int
+	UsedRuns       int
+	MaxAgentSteps  int
+	UsedAgentSteps int
+	WaitingReason  string
+	Nodes          []WorkflowNodeSnapshot
 }
 
 // Snapshot is the authoritative Coding Agent state exposed to UI and future clients.
@@ -210,7 +308,10 @@ type Snapshot struct {
 	Metrics                  SessionMetrics
 	ActiveTurn               *TurnSnapshot
 	ActivePlan               *PlanSnapshot
+	ActiveWorkflow           *WorkflowSnapshot
+	ChildAgents              []ChildAgentSnapshot
 	PlanHistory              []PlanVersionSummary
 	PendingPlanApproval      bool
 	PendingPlanEntryApproval bool
+	PendingPlanReplan        bool
 }

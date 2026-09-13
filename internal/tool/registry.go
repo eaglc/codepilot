@@ -34,11 +34,31 @@ func NewRegistry(tools ...Tool) (*Registry, error) {
 		if _, exists := registry.tools[definition.Name]; exists {
 			return nil, fmt.Errorf("create tool registry: duplicate tool %q", definition.Name)
 		}
+		if terminal, ok := executable.(TerminalOutputTool); ok {
+			policy := terminal.TerminalOutputPolicy()
+			if policy.MaxBytes <= 0 || policy.MaxBytes > 1<<20 {
+				return nil, fmt.Errorf("create tool registry %q: terminal output size must be between 1 and 1048576 bytes", definition.Name)
+			}
+		}
 		registry.tools[definition.Name] = executable
 		registry.names = append(registry.names, definition.Name)
 	}
 	sort.Strings(registry.names)
 	return registry, nil
+}
+
+// TerminalOutputPolicy returns trusted structured-completion metadata for a
+// registered Tool.
+func (r *Registry) TerminalOutputPolicy(name string) (TerminalOutputPolicy, bool) {
+	executable, exists := r.Lookup(name)
+	if !exists {
+		return TerminalOutputPolicy{}, false
+	}
+	terminal, ok := executable.(TerminalOutputTool)
+	if !ok {
+		return TerminalOutputPolicy{}, false
+	}
+	return terminal.TerminalOutputPolicy(), true
 }
 
 // Definitions returns defensive model-facing declarations ordered by name.
@@ -85,6 +105,15 @@ func (r *Registry) Execute(ctx context.Context, call Call, progress ProgressSink
 	modelCall := llm.ToolCall{ID: call.ID, Name: call.Name, Arguments: call.Arguments}
 	if err := modelCall.Validate(); err != nil {
 		return Result{}, err
+	}
+	if llm.HasInvalidToolArguments(call.Arguments) {
+		return Result{
+			Status: ResultInvalid,
+			Content: []llm.Content{{
+				Type: llm.ContentText,
+				Text: "The Tool arguments were malformed or truncated. Call the Tool again with one complete JSON object matching its input schema.",
+			}},
+		}, nil
 	}
 	executable, exists := r.Lookup(call.Name)
 	if !exists {

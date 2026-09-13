@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/eaglc/codepilot/internal/agent"
+	"github.com/eaglc/codepilot/internal/tool"
 )
 
 // SessionID uniquely identifies one Coding Agent product session.
@@ -57,11 +58,28 @@ const (
 	EventPlanEntryApproved         EventKind = "plan_entry_approved"
 	EventPlanEntryDeclined         EventKind = "plan_entry_declined"
 	EventPlanEntryCancelled        EventKind = "plan_entry_cancelled"
+	EventPlanDraftUpdated          EventKind = "plan_draft_updated"
 	EventPlanCreated               EventKind = "plan_created"
 	EventPlanRevised               EventKind = "plan_revised"
 	EventPlanApprovalRequested     EventKind = "plan_approval_requested"
 	EventPlanApproved              EventKind = "plan_approved"
 	EventPlanCancelled             EventKind = "plan_cancelled"
+	EventPlanDriftDetected         EventKind = "plan_drift_detected"
+	EventPlanReplanRequested       EventKind = "plan_replan_requested"
+	EventPlanReplanResolved        EventKind = "plan_replan_resolved"
+	EventWorkflowStarted           EventKind = "workflow_started"
+	EventWorkflowNodeStarted       EventKind = "workflow_node_started"
+	EventWorkflowNodeCompleted     EventKind = "workflow_node_completed"
+	EventWorkflowNodeFailed        EventKind = "workflow_node_failed"
+	EventWorkflowNodeRetrying      EventKind = "workflow_node_retrying"
+	EventWorkflowBlocked           EventKind = "workflow_blocked"
+	EventWorkflowReplanRequested   EventKind = "workflow_replan_requested"
+	EventWorkflowCompleted         EventKind = "workflow_completed"
+	EventWorkflowCancelled         EventKind = "workflow_cancelled"
+	EventWorkflowFailed            EventKind = "workflow_failed"
+	EventChildAgentStarted         EventKind = "child_agent_started"
+	EventChildAgentCompleted       EventKind = "child_agent_completed"
+	EventChildAgentFailed          EventKind = "child_agent_failed"
 )
 
 // AssistantOutputEvent contains only normalized display text.
@@ -111,11 +129,16 @@ type ApprovalEvent struct {
 
 // PlanEvent identifies one immutable Plan revision without carrying raw internal state.
 type PlanEvent struct {
-	PlanID   PlanID
-	Version  uint64
-	Digest   string
-	Goal     string
-	Decision string
+	PlanID       PlanID
+	Version      uint64
+	Digest       string
+	Goal         string
+	Decision     string
+	Drift        WorkspaceDriftSeverity
+	Reason       string
+	Summary      string
+	Paths        []string
+	ReplanReason PlanReplanReasonCode
 }
 
 // PlanEntryEvent describes a bounded Agent suggestion and the product decision
@@ -125,6 +148,26 @@ type PlanEntryEvent struct {
 	Summary    string
 	Digest     string
 	Decision   string
+}
+
+// PlanDraftEvent contains a safe, structured rendering of the Plan fields
+// completed so far while exit_plan_mode arguments are still streaming.
+type PlanDraftEvent struct {
+	Markdown string
+}
+
+// WorkflowEvent is a bounded state projection; it never carries node prompts,
+// tool arguments, or internal Agent conversation.
+type WorkflowEvent struct {
+	WorkflowID   string
+	Status       string
+	NodeID       NodeID
+	NodeStatus   string
+	Role         string
+	Executor     string
+	ChildAgentID ChildAgentID
+	Attempts     int
+	Summary      string
 }
 
 // WorkspaceEvent contains product workspace state without lower-level runtime objects.
@@ -162,7 +205,9 @@ type EventPayload struct {
 	Turn            *TurnEvent
 	Approval        *ApprovalEvent
 	PlanEntry       *PlanEntryEvent
+	PlanDraft       *PlanDraftEvent
 	Plan            *PlanEvent
+	Workflow        *WorkflowEvent
 	Workspace       *WorkspaceEvent
 	Session         *SessionEvent
 	Error           *ErrorEvent
@@ -177,6 +222,7 @@ type Event struct {
 	TurnID           TurnID
 	RunID            RunID
 	NodeID           NodeID
+	ChildAgentID     ChildAgentID
 	Timestamp        time.Time
 	Kind             EventKind
 	Payload          EventPayload
@@ -194,14 +240,15 @@ type RevisionSource interface {
 
 // AgentEventAdapter maps generic Agent events to the product protocol using explicit field copies.
 type AgentEventAdapter struct {
-	mu        sync.Mutex
-	sessionID SessionID
-	turnID    TurnID
-	runID     RunID
-	nodeID    NodeID
-	sink      EventSink
-	revisions RevisionSource
-	sequence  uint64
+	mu           sync.Mutex
+	sessionID    SessionID
+	turnID       TurnID
+	runID        RunID
+	nodeID       NodeID
+	childAgentID ChildAgentID
+	sink         EventSink
+	revisions    RevisionSource
+	sequence     uint64
 }
 
 // NewAgentEventAdapter creates an isolated Agent-to-product event boundary.
@@ -230,6 +277,7 @@ func (a *AgentEventAdapter) PublishAgentEvent(ctx context.Context, source agent.
 	event.TurnID = a.turnID
 	event.RunID = a.runID
 	event.NodeID = a.nodeID
+	event.ChildAgentID = a.childAgentID
 	event.Timestamp = source.Timestamp
 	if a.revisions != nil {
 		revision, err := a.revisions.CurrentRevision(ctx, a.sessionID)
@@ -262,6 +310,11 @@ func (a *AgentEventAdapter) translate(source agent.Event) (Event, bool) {
 			return Event{}, false
 		}
 		return Event{Kind: EventAssistantOutputDelta, Payload: EventPayload{AssistantOutput: &AssistantOutputEvent{Delta: boundedUTF8(redactSensitiveText(source.Assistant.Text), 16<<10)}}}, true
+	case agent.EventAssistantPreviewUpdated:
+		if source.Assistant == nil || source.Assistant.Text == "" {
+			return Event{}, false
+		}
+		return Event{Kind: EventPlanDraftUpdated, Payload: EventPayload{PlanDraft: &PlanDraftEvent{Markdown: boundedUTF8(redactSensitiveText(source.Assistant.Text), 64<<10)}}}, true
 	case agent.EventAssistantThinkingChanged:
 		if source.Assistant == nil {
 			return Event{}, false
@@ -277,8 +330,12 @@ func (a *AgentEventAdapter) translate(source agent.Event) (Event, bool) {
 		} else if source.Kind == agent.EventToolFinished {
 			kind = EventToolActivityFinished
 		}
+		status := source.Tool.Status
+		if source.Tool.Name == exitPlanModeToolName && status == string(tool.ResultDenied) {
+			status = "revision_requested"
+		}
 		toolEvent := &ToolActivityEvent{
-			CallID: source.Tool.CallID, Name: source.Tool.Name, Status: source.Tool.Status,
+			CallID: source.Tool.CallID, Name: source.Tool.Name, Status: status,
 			Summary: toolSummary(source.Tool.Summary),
 		}
 		projectLiveToolDetails(toolEvent, source.Tool.Details)
@@ -307,6 +364,9 @@ func (a *AgentEventAdapter) translate(source agent.Event) (Event, bool) {
 				Approval: &ApprovalEvent{RequestID: source.Interrupt.ID, Kind: source.Interrupt.Kind},
 				Turn:     &TurnEvent{Status: "interrupted", Reason: reason},
 			}}, true
+		}
+		if source.Interrupt != nil && source.Interrupt.Kind == planReplanApprovalKind {
+			return Event{Kind: EventTurnInterrupted, Payload: EventPayload{Turn: &TurnEvent{Status: "interrupted", Reason: reason}}}, true
 		}
 		if source.Interrupt != nil && source.Interrupt.Kind == "approval" {
 			return Event{Kind: EventApprovalRequested, Payload: EventPayload{

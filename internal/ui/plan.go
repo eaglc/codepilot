@@ -74,6 +74,39 @@ func (m *Model) planRows(plan codingagent.PlanSnapshot, width int) []renderRow {
 		contextLabel = "general"
 	}
 	rows := []renderRow{{text: theme.header.Render(fmt.Sprintf("Plan v%d  •  %s  •  %s", plan.Version, contextLabel, mode))}}
+	strategy := "Direct single Agent"
+	if plan.RecommendedStrategy == codingagent.ExecutionWorkflowSingle {
+		strategy = "single-Agent Workflow"
+	} else if plan.RecommendedStrategy == codingagent.ExecutionWorkflowMultiSerial {
+		strategy = "serial multi-Agent Workflow"
+	}
+	rows = appendWrapped(rows, "Recommended execution  ", strategy, width, theme.muted)
+	if plan.ApprovedVersion == plan.Version && plan.ApprovedVersion != 0 {
+		rows = append(rows, renderRow{text: theme.muted.Render(fmt.Sprintf("Approved exact version: v%d", plan.ApprovedVersion))})
+	}
+	if len(plan.Changes) != 0 {
+		rows = appendPlanList(rows, "Changes in this version", plan.Changes, width)
+	}
+	if plan.RevisionReason != "" {
+		rows = appendWrapped(rows, "Why reapproval is required  ", plan.RevisionReason, width, theme.warning)
+	}
+	if plan.WorkspaceDrift != nil {
+		label := "Workspace drift"
+		if plan.WorkspaceDrift.Severity == codingagent.WorkspaceDriftMaterial {
+			label = "Material workspace drift"
+		}
+		rows = appendWrapped(rows, label+"  ", plan.WorkspaceDrift.Summary, width, theme.warning)
+		if len(plan.WorkspaceDrift.Paths) != 0 {
+			rows = appendWrapped(rows, "  Paths  ", strings.Join(plan.WorkspaceDrift.Paths, ", "), width, theme.muted)
+		}
+	}
+	if plan.Replan != nil {
+		decision := plan.Replan.Decision
+		if decision == "" {
+			decision = "awaiting user decision"
+		}
+		rows = appendWrapped(rows, "Replan  ", plan.Replan.Summary+" ("+decision+")", width, theme.warning)
+	}
 	rows = appendWrapped(rows, "Goal  ", plan.Goal, width, theme.assistant)
 	rows = appendPlanList(rows, "In scope", plan.Scope.Included, width)
 	if len(plan.Scope.Excluded) != 0 {

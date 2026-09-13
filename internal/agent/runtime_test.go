@@ -283,7 +283,7 @@ func TestStreamAssistantPublishesProviderTextDeltasBeforeFinish(t *testing.T) {
 	runtime := &Runtime{ids: &sequenceIDs{}, dataPolicy: identityDataPolicy{}}
 	events := &eventCollector{}
 	dispatcher := &eventDispatcher{runtime: runtime, sink: events, sessionID: "session", runID: "run"}
-	message, observed, err := runtime.streamAssistant(context.Background(), model, llm.ChatRequest{
+	message, observed, err := runtime.streamAssistant(context.Background(), RunRequest{}, model, llm.ChatRequest{
 		Model: llm.ModelRef{Provider: "test", Model: "model"},
 	}, dispatcher)
 	if err != nil || !observed || message.Content[0].Text != "hello world" {
@@ -298,6 +298,42 @@ func TestStreamAssistantPublishesProviderTextDeltasBeforeFinish(t *testing.T) {
 	if len(deltas) != 2 || deltas[0] != "hello " || deltas[1] != "world" {
 		t.Fatalf("assistant deltas = %#v", deltas)
 	}
+}
+
+type testToolCallPreviewer struct{}
+
+func (testToolCallPreviewer) PreviewToolCall(callID, toolName, delta string) (string, bool) {
+	return "Plan " + callID + " " + toolName + " " + delta, true
+}
+
+func TestStreamAssistantPublishesSanitizedToolCallPreview(t *testing.T) {
+	response := llm.Message{
+		Role: llm.RoleAssistant, Provider: "test", Model: "model", StopReason: llm.StopReasonStop,
+		Content: []llm.Content{{Type: llm.ContentText, Text: "done"}},
+	}
+	model := &scriptedStreamModel{streams: [][]llm.StreamEvent{{
+		{Kind: llm.StreamToolCallDelta, ToolCallID: "call-plan", ToolName: "exit_plan_mode", Delta: "top-secret"},
+		{Kind: llm.StreamResponseFinished, Message: &response},
+	}}}
+	runtime := &Runtime{ids: &sequenceIDs{}, dataPolicy: testRedactionPolicy{}}
+	events := &eventCollector{}
+	dispatcher := &eventDispatcher{runtime: runtime, sink: events, sessionID: "session", runID: "run"}
+	_, observed, err := runtime.streamAssistant(context.Background(), RunRequest{ToolCallPreviewer: testToolCallPreviewer{}}, model, llm.ChatRequest{
+		Model: llm.ModelRef{Provider: "test", Model: "model"},
+	}, dispatcher)
+	if err != nil || !observed {
+		t.Fatalf("stream observed=%v err=%v", observed, err)
+	}
+	for _, event := range events.events {
+		if event.Kind != EventAssistantPreviewUpdated {
+			continue
+		}
+		if event.Assistant == nil || !strings.Contains(event.Assistant.Text, "[safe]") || strings.Contains(event.Assistant.Text, "top-secret") {
+			t.Fatalf("preview was not sanitized: %#v", event)
+		}
+		return
+	}
+	t.Fatal("assistant preview event was not published")
 }
 
 type secretResultTool struct{ arguments json.RawMessage }
@@ -761,6 +797,46 @@ func TestRuntimeCentrallyPersistsToolActivity(t *testing.T) {
 	}
 	if !sawToolStart || !sawToolFinish || !sawThinkingStart || !sawThinkingFinish {
 		t.Fatalf("agent events = %#v", events.events)
+	}
+}
+
+func TestRuntimeFeedsMalformedProviderToolArgumentsBackWithoutExecuting(t *testing.T) {
+	repository := agentsession.NewMemoryRepository()
+	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-malformed-tool"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	manager, err := contextmanager.NewManager()
+	if err != nil {
+		t.Fatalf("create context manager: %v", err)
+	}
+	model := &fakeModel{responses: []llm.Message{
+		toolCallingMessage("call-malformed", llm.InvalidToolArguments()),
+		{Role: llm.RoleAssistant, Provider: "test", Model: "model", StopReason: llm.StopReasonStop, Content: []llm.Content{{Type: llm.ContentText, Text: "repaired"}}},
+	}}
+	runtime, err := NewRuntime(Dependencies{Models: fakeModelFactory{model: model}, Contexts: manager, Sessions: repository, IDs: &sequenceIDs{}})
+	if err != nil {
+		t.Fatalf("create runtime: %v", err)
+	}
+	executable := &readTool{}
+	registry, err := tool.NewRegistry(executable)
+	if err != nil {
+		t.Fatalf("create tools: %v", err)
+	}
+	result, err := runtime.Run(context.Background(), RunRequest{
+		SessionID: "session-malformed-tool", RunID: "run-malformed-tool", UserEntryID: "user-malformed-tool",
+		Model:       llm.ModelRef{Provider: "test", Model: "model"},
+		UserMessage: llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "plan"}}},
+		Tools:       registry, Limits: RunLimits{MaxSteps: 3, MaxRepeatedToolCalls: 3},
+	}, &eventCollector{})
+	if err != nil || result.Status != RunCompleted || result.Steps != 2 || executable.calls != 0 {
+		t.Fatalf("result = %#v, calls = %d, err = %v", result, executable.calls, err)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("model requests = %d", len(model.requests))
+	}
+	messages := model.requests[1].Messages
+	if len(messages) == 0 || messages[len(messages)-1].Role != llm.RoleTool || !messages[len(messages)-1].IsError || !strings.Contains(messages[len(messages)-1].Content[0].Text, "complete JSON object") {
+		t.Fatalf("repair feedback = %#v", messages)
 	}
 }
 

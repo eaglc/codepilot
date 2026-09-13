@@ -7,6 +7,7 @@ import (
 
 	"github.com/eaglc/codepilot/internal/agent"
 	agentsession "github.com/eaglc/codepilot/internal/agent/session"
+	"github.com/eaglc/codepilot/internal/tool"
 )
 
 type productEventCollector struct{ events []Event }
@@ -101,5 +102,39 @@ func TestAgentEventAdapterMapsRetryWithoutProviderDetails(t *testing.T) {
 	turn := collector.events[0].Payload.Turn
 	if turn == nil || turn.RetryAttempt != 2 || turn.RetryAfter != 500*time.Millisecond || turn.Reason != "rate_limited" {
 		t.Fatalf("retry projection = %#v", collector.events[0])
+	}
+}
+
+func TestAgentEventAdapterMapsPlanDraftWithoutRawToolArguments(t *testing.T) {
+	collector := &productEventCollector{}
+	adapter, _ := NewAgentEventAdapter("coding-session-1", "turn-1", "run-1", "", collector, nil)
+	input := agent.Event{
+		ID: "preview", RunID: "run-1", Timestamp: time.Now().UTC(), Kind: agent.EventAssistantPreviewUpdated,
+		Assistant: &agent.AssistantEvent{Text: "## Plan (drafting…)\n\n**Goal:** Beijing"},
+	}
+	if err := adapter.PublishAgentEvent(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if len(collector.events) != 1 || collector.events[0].Kind != EventPlanDraftUpdated {
+		t.Fatalf("preview events = %#v", collector.events)
+	}
+	draft := collector.events[0].Payload.PlanDraft
+	if draft == nil || draft.Markdown != input.Assistant.Text || collector.events[0].Payload.AssistantOutput != nil || collector.events[0].Payload.Tool != nil {
+		t.Fatalf("Plan draft projection = %#v", collector.events[0])
+	}
+}
+
+func TestAgentEventAdapterMapsDeclinedPlanSubmissionAsRevisionRequest(t *testing.T) {
+	collector := &productEventCollector{}
+	adapter, _ := NewAgentEventAdapter("coding-session-1", "turn-1", "run-1", "", collector, nil)
+	input := agent.Event{
+		ID: "tool", RunID: "run-1", Timestamp: time.Now().UTC(), Kind: agent.EventToolFinished,
+		Tool: &agent.ToolEvent{CallID: "call-plan", Name: exitPlanModeToolName, Status: string(tool.ResultDenied), Summary: "revision feedback"},
+	}
+	if err := adapter.PublishAgentEvent(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if len(collector.events) != 1 || collector.events[0].Payload.Tool == nil || collector.events[0].Payload.Tool.Status != "revision_requested" {
+		t.Fatalf("Plan revision tool event = %#v", collector.events)
 	}
 }

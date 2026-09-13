@@ -50,6 +50,7 @@ func (record Record) Clone() Record {
 	clone := record
 	if record.Operation != nil {
 		value := *record.Operation
+		value.TerminalOutput = append([]byte(nil), record.Operation.TerminalOutput...)
 		clone.Operation = &value
 	}
 	if record.Step != nil {

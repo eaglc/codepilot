@@ -2,9 +2,6 @@ package file
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,23 +13,6 @@ import (
 	agentsession "github.com/eaglc/codepilot/internal/agent/session"
 	"github.com/eaglc/codepilot/internal/codingagent"
 )
-
-type legacyPlanV1Fixture struct {
-	ID                  codingagent.PlanID            `json:"id"`
-	TurnID              codingagent.TurnID            `json:"turn_id"`
-	Version             uint64                        `json:"version"`
-	Goal                string                        `json:"goal"`
-	Scope               codingagent.PlanScope         `json:"scope"`
-	Findings            []string                      `json:"findings"`
-	Assumptions         []string                      `json:"assumptions,omitempty"`
-	Risks               []string                      `json:"risks"`
-	Steps               []codingagent.PlanStep        `json:"steps"`
-	AcceptanceCriteria  []string                      `json:"acceptance_criteria"`
-	RecommendedStrategy codingagent.ExecutionStrategy `json:"recommended_strategy"`
-	WorkspaceRevision   codingagent.WorkspaceRevision `json:"workspace_revision"`
-	Digest              string                        `json:"digest"`
-	CreatedAt           time.Time                     `json:"created_at"`
-}
 
 func TestRepositoryPersistsProductBindingsAcrossRestart(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
@@ -110,7 +90,10 @@ func TestRepositoryPersistsProductBindingsAcrossRestart(t *testing.T) {
 		Steps:              []codingagent.PlanStep{{ID: "persist", Goal: "Persist the Plan.", Files: []string{"internal/codingagent/plan.go"}, Validation: []string{"Reopen the repository."}}},
 		AcceptanceCriteria: []string{"The exact version survives restart."}, RecommendedStrategy: codingagent.ExecutionSingle,
 		WorkspaceRelevant: true, CompletionMode: codingagent.PlanCompletionExecute,
-		WorkspaceRevision: codingagent.WorkspaceRevision{WorktreeID: worktree.ID, StatusDigest: strings.Repeat("a", 64), RecordedAt: now}, CreatedAt: now,
+		WorkspaceRevision: codingagent.WorkspaceRevision{
+			Version: 2, WorktreeID: worktree.ID, IdentityDigest: strings.Repeat("a", 64), StatusDigest: strings.Repeat("b", 64), DiffDigest: strings.Repeat("c", 64),
+			RelevantPaths: []codingagent.WorkspacePathRevision{{Path: "internal/codingagent/plan.go", Kind: "file", Digest: strings.Repeat("d", 64), Files: 1}}, RecordedAt: now,
+		}, CreatedAt: now,
 	}
 	plan.Digest, _ = codingagent.ComputePlanDigest(plan)
 	if err := reopened.CreatePlanVersion(context.Background(), plan); err != nil {
@@ -165,6 +148,72 @@ func TestRepositoryPersistsProductBindingsAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestLegacyTurnJournalIsIsolatedFromNewSessions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	repository, err := NewRepository(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	workspace := codingagent.Workspace{ID: "workspace-isolation", DisplayName: "repo", GitCommonDir: filepath.Join(root, ".git"), Trusted: true, CreatedAt: now, UpdatedAt: now}
+	worktree := codingagent.Worktree{ID: "worktree-isolation", WorkspaceID: workspace.ID, Root: root, GitDir: workspace.GitCommonDir, CreatedAt: now, LastUsedAt: now}
+	if err := repository.SaveWorkspace(context.Background(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SaveWorktree(context.Background(), worktree); err != nil {
+		t.Fatal(err)
+	}
+	legacySession := codingagent.Session{ID: "session-legacy", AgentSessionID: "agent-legacy", WorkspaceID: workspace.ID, WorktreeID: worktree.ID, ProviderProfileID: "provider", ModelID: "model", PermissionMode: codingagent.PermissionAsk, CreatedAt: now, UpdatedAt: now}
+	newSession := legacySession
+	newSession.ID, newSession.AgentSessionID = "session-new", "agent-new"
+	if err := repository.CreateSession(context.Background(), legacySession); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CreateSession(context.Background(), newSession); err != nil {
+		t.Fatal(err)
+	}
+	legacyTurn := codingagent.Turn{
+		ID: "turn-legacy", SessionID: legacySession.ID, RequestText: "old Plan execution", Phase: codingagent.TurnPhaseExecuting, Status: codingagent.TurnFailed, Strategy: codingagent.ExecutionSingle,
+		Runs:   []codingagent.RunBinding{{RunID: "run-legacy", Phase: codingagent.TurnPhaseExecuting, Profile: codingagent.CapabilityDirect, Status: codingagent.RunBindingFailed, StartedAt: now, FinishedAt: now}},
+		PlanID: "plan-legacy", PlanVersion: 1, PlanDigest: strings.Repeat("a", 64), Revision: 1, CreatedAt: now, UpdatedAt: now, CompletedAt: now,
+	}
+	if err := repository.appendTurnRecord(legacySession.ID, turnJournalRecord{Kind: "created", Turn: legacyTurn}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.LoadTurn(context.Background(), legacyTurn.ID); err == nil {
+		t.Fatal("legacy Turn unexpectedly passed the strict P3 lifecycle contract")
+	}
+	newTurn := codingagent.Turn{
+		ID: "turn-new", SessionID: newSession.ID, RequestText: "new question", Phase: codingagent.TurnPhaseDirect, Status: codingagent.TurnPending, Strategy: codingagent.ExecutionSingle,
+		Runs:     []codingagent.RunBinding{{RunID: "run-new", UserEntryID: "entry-new", Phase: codingagent.TurnPhaseDirect, Profile: codingagent.CapabilityDirect, Status: codingagent.RunBindingPending}},
+		Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := repository.CreateTurn(context.Background(), newTurn); err != nil {
+		t.Fatalf("new session was blocked by an unrelated legacy journal: %v", err)
+	}
+	if loaded, err := repository.LoadTurn(context.Background(), newTurn.ID); err != nil || loaded.ID != newTurn.ID {
+		t.Fatalf("load isolated new Turn = %#v, %v", loaded, err)
+	}
+	plan := codingagent.Plan{
+		ID: "plan-new", TurnID: newTurn.ID, Version: 1, Goal: "Answer from a clean P3 Turn.", Scope: codingagent.PlanScope{Included: []string{"main.go"}},
+		Findings: []string{"The new session is isolated."}, Risks: []string{"Legacy state must remain inaccessible."},
+		Steps:              []codingagent.PlanStep{{ID: "answer", Goal: "Complete the new Turn.", Files: []string{"main.go"}, Validation: []string{"Load the exact Turn."}}},
+		AcceptanceCriteria: []string{"The Plan persists without replaying unrelated journals."}, RecommendedStrategy: codingagent.ExecutionSingle,
+		WorkspaceRelevant: true, CompletionMode: codingagent.PlanCompletionExecute,
+		WorkspaceRevision: codingagent.WorkspaceRevision{Version: 2, WorktreeID: worktree.ID, IdentityDigest: strings.Repeat("b", 64), StatusDigest: strings.Repeat("c", 64), DiffDigest: strings.Repeat("d", 64), RelevantPaths: []codingagent.WorkspacePathRevision{{Path: "main.go", Kind: "missing", Digest: strings.Repeat("e", 64)}}, RecordedAt: now},
+		CreatedAt:         now,
+	}
+	plan.Digest, _ = codingagent.ComputePlanDigest(plan)
+	if err := repository.CreatePlanVersion(context.Background(), plan); err != nil {
+		t.Fatalf("new Plan was blocked by an unrelated legacy journal: %v", err)
+	}
+	duplicate := newTurn
+	duplicate.SessionID = legacySession.ID
+	if err := repository.CreateTurn(context.Background(), duplicate); err == nil {
+		t.Fatal("raw journal identity scan did not preserve global Turn ID uniqueness")
+	}
+}
+
 func TestRepositoryMigratesLegacyFlatSessionMetadata(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	legacyDirectory := filepath.Join(root, "coding-sessions")
@@ -198,48 +247,6 @@ func TestRepositoryMigratesLegacyFlatSessionMetadata(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy metadata remains after migration: %v", err)
-	}
-}
-
-func TestRepositoryLoadsLegacyPlanWithoutNewCompletionFields(t *testing.T) {
-	root := t.TempDir()
-	repository, err := NewRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC().Truncate(time.Millisecond)
-	legacy := legacyPlanV1Fixture{
-		ID: "plan-legacy", TurnID: "turn-legacy", Version: 1, Goal: "Load the original Plan format.",
-		Scope:    codingagent.PlanScope{Included: []string{"internal/codingagent"}},
-		Findings: []string{"The stored Plan predates completion modes."}, Risks: []string{"Its immutable digest must remain valid."},
-		Steps:              []codingagent.PlanStep{{ID: "load", Goal: "Load the Plan.", Files: []string{"internal/codingagent/plan.go"}, Validation: []string{"Open the existing session."}}},
-		AcceptanceCriteria: []string{"Startup succeeds without rewriting the Plan."}, RecommendedStrategy: codingagent.ExecutionSingle,
-		WorkspaceRevision: codingagent.WorkspaceRevision{WorktreeID: "worktree-legacy", StatusDigest: strings.Repeat("b", 64), RecordedAt: now},
-		CreatedAt:         now,
-	}
-	canonical, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	digest := sha256.Sum256(canonical)
-	legacy.Digest = hex.EncodeToString(digest[:])
-	path, err := repository.planVersionPath(legacy.ID, legacy.Version)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeEnvelope(path, legacy); err != nil {
-		t.Fatal(err)
-	}
-	versions, err := repository.ListPlanVersions(context.Background(), legacy.ID)
-	if err != nil || len(versions) != 1 {
-		t.Fatalf("list legacy Plan versions = %#v, %v", versions, err)
-	}
-	loaded := versions[0]
-	if loaded.CompletionMode != codingagent.PlanCompletionExecute || !loaded.WorkspaceRelevant || loaded.Digest != legacy.Digest {
-		t.Fatalf("loaded legacy Plan = %#v", loaded)
 	}
 }
 

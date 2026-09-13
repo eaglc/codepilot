@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
 	"reflect"
 	"strings"
 	"time"
@@ -27,6 +25,8 @@ type exitPlanModeTool struct {
 	turnID       TurnID
 	worktreeID   WorktreeID
 	worktreeRoot string
+	workflows    bool
+	subagents    bool
 }
 
 type planApprovalPayload struct {
@@ -37,13 +37,14 @@ type planApprovalPayload struct {
 	Digest         string             `json:"digest"`
 	Summary        string             `json:"summary"`
 	CompletionMode PlanCompletionMode `json:"completion_mode"`
+	Strategy       ExecutionStrategy  `json:"recommended_strategy"`
 }
 
 func (*exitPlanModeTool) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{
 		Name:        exitPlanModeToolName,
 		Description: "Submit a complete structured plan for product validation and user review. Declare whether it depends on this workspace and whether approval should execute it or finish the task. This exclusive control call never grants write permission.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string"},"scope":{"type":"object","properties":{"included":{"type":"array","items":{"type":"string"}},"excluded":{"type":"array","items":{"type":"string"}}},"required":["included"],"additionalProperties":false},"findings":{"type":"array","items":{"type":"string"}},"assumptions":{"type":"array","items":{"type":"string"}},"risks":{"type":"array","items":{"type":"string"}},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"goal":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"files":{"type":"array","items":{"type":"string"}},"validation":{"type":"array","items":{"type":"string"}}},"required":["id","goal","validation"],"additionalProperties":false}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"recommended_strategy":{"type":"string","enum":["single"]},"workspace_relevant":{"type":"boolean"},"completion_mode":{"type":"string","enum":["execute","deliverable"]}},"required":["goal","scope","findings","risks","steps","acceptance_criteria","recommended_strategy","workspace_relevant","completion_mode"],"additionalProperties":false}`),
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string"},"scope":{"type":"object","properties":{"included":{"type":"array","items":{"type":"string"}},"excluded":{"type":"array","items":{"type":"string"}}},"required":["included"],"additionalProperties":false},"findings":{"type":"array","items":{"type":"string"}},"assumptions":{"type":"array","items":{"type":"string"}},"risks":{"type":"array","items":{"type":"string"}},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"goal":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"files":{"type":"array","items":{"type":"string"}},"validation":{"type":"array","items":{"type":"string"}},"role":{"type":"string","enum":["explore","implement","validate","review","integrate"]},"failure_action":{"type":"string","enum":["retry","block","replan","terminate","fallback_main"]},"max_attempts":{"type":"integer","minimum":1,"maximum":8}},"required":["id","goal","validation"],"additionalProperties":false}},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"recommended_strategy":{"type":"string","enum":["single","workflow_single","workflow_multi_serial"]},"workspace_relevant":{"type":"boolean"},"completion_mode":{"type":"string","enum":["execute","deliverable"]}},"required":["goal","scope","findings","risks","steps","acceptance_criteria","recommended_strategy","workspace_relevant","completion_mode"],"additionalProperties":false}`),
 	}
 }
 
@@ -73,6 +74,12 @@ func (t *exitPlanModeTool) Execute(ctx context.Context, call tool.Call, _ tool.P
 	if err := validatePlanSubmission(submission); err != nil {
 		return planInvalidResult(err.Error()), nil
 	}
+	if submission.RecommendedStrategy == ExecutionWorkflowSingle && !t.workflows {
+		return planInvalidResult("Single-Agent Workflow execution is currently disabled; recommend Direct single-Agent execution."), nil
+	}
+	if submission.RecommendedStrategy == ExecutionWorkflowMultiSerial && (!t.workflows || !t.subagents) {
+		return planInvalidResult("Serial multi-Agent Workflow execution is currently disabled; recommend Direct or single-Agent Workflow execution."), nil
+	}
 	turn, err := t.turns.LoadTurn(ctx, t.turnID)
 	if err != nil {
 		return tool.Result{}, fmt.Errorf("submit Coding plan: load Product Turn: %w", err)
@@ -95,7 +102,7 @@ func (t *exitPlanModeTool) Execute(ctx context.Context, call tool.Call, _ tool.P
 	}
 	workspaceRevision := WorkspaceRevision{}
 	if submission.WorkspaceRelevant {
-		workspaceRevision, err = capturePlanWorkspaceRevision(ctx, t.worktreeID, t.worktreeRoot)
+		workspaceRevision, err = capturePlanWorkspaceRevision(ctx, t.worktreeID, t.worktreeRoot, planRelevantPaths(submission))
 		if err != nil {
 			return tool.Result{}, err
 		}
@@ -154,6 +161,7 @@ func planApprovalInterruptResult(value Plan) tool.Result {
 		Kind: "coding_plan_approval_v1", Version: 1, PlanID: value.ID, Revision: value.Version,
 		Digest: value.Digest, Summary: "Review Plan v" + fmt.Sprint(value.Version) + ": " + value.Goal,
 		CompletionMode: value.CompletionMode,
+		Strategy:       value.RecommendedStrategy,
 	}
 	encoded, _ := json.Marshal(payload)
 	return tool.Result{
@@ -166,7 +174,11 @@ func planApprovalInterruptResult(value Plan) tool.Result {
 
 func (t *exitPlanModeTool) Resume(ctx context.Context, _ tool.Call, interrupt tool.Interrupt, resolution tool.Result, _ tool.ProgressSink) (tool.Result, error) {
 	var payload planApprovalPayload
-	if json.Unmarshal(interrupt.Payload, &payload) != nil || payload.Kind != "coding_plan_approval_v1" || payload.Version != 1 || payload.PlanID == "" || payload.Revision == 0 || !isHexDigest(payload.Digest, 64, 64) {
+	if json.Unmarshal(interrupt.Payload, &payload) != nil {
+		return tool.Result{}, errors.New("resume Coding plan approval: durable approval payload is invalid")
+	}
+	normalizePlanApprovalPayload(&payload)
+	if payload.Kind != "coding_plan_approval_v1" || payload.Version != 1 || payload.PlanID == "" || payload.Revision == 0 || !isHexDigest(payload.Digest, 64, 64) || !validExecutionStrategy(payload.Strategy) {
 		return tool.Result{}, errors.New("resume Coding plan approval: durable approval payload is invalid")
 	}
 	turn, err := t.turns.LoadTurn(ctx, t.turnID)
@@ -206,6 +218,12 @@ func (t *exitPlanModeTool) Resume(ctx context.Context, _ tool.Call, interrupt to
 	}
 }
 
+func normalizePlanApprovalPayload(payload *planApprovalPayload) {
+	if payload != nil && payload.Strategy == "" {
+		payload.Strategy = ExecutionSingle
+	}
+}
+
 func normalizePlanSubmission(value *PlanSubmission) error {
 	if value == nil {
 		return errors.New("The Plan submission is missing.")
@@ -220,29 +238,6 @@ func normalizePlanSubmission(value *PlanSubmission) error {
 		}
 	}
 	return nil
-}
-
-func capturePlanWorkspaceRevision(ctx context.Context, worktreeID WorktreeID, root string) (WorkspaceRevision, error) {
-	head, _ := runReadOnlyGit(ctx, root, "rev-parse", "HEAD")
-	status, err := runReadOnlyGit(ctx, root, "status", "--porcelain=v1", "--untracked-files=all")
-	if err != nil {
-		return WorkspaceRevision{}, fmt.Errorf("capture Coding plan workspace revision: %w", err)
-	}
-	digest := sha256.Sum256([]byte(status))
-	return WorkspaceRevision{WorktreeID: worktreeID, GitHead: strings.TrimSpace(head), StatusDigest: hex.EncodeToString(digest[:]), RecordedAt: time.Now().UTC()}, nil
-}
-
-func runReadOnlyGit(ctx context.Context, root string, arguments ...string) (string, error) {
-	command := exec.CommandContext(ctx, "git", append([]string{"-C", root, "--no-optional-locks"}, arguments...)...)
-	command.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
-	output, err := command.Output()
-	if err != nil {
-		return "", errors.New("Git could not read the current worktree revision")
-	}
-	if len(output) > 1<<20 {
-		return "", errors.New("Git revision output exceeded its size limit")
-	}
-	return string(output), nil
 }
 
 func deterministicPlanID(turnID TurnID) PlanID {

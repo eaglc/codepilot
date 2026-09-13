@@ -33,6 +33,8 @@ func ProjectSnapshot(product Session, durable agentsession.Snapshot, lane agents
 			projectPlanEntryApprovalInterrupt(&projected, pending.Payload)
 		} else if pending.Kind == "plan_approval" && len(pending.Payload) != 0 {
 			projectPlanApprovalInterrupt(&projected, pending.Payload)
+		} else if pending.Kind == planReplanApprovalKind && len(pending.Payload) != 0 {
+			projectPlanReplanApprovalInterrupt(&projected, pending.Payload)
 		} else if pending.Kind == clarificationInterruptKind && len(pending.Payload) != 0 {
 			projectClarificationInterrupt(&projected, pending.Payload)
 		}
@@ -114,7 +116,11 @@ func projectPlanApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage)
 		return
 	}
 	var payload planApprovalPayload
-	if json.Unmarshal(raw, &payload) != nil || payload.Kind != "coding_plan_approval_v1" || payload.Version != 1 || payload.PlanID == "" || payload.Revision == 0 || !isHexDigest(payload.Digest, 64, 64) {
+	if json.Unmarshal(raw, &payload) != nil {
+		return
+	}
+	normalizePlanApprovalPayload(&payload)
+	if payload.Kind != "coding_plan_approval_v1" || payload.Version != 1 || payload.PlanID == "" || payload.Revision == 0 || !isHexDigest(payload.Digest, 64, 64) || !validExecutionStrategy(payload.Strategy) {
 		return
 	}
 	target.Summary = boundedUTF8(redactSensitiveText(payload.Summary), 4<<10)
@@ -122,6 +128,21 @@ func projectPlanApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage)
 	target.PlanVersion = payload.Revision
 	target.PlanDigest = payload.Digest
 	target.PlanCompletion = payload.CompletionMode
+	target.PlanStrategy = payload.Strategy
+}
+
+func projectPlanReplanApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage) {
+	if target == nil || len(raw) == 0 || !json.Valid(raw) {
+		return
+	}
+	var payload planReplanApprovalPayload
+	if json.Unmarshal(raw, &payload) != nil || payload.Kind != "coding_plan_replan_approval_v1" || payload.Version != 1 || validatePlanReplanSubmission(planReplanSubmission{ReasonCode: payload.ReasonCode, Summary: payload.Summary}) != nil || !isHexDigest(payload.Digest, 64, 64) || payload.PlanVersion == 0 || !isHexDigest(payload.PlanDigest, 64, 64) {
+		return
+	}
+	target.Summary = boundedUTF8(redactSensitiveText(payload.Summary), maxPlanReplanSummaryBytes)
+	target.PlanVersion = payload.PlanVersion
+	target.PlanDigest = payload.PlanDigest
+	target.PlanReplanReason = payload.ReasonCode
 }
 
 // ProjectSnapshotWithTurns adds explicit Product Turn/Run relationships while
@@ -135,6 +156,7 @@ func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, la
 	runProfiles := make(map[agentsession.RunID]CapabilityProfile)
 	runPhases := make(map[agentsession.RunID]TurnPhase)
 	runStatuses := make(map[agentsession.RunID]TurnStatus)
+	revisedPlanTurns := 0
 	for _, turn := range turns {
 		for _, binding := range turn.Runs {
 			runTurns[binding.RunID] = turn.ID
@@ -143,10 +165,27 @@ func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, la
 			runStatuses[binding.RunID] = turn.Status
 		}
 		if turn.Status == TurnPending || turn.Status == TurnRunning || turn.Status == TurnInterrupted {
-			value := TurnSnapshot{ID: turn.ID, Phase: turn.Phase, Status: turn.Status, Strategy: turn.Strategy, RunCount: len(turn.Runs), Revision: turn.Revision}
+			value := TurnSnapshot{ID: turn.ID, Phase: turn.Phase, Status: turn.Status, Strategy: turn.Strategy, RunCount: len(turn.Runs), Revision: turn.Revision, ApprovedPlanVersion: turn.ApprovedPlanVersion}
 			snapshot.ActiveTurn = &value
 			snapshot.PendingPlanEntryApproval = turn.Phase == TurnPhaseAwaitingPlanEntryApproval && turn.Status == TurnInterrupted
+			snapshot.PendingPlanReplan = turn.Phase == TurnPhaseNeedsReplan && turn.Status == TurnInterrupted
 		}
+		if turn.PlanVersion != 0 {
+			snapshot.Metrics.PlanTurns++
+			if turn.PlanVersion > 1 {
+				snapshot.Metrics.PlanRevisions += int(turn.PlanVersion - 1)
+				revisedPlanTurns++
+			}
+		}
+		if turn.ApprovedPlanVersion != 0 {
+			snapshot.Metrics.PlanApprovals++
+		}
+		snapshot.Metrics.WorkspaceDrifts += int(turn.WorkspaceDriftCount)
+		snapshot.Metrics.Replans += int(turn.PlanReplanCount)
+	}
+	if snapshot.Metrics.PlanTurns != 0 {
+		snapshot.Metrics.PlanApprovalRate = float64(snapshot.Metrics.PlanApprovals) / float64(snapshot.Metrics.PlanTurns)
+		snapshot.Metrics.PlanRevisionRate = float64(revisedPlanTurns) / float64(snapshot.Metrics.PlanTurns)
 	}
 	for index := range snapshot.Transcript {
 		runID := agentsession.RunID(snapshot.Transcript[index].TurnID)
@@ -185,7 +224,75 @@ func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, la
 		snapshot.Metrics.LatestTurnStatus = runStatuses[runID]
 	}
 	snapshot.Metrics.ByPhase = projectPhaseMetrics(durable, lane, turns)
+	snapshot.Metrics.Workflow = projectWorkflowMetrics(durable, turns)
+	if snapshot.Metrics.LatestTurnID != "" {
+		steps := 0
+		for _, turn := range turns {
+			if turn.ID != snapshot.Metrics.LatestTurnID {
+				continue
+			}
+			for _, binding := range turn.Runs {
+				steps += binding.Steps
+			}
+			break
+		}
+		snapshot.Metrics.Steps = steps
+	}
 	return snapshot, nil
+}
+
+func projectWorkflowMetrics(durable agentsession.Snapshot, turns []Turn) WorkflowMetrics {
+	metrics := WorkflowMetrics{}
+	runs := make(map[agentsession.RunID]struct{})
+	nodeRuns := make(map[string]int)
+	for _, turn := range turns {
+		if !isWorkflowStrategy(turn.Strategy) || turn.WorkflowID == "" {
+			continue
+		}
+		metrics.Turns++
+		switch turn.Status {
+		case TurnCompleted:
+			metrics.CompletedTurns++
+		case TurnFailed:
+			metrics.FailedTurns++
+		case TurnCancelled:
+			metrics.CancelledTurns++
+		}
+		for _, binding := range turn.Runs {
+			if binding.NodeID == "" {
+				continue
+			}
+			metrics.NodeRuns++
+			metrics.Steps += binding.Steps
+			if binding.Status == RunBindingFailed {
+				metrics.FailedNodeRuns++
+			}
+			if !binding.StartedAt.IsZero() && !binding.FinishedAt.IsZero() && !binding.FinishedAt.Before(binding.StartedAt) {
+				metrics.Elapsed += binding.FinishedAt.Sub(binding.StartedAt)
+			}
+			runs[binding.RunID] = struct{}{}
+			nodeRuns[string(turn.ID)+"\x00"+string(binding.NodeID)]++
+		}
+	}
+	for _, count := range nodeRuns {
+		if count > 1 {
+			metrics.Retries += count - 1
+		}
+	}
+	for _, record := range durable.Records {
+		if _, found := runs[record.RunID]; !found || record.Type != agentsession.RecordUsage || record.Usage == nil {
+			continue
+		}
+		total := record.Usage.TotalTokens
+		if total <= 0 {
+			total = record.Usage.InputTokens + record.Usage.OutputTokens
+		}
+		metrics.TotalTokens += max(0, total)
+		if record.Usage.Cost > 0 {
+			metrics.Cost += record.Usage.Cost
+		}
+	}
+	return metrics
 }
 
 func projectPhaseMetrics(durable agentsession.Snapshot, lane agentsession.Lane, turns []Turn) []PhaseMetrics {
@@ -641,6 +748,14 @@ func transcriptItemID(entryID agentsession.EntryID, index int) string {
 }
 
 func toolMessageStatus(message *llm.Message) string {
+	if message.ToolName == exitPlanModeToolName && message.IsError {
+		var decision struct {
+			Decision string `json:"decision"`
+		}
+		if json.Unmarshal(message.Details, &decision) == nil && decision.Decision == "declined" {
+			return "revision_requested"
+		}
+	}
 	if message.IsError {
 		return "error"
 	}

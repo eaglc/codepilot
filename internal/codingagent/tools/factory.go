@@ -23,9 +23,11 @@ import (
 	"github.com/eaglc/codepilot/internal/codingagent"
 	"github.com/eaglc/codepilot/internal/codingagent/language"
 	"github.com/eaglc/codepilot/internal/codingagent/lsp"
+	"github.com/eaglc/codepilot/internal/codingagent/roleprofile"
 	workspacefiles "github.com/eaglc/codepilot/internal/codingagent/workspace"
 	"github.com/eaglc/codepilot/internal/llm"
 	"github.com/eaglc/codepilot/internal/tool"
+	"github.com/eaglc/codepilot/internal/workflow"
 )
 
 const (
@@ -67,6 +69,7 @@ type Options struct {
 	Security          *codingagent.SecurityPolicy
 	Languages         *language.Registry
 	Navigator         lsp.Navigator
+	Roles             *roleprofile.Registry
 }
 
 // Factory creates an isolated tool registry for one trusted worktree.
@@ -133,8 +136,22 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 	if scope.Profile == "" {
 		scope.Profile = codingagent.CapabilityDirect
 	}
-	if scope.Profile != codingagent.CapabilityDirect && scope.Profile != codingagent.CapabilityPlan && scope.Profile != codingagent.CapabilityPlanWorkspace {
-		return nil, fmt.Errorf("create Coding tools: unsupported capability profile %q", scope.Profile)
+	roleProfile := scope.Profile != codingagent.CapabilityDirect && scope.Profile != codingagent.CapabilityPlan && scope.Profile != codingagent.CapabilityPlanWorkspace
+	roles := f.options.Roles
+	if roles == nil {
+		defaultRoles, roleErr := roleprofile.NewDefaultRegistry()
+		if roleErr != nil {
+			return nil, fmt.Errorf("create Coding tools: load role profiles: %w", roleErr)
+		}
+		roles = defaultRoles
+	}
+	var roleDefinition roleprofile.Definition
+	if roleProfile {
+		var roleErr error
+		roleDefinition, roleErr = roles.ResolveVersion(workflow.Role(scope.Profile), roleprofile.Profile(scope.Profile), scope.PolicyVersion)
+		if roleErr != nil {
+			return nil, fmt.Errorf("create Coding tools: %w", roleErr)
+		}
 	}
 	root, err := filepath.Abs(scope.WorktreeRoot)
 	if err != nil {
@@ -212,8 +229,23 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 			}
 		}
 		executables = readOnly
+	} else if roleProfile {
+		allowed := make(map[string]bool, len(roleDefinition.Tools.Allowed))
+		for _, name := range roleDefinition.Tools.Allowed {
+			allowed[name] = true
+		}
+		bounded := executables[:0]
+		for _, executable := range executables {
+			if allowed[executable.Definition().Name] {
+				bounded = append(bounded, executable)
+			}
+		}
+		executables = bounded
 	}
 	for index := range executables {
+		if scope.NodeID != "" || roleProfile && roleDefinition.Tools.NodeScoped {
+			executables[index] = withNodeScopeBoundary(executables[index], scope.ReadScope, scope.WriteScope)
+		}
 		executables[index] = withPermissionBoundary(executables[index], scope.PermissionMode, scope.PermissionGrants)
 		executables[index] = withSecurityBoundary(executables[index], security)
 		if executables[index].Definition().Name != "read_tool_result" {

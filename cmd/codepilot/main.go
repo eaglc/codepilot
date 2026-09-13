@@ -61,6 +61,8 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	disableProductTurns := flags.Bool("disable-product-turns", false, "disable Product Turn persistence and use the legacy Direct execution path")
 	disablePlanMode := flags.Bool("disable-plan-mode", false, "disable starting new Plan tasks, including Agent suggestions")
 	disablePlanSuggestions := flags.Bool("disable-plan-suggestions", false, "disable Agent suggestions to enter Plan mode")
+	disableWorkflows := flags.Bool("disable-workflows", false, "disable starting new Workflows while preserving existing Workflow recovery")
+	disableSubagents := flags.Bool("disable-subagents", false, "disable new Plan exploration and serial multi-Agent delegation while preserving recovery")
 	if err := flags.Parse(arguments); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -101,6 +103,8 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 		DisableProductTurns:    *disableProductTurns,
 		DisablePlanMode:        *disablePlanMode,
 		DisablePlanSuggestions: *disablePlanSuggestions,
+		DisableWorkflows:       *disableWorkflows,
+		DisableSubagents:       *disableSubagents,
 		Input:                  stdin,
 		Output:                 stdout,
 	}

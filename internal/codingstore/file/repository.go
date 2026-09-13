@@ -48,7 +48,7 @@ func NewRepository(root string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, directory := range []string{"coding-sessions", "coding-plans", "coding-workspaces", "coding-worktrees", "coding-artifacts", filepath.Join("coding-transactions", "session-create"), worktreeRelocationDirectory} {
+	for _, directory := range []string{"coding-sessions", "coding-plans", "coding-workflows", "coding-child-agents", "coding-workspaces", "coding-worktrees", "coding-artifacts", filepath.Join("coding-transactions", "session-create"), worktreeRelocationDirectory} {
 		if err := os.MkdirAll(filepath.Join(absolute, directory), 0o700); err != nil {
 			return nil, fmt.Errorf("create Coding file repository: create %s: %w", directory, err)
 		}
@@ -79,12 +79,15 @@ func (r *Repository) CreateTurn(ctx context.Context, value codingagent.Turn) err
 	if _, err := r.loadSessionLocked(value.SessionID); err != nil {
 		return fmt.Errorf("create Coding turn %q: %w", value.ID, err)
 	}
-	turns, err := r.loadTurnsLocked(ctx, "")
+	_, found, err := r.findTurnJournalLocked(ctx, value.ID)
 	if err != nil {
 		return fmt.Errorf("create Coding turn %q: %w", value.ID, err)
 	}
-	if _, found := turns[value.ID]; found {
+	if found {
 		return fmt.Errorf("create Coding turn %q: already exists", value.ID)
+	}
+	if _, err := r.loadTurnsLocked(ctx, value.SessionID); err != nil {
+		return fmt.Errorf("create Coding turn %q: %w", value.ID, err)
 	}
 	return r.appendTurnRecord(value.SessionID, turnJournalRecord{Kind: "created", Turn: value})
 }
@@ -96,15 +99,7 @@ func (r *Repository) LoadTurn(ctx context.Context, id codingagent.TurnID) (codin
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	turns, err := r.loadTurnsLocked(ctx, "")
-	if err != nil {
-		return codingagent.Turn{}, err
-	}
-	value, found := turns[id]
-	if !found {
-		return codingagent.Turn{}, fmt.Errorf("load Coding turn %q: %w", id, codingagent.ErrTurnNotFound)
-	}
-	return value, nil
+	return r.loadTurnLocked(ctx, id)
 }
 
 // ListTurns returns Product Turns for one session in creation order.
@@ -634,6 +629,87 @@ func (r *Repository) loadTurnsLocked(ctx context.Context, sessionID codingagent.
 		}
 	}
 	return turns, nil
+}
+
+func (r *Repository) loadTurnLocked(ctx context.Context, id codingagent.TurnID) (codingagent.Turn, error) {
+	path, found, err := r.findTurnJournalLocked(ctx, id)
+	if err != nil {
+		return codingagent.Turn{}, err
+	}
+	if !found {
+		return codingagent.Turn{}, fmt.Errorf("load Coding turn %q: %w", id, codingagent.ErrTurnNotFound)
+	}
+	turns := make(map[codingagent.TurnID]codingagent.Turn)
+	if err := replayTurnJournal(ctx, path, turns); err != nil {
+		return codingagent.Turn{}, err
+	}
+	value, found := turns[id]
+	if !found {
+		return codingagent.Turn{}, fmt.Errorf("load Coding turn %q: %w", id, codingagent.ErrTurnNotFound)
+	}
+	return value, nil
+}
+
+func (r *Repository) findTurnJournalLocked(ctx context.Context, id codingagent.TurnID) (string, bool, error) {
+	entries, err := os.ReadDir(filepath.Join(r.root, "coding-sessions"))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("list Coding turn journals: %w", err)
+	}
+	foundPath := ""
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return "", false, err
+		}
+		if !entry.IsDir() || !validID.MatchString(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(r.root, "coding-sessions", entry.Name(), "turns.jsonl")
+		contains, err := turnJournalContainsID(ctx, path, id)
+		if err != nil {
+			return "", false, err
+		}
+		if !contains {
+			continue
+		}
+		if foundPath != "" {
+			return "", false, fmt.Errorf("Coding turn %q exists in multiple session journals", id)
+		}
+		foundPath = path
+	}
+	return foundPath, foundPath != "", nil
+}
+
+func turnJournalContainsID(ctx context.Context, path string, id codingagent.TurnID) (bool, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read Coding turn journal %q: %w", path, err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64<<10), 8<<20)
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		var identity struct {
+			Turn struct {
+				ID codingagent.TurnID `json:"id"`
+			} `json:"turn"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &identity) == nil && identity.Turn.ID == id {
+			return true, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("read Coding turn journal %q: %w", path, err)
+	}
+	return false, nil
 }
 
 func replayTurnJournal(ctx context.Context, path string, turns map[codingagent.TurnID]codingagent.Turn) error {

@@ -57,6 +57,11 @@ func (b *EventBridge) PublishCodingEvent(ctx context.Context, event codingagent.
 			b.signal(b.wake)
 			return nil
 		}
+		if b.replacePlanDraft(event) {
+			b.mu.Unlock()
+			b.signal(b.wake)
+			return nil
+		}
 		if len(b.queue) < b.capacity {
 			b.queue = append(b.queue, event)
 			b.mu.Unlock()
@@ -140,6 +145,20 @@ func (b *EventBridge) mergeAssistantDelta(event codingagent.Event) bool {
 	last.Sequence = event.Sequence
 	last.SnapshotRevision = event.SnapshotRevision
 	last.Timestamp = event.Timestamp
+	return true
+}
+
+// replacePlanDraft must be called with b.mu held. Plan draft events contain a
+// complete replacement rendering, so only the newest queued version matters.
+func (b *EventBridge) replacePlanDraft(event codingagent.Event) bool {
+	if event.Kind != codingagent.EventPlanDraftUpdated || event.Payload.PlanDraft == nil || len(b.queue) == 0 {
+		return false
+	}
+	last := &b.queue[len(b.queue)-1]
+	if last.Kind != codingagent.EventPlanDraftUpdated || last.Payload.PlanDraft == nil || last.SessionID != event.SessionID || last.TurnID != event.TurnID {
+		return false
+	}
+	*last = event
 	return true
 }
 

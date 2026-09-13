@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/eaglc/codepilot/internal/workflow"
 )
 
 const (
@@ -40,19 +42,37 @@ type PlanScope struct {
 
 // PlanStep is one bounded, dependency-aware implementation step.
 type PlanStep struct {
-	ID         string   `json:"id"`
-	Goal       string   `json:"goal"`
-	DependsOn  []string `json:"depends_on,omitempty"`
-	Files      []string `json:"files,omitempty"`
-	Validation []string `json:"validation"`
+	ID            string                 `json:"id"`
+	Goal          string                 `json:"goal"`
+	DependsOn     []string               `json:"depends_on,omitempty"`
+	Files         []string               `json:"files,omitempty"`
+	Validation    []string               `json:"validation"`
+	Role          workflow.Role          `json:"role,omitempty"`
+	FailureAction workflow.FailureAction `json:"failure_action,omitempty"`
+	MaxAttempts   int                    `json:"max_attempts,omitempty"`
+}
+
+// WorkspacePathRevision is a bounded content fingerprint for one Plan-relevant
+// file or directory. Directory digests include every contained regular file and
+// symlink without following links outside the worktree.
+type WorkspacePathRevision struct {
+	Path   string `json:"path"`
+	Kind   string `json:"kind"`
+	Digest string `json:"digest"`
+	Files  int    `json:"files,omitempty"`
 }
 
 // WorkspaceRevision binds a Plan to the trusted worktree facts observed at submission.
 type WorkspaceRevision struct {
-	WorktreeID   WorktreeID `json:"worktree_id"`
-	GitHead      string     `json:"git_head,omitempty"`
-	StatusDigest string     `json:"status_digest"`
-	RecordedAt   time.Time  `json:"recorded_at"`
+	Version        int                     `json:"version,omitempty"`
+	WorktreeID     WorktreeID              `json:"worktree_id"`
+	IdentityDigest string                  `json:"identity_digest,omitempty"`
+	GitHead        string                  `json:"git_head,omitempty"`
+	StatusDigest   string                  `json:"status_digest"`
+	DiffDigest     string                  `json:"diff_digest,omitempty"`
+	ChangedPaths   []string                `json:"changed_paths,omitempty"`
+	RelevantPaths  []WorkspacePathRevision `json:"relevant_paths,omitempty"`
+	RecordedAt     time.Time               `json:"recorded_at"`
 }
 
 // Plan is one immutable, structured implementation-plan revision.
@@ -90,23 +110,12 @@ type PlanSubmission struct {
 	CompletionMode      PlanCompletionMode `json:"completion_mode"`
 }
 
-// ApplyPlanCompatibilityDefaults upgrades a Plan decoded from the original P1
-// persistence shape. It deliberately preserves Digest because Product Turns
-// bind the immutable revision by that original digest.
-func ApplyPlanCompatibilityDefaults(value Plan) Plan {
-	if value.CompletionMode == "" {
-		value.CompletionMode = PlanCompletionExecute
-		value.WorkspaceRelevant = value.WorkspaceRevision != (WorkspaceRevision{})
-	}
-	return value
-}
-
 // ValidatePlan checks the immutable Plan repository contract and canonical digest.
 func ValidatePlan(value Plan) error {
 	if value.ID == "" || value.TurnID == "" || value.Version == 0 || value.CreatedAt.IsZero() {
 		return errors.New("Coding plan identity, turn, version, and creation time are required")
 	}
-	if value.RecommendedStrategy != ExecutionSingle {
+	if !validExecutionStrategy(value.RecommendedStrategy) {
 		return fmt.Errorf("Coding plan execution strategy %q is unsupported", value.RecommendedStrategy)
 	}
 	if err := validatePlanSubmission(PlanSubmission{
@@ -118,16 +127,19 @@ func ValidatePlan(value Plan) error {
 		return err
 	}
 	if value.WorkspaceRelevant {
-		if value.WorkspaceRevision.WorktreeID == "" || value.WorkspaceRevision.RecordedAt.IsZero() {
-			return errors.New("Workspace-relevant Coding plan requires a worktree revision and timestamp")
+		if err := validateWorkspaceRevision(value.WorkspaceRevision); err != nil {
+			return fmt.Errorf("Coding plan workspace revision is invalid: %w", err)
 		}
-		if value.WorkspaceRevision.GitHead != "" && !isHexDigest(value.WorkspaceRevision.GitHead, 40, 64) {
-			return errors.New("Coding plan Git HEAD is invalid")
+		expectedPaths := planRelevantPaths(planSubmissionFromPlan(value))
+		if len(expectedPaths) != len(value.WorkspaceRevision.RelevantPaths) {
+			return errors.New("Coding plan workspace revision does not cover its exact file scope")
 		}
-		if !isHexDigest(value.WorkspaceRevision.StatusDigest, 64, 64) {
-			return errors.New("Coding plan workspace status digest is invalid")
+		for index, expected := range expectedPaths {
+			if value.WorkspaceRevision.RelevantPaths[index].Path != expected {
+				return errors.New("Coding plan workspace revision does not cover its exact file scope")
+			}
 		}
-	} else if value.WorkspaceRevision != (WorkspaceRevision{}) {
+	} else if !workspaceRevisionEmpty(value.WorkspaceRevision) {
 		return errors.New("Workspace-independent Coding plan cannot carry a workspace revision")
 	}
 	digest, err := ComputePlanDigest(value)
@@ -135,10 +147,7 @@ func ValidatePlan(value Plan) error {
 		return err
 	}
 	if value.Digest != digest {
-		legacyDigest, legacyErr := computeLegacyPlanDigest(value)
-		if legacyErr != nil || value.CompletionMode != PlanCompletionExecute || !value.WorkspaceRelevant || value.Digest != legacyDigest {
-			return errors.New("Coding plan digest does not match its canonical content")
-		}
+		return errors.New("Coding plan digest does not match its canonical content")
 	}
 	return nil
 }
@@ -147,8 +156,11 @@ func validatePlanSubmission(value PlanSubmission) error {
 	if err := validatePlanText("goal", value.Goal, true); err != nil {
 		return err
 	}
-	if value.RecommendedStrategy != ExecutionSingle {
+	if !validExecutionStrategy(value.RecommendedStrategy) {
 		return fmt.Errorf("Coding plan execution strategy %q is unsupported", value.RecommendedStrategy)
+	}
+	if value.CompletionMode == PlanCompletionDeliverable && value.RecommendedStrategy != ExecutionSingle {
+		return errors.New("A deliverable-only Coding plan cannot recommend an execution Workflow")
 	}
 	if value.CompletionMode != PlanCompletionExecute && value.CompletionMode != PlanCompletionDeliverable {
 		return fmt.Errorf("Coding plan completion mode %q is unsupported", value.CompletionMode)
@@ -194,6 +206,21 @@ func validatePlanSubmission(value PlanSubmission) error {
 		}
 		if len(step.DependsOn) > maxPlanSteps || len(step.Files) > maxPlanPathsPerStep {
 			return fmt.Errorf("Coding plan step %q exceeds dependency or file limits", step.ID)
+		}
+		if step.Role != "" && step.Role != workflow.RoleExplore && step.Role != workflow.RoleImplement && step.Role != workflow.RoleValidate && step.Role != workflow.RoleReview && step.Role != workflow.RoleIntegrate {
+			return fmt.Errorf("Coding plan step %q has unknown role %q", step.ID, step.Role)
+		}
+		if step.Role == workflow.RoleExplore && value.RecommendedStrategy != ExecutionWorkflowMultiSerial {
+			return fmt.Errorf("Coding plan step %q can use Explore only with serial multi-Agent execution", step.ID)
+		}
+		if step.FailureAction != "" && step.FailureAction != workflow.FailureRetry && step.FailureAction != workflow.FailureBlock && step.FailureAction != workflow.FailureReplan && step.FailureAction != workflow.FailureTerminate && step.FailureAction != workflow.FailureFallbackMain {
+			return fmt.Errorf("Coding plan step %q has unknown failure action %q", step.ID, step.FailureAction)
+		}
+		if step.FailureAction == workflow.FailureFallbackMain && value.RecommendedStrategy != ExecutionWorkflowMultiSerial {
+			return fmt.Errorf("Coding plan step %q can fall back to main only in serial multi-Agent execution", step.ID)
+		}
+		if step.MaxAttempts < 0 || step.MaxAttempts > 8 {
+			return fmt.Errorf("Coding plan step %q has invalid attempt limit", step.ID)
 		}
 		seenDependencies := make(map[string]struct{}, len(step.DependsOn))
 		for _, dependency := range step.DependsOn {
@@ -252,36 +279,6 @@ func ComputePlanDigest(value Plan) (string, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return "", fmt.Errorf("compute Coding plan digest: %w", err)
-	}
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:]), nil
-}
-
-func computeLegacyPlanDigest(value Plan) (string, error) {
-	legacy := struct {
-		ID                  PlanID            `json:"id"`
-		TurnID              TurnID            `json:"turn_id"`
-		Version             uint64            `json:"version"`
-		Goal                string            `json:"goal"`
-		Scope               PlanScope         `json:"scope"`
-		Findings            []string          `json:"findings"`
-		Assumptions         []string          `json:"assumptions,omitempty"`
-		Risks               []string          `json:"risks"`
-		Steps               []PlanStep        `json:"steps"`
-		AcceptanceCriteria  []string          `json:"acceptance_criteria"`
-		RecommendedStrategy ExecutionStrategy `json:"recommended_strategy"`
-		WorkspaceRevision   WorkspaceRevision `json:"workspace_revision"`
-		Digest              string            `json:"digest"`
-		CreatedAt           time.Time         `json:"created_at"`
-	}{
-		ID: value.ID, TurnID: value.TurnID, Version: value.Version, Goal: value.Goal,
-		Scope: value.Scope, Findings: value.Findings, Assumptions: value.Assumptions, Risks: value.Risks,
-		Steps: value.Steps, AcceptanceCriteria: value.AcceptanceCriteria, RecommendedStrategy: value.RecommendedStrategy,
-		WorkspaceRevision: value.WorkspaceRevision, CreatedAt: value.CreatedAt,
-	}
-	encoded, err := json.Marshal(legacy)
-	if err != nil {
-		return "", fmt.Errorf("compute legacy Coding plan digest: %w", err)
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:]), nil

@@ -37,6 +37,33 @@ func TestEventBridgeMergesAdjacentQueuedAssistantDeltas(t *testing.T) {
 	}
 }
 
+func TestEventBridgeKeepsOnlyNewestAdjacentPlanDraft(t *testing.T) {
+	bridge, err := NewEventBridge(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.Close()
+	ctx := context.Background()
+	if err := bridge.PublishCodingEvent(ctx, codingagent.Event{ID: "head", Kind: codingagent.EventTurnStarted}); err != nil {
+		t.Fatal(err)
+	}
+	first := codingagent.Event{ID: "draft-1", SessionID: "session", TurnID: "turn", Kind: codingagent.EventPlanDraftUpdated, Payload: codingagent.EventPayload{PlanDraft: &codingagent.PlanDraftEvent{Markdown: "first"}}}
+	second := codingagent.Event{ID: "draft-2", SessionID: "session", TurnID: "turn", Kind: codingagent.EventPlanDraftUpdated, Payload: codingagent.EventPayload{PlanDraft: &codingagent.PlanDraftEvent{Markdown: "second"}}}
+	if err := bridge.PublishCodingEvent(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.PublishCodingEvent(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if received := receiveBridgeEvent(t, bridge); received.ID != "head" {
+		t.Fatalf("head event = %#v", received)
+	}
+	received := receiveBridgeEvent(t, bridge)
+	if received.ID != "draft-2" || received.Payload.PlanDraft == nil || received.Payload.PlanDraft.Markdown != "second" {
+		t.Fatalf("latest Plan draft = %#v", received)
+	}
+}
+
 func TestEventBridgeBackpressureUnblocksWhenConsumerAdvances(t *testing.T) {
 	bridge, err := NewEventBridge(1)
 	if err != nil {

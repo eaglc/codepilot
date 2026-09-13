@@ -84,13 +84,15 @@ func (emptyToolFactory) CreateTools(context.Context, codingagent.ToolScope) (*to
 
 type failTerminalTurnRepository struct {
 	codingagent.TurnRepository
-	failOnce bool
+	failOnce  bool
+	childOnly bool
 }
 
 func (r *failTerminalTurnRepository) SaveTurn(ctx context.Context, turn codingagent.Turn, expectedRevision uint64) error {
 	if r.failOnce && len(turn.Runs) != 0 {
 		status := turn.Runs[len(turn.Runs)-1].Status
-		if status == codingagent.RunBindingHandedOff || status == codingagent.RunBindingCancelled || status == codingagent.RunBindingCompleted || status == codingagent.RunBindingFailed {
+		childMatches := !r.childOnly || turn.Runs[len(turn.Runs)-1].ChildAgentID != ""
+		if childMatches && (status == codingagent.RunBindingHandedOff || status == codingagent.RunBindingCancelled || status == codingagent.RunBindingCompleted || status == codingagent.RunBindingFailed) {
 			r.failOnce = false
 			return errors.New("injected terminal Product Turn write failure")
 		}

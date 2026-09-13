@@ -3,6 +3,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -11,17 +12,21 @@ import (
 	"time"
 
 	"github.com/eaglc/codepilot/internal/codingagent"
+	"github.com/eaglc/codepilot/internal/workflow"
 )
 
 // Repository stores Coding sessions and worktrees in memory.
 type Repository struct {
-	mu         sync.RWMutex
-	sessions   map[codingagent.SessionID]codingagent.Session
-	workspaces map[codingagent.WorkspaceID]codingagent.Workspace
-	worktrees  map[codingagent.WorktreeID]codingagent.Worktree
-	intents    map[codingagent.SessionCreationIntentID]codingagent.SessionCreationIntent
-	turns      map[codingagent.TurnID]codingagent.Turn
-	plans      map[codingagent.PlanID][]codingagent.Plan
+	mu             sync.RWMutex
+	sessions       map[codingagent.SessionID]codingagent.Session
+	workspaces     map[codingagent.WorkspaceID]codingagent.Workspace
+	worktrees      map[codingagent.WorktreeID]codingagent.Worktree
+	intents        map[codingagent.SessionCreationIntentID]codingagent.SessionCreationIntent
+	turns          map[codingagent.TurnID]codingagent.Turn
+	plans          map[codingagent.PlanID][]codingagent.Plan
+	workflows      map[workflow.ID]workflow.Workflow
+	workflowEvents map[workflow.ID]map[string]workflow.Event
+	children       map[codingagent.ChildAgentID]codingagent.ChildAgent
 }
 
 // NewRepository creates an empty product repository.
@@ -29,9 +34,180 @@ func NewRepository() *Repository {
 	return &Repository{
 		sessions: make(map[codingagent.SessionID]codingagent.Session), workspaces: make(map[codingagent.WorkspaceID]codingagent.Workspace),
 		worktrees: make(map[codingagent.WorktreeID]codingagent.Worktree), intents: make(map[codingagent.SessionCreationIntentID]codingagent.SessionCreationIntent),
-		turns: make(map[codingagent.TurnID]codingagent.Turn),
-		plans: make(map[codingagent.PlanID][]codingagent.Plan),
+		turns:     make(map[codingagent.TurnID]codingagent.Turn),
+		plans:     make(map[codingagent.PlanID][]codingagent.Plan),
+		workflows: make(map[workflow.ID]workflow.Workflow), workflowEvents: make(map[workflow.ID]map[string]workflow.Event),
+		children: make(map[codingagent.ChildAgentID]codingagent.ChildAgent),
 	}
+}
+
+// CreateChildAgent persists a durable creation intent before its Agent session exists.
+func (r *Repository) CreateChildAgent(ctx context.Context, value codingagent.ChildAgent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := codingagent.ValidateChildAgent(value); err != nil {
+		return fmt.Errorf("create Coding child Agent: %w", err)
+	}
+	if value.Status != codingagent.ChildAgentCreating || value.Revision != 1 {
+		return errors.New("create Coding child Agent: initial state must be creating revision 1")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current, exists := r.children[value.ID]; exists {
+		if reflect.DeepEqual(current, value) {
+			return nil
+		}
+		return fmt.Errorf("create Coding child Agent %q: identity already exists with different data", value.ID)
+	}
+	r.children[value.ID] = codingagent.CloneChildAgent(value)
+	return nil
+}
+
+// LoadChildAgent returns an isolated durable child projection.
+func (r *Repository) LoadChildAgent(ctx context.Context, id codingagent.ChildAgentID) (codingagent.ChildAgent, error) {
+	if err := ctx.Err(); err != nil {
+		return codingagent.ChildAgent{}, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	value, exists := r.children[id]
+	if !exists {
+		return codingagent.ChildAgent{}, fmt.Errorf("load Coding child Agent %q: %w", id, codingagent.ErrChildAgentNotFound)
+	}
+	return codingagent.CloneChildAgent(value), nil
+}
+
+// ListChildAgents returns stable creation ordering for one parent Turn.
+func (r *Repository) ListChildAgents(ctx context.Context, turnID codingagent.TurnID) ([]codingagent.ChildAgent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	values := make([]codingagent.ChildAgent, 0)
+	for _, value := range r.children {
+		if turnID == "" || value.ParentTurnID == turnID {
+			values = append(values, codingagent.CloneChildAgent(value))
+		}
+	}
+	sort.Slice(values, func(left, right int) bool {
+		if values[left].CreatedAt.Equal(values[right].CreatedAt) {
+			return values[left].ID < values[right].ID
+		}
+		return values[left].CreatedAt.Before(values[right].CreatedAt)
+	})
+	return values, nil
+}
+
+// SaveChildAgent applies one lifecycle transition with revision CAS.
+func (r *Repository) SaveChildAgent(ctx context.Context, value codingagent.ChildAgent, expectedRevision uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, exists := r.children[value.ID]
+	if !exists {
+		return fmt.Errorf("save Coding child Agent %q: %w", value.ID, codingagent.ErrChildAgentNotFound)
+	}
+	if current.Revision != expectedRevision {
+		return fmt.Errorf("save Coding child Agent %q: expected revision %d, found %d: %w", value.ID, expectedRevision, current.Revision, codingagent.ErrChildAgentConflict)
+	}
+	if err := codingagent.ValidateChildAgentTransition(current, value); err != nil {
+		return fmt.Errorf("save Coding child Agent %q: %w", value.ID, err)
+	}
+	r.children[value.ID] = codingagent.CloneChildAgent(value)
+	return nil
+}
+
+// CreateWorkflow stores immutable Workflow metadata before any state event.
+func (r *Repository) CreateWorkflow(ctx context.Context, value workflow.Workflow) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := workflow.Validate(value); err != nil {
+		return fmt.Errorf("create Coding workflow: %w", err)
+	}
+	if value.Status != workflow.StatusPending || value.Revision != 1 {
+		return errors.New("create Coding workflow: initial state must be pending revision 1")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.workflows[value.ID]; exists {
+		return fmt.Errorf("create Coding workflow %q: already exists", value.ID)
+	}
+	r.workflows[value.ID] = workflow.Clone(value)
+	r.workflowEvents[value.ID] = make(map[string]workflow.Event)
+	return nil
+}
+
+// LoadWorkflow rebuilds one Workflow from its in-memory event projection.
+func (r *Repository) LoadWorkflow(ctx context.Context, id workflow.ID) (workflow.Workflow, error) {
+	if err := ctx.Err(); err != nil {
+		return workflow.Workflow{}, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	value, exists := r.workflows[id]
+	if !exists {
+		return workflow.Workflow{}, fmt.Errorf("load Coding workflow %q: %w", id, workflow.ErrNotFound)
+	}
+	return workflow.Clone(value), nil
+}
+
+// ListWorkflows returns stable creation ordering for one Product Turn owner.
+func (r *Repository) ListWorkflows(ctx context.Context, ownerID string) ([]workflow.Workflow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	values := make([]workflow.Workflow, 0)
+	for _, value := range r.workflows {
+		if ownerID == "" || value.OwnerID == ownerID {
+			values = append(values, workflow.Clone(value))
+		}
+	}
+	sort.Slice(values, func(left, right int) bool {
+		if values[left].CreatedAt.Equal(values[right].CreatedAt) {
+			return values[left].ID < values[right].ID
+		}
+		return values[left].CreatedAt.Before(values[right].CreatedAt)
+	})
+	return values, nil
+}
+
+// AppendWorkflowEvent applies one idempotent event using revision CAS.
+func (r *Repository) AppendWorkflowEvent(ctx context.Context, id workflow.ID, expectedRevision uint64, event workflow.Event) (workflow.Workflow, error) {
+	if err := ctx.Err(); err != nil {
+		return workflow.Workflow{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, exists := r.workflows[id]
+	if !exists {
+		return workflow.Workflow{}, fmt.Errorf("append Coding workflow event %q: %w", id, workflow.ErrNotFound)
+	}
+	if previous, duplicate := r.workflowEvents[id][event.ID]; duplicate {
+		if !reflect.DeepEqual(previous, event) {
+			return workflow.Workflow{}, fmt.Errorf("append Coding workflow event %q: event id %q changed", id, event.ID)
+		}
+		return workflow.Clone(current), nil
+	}
+	if current.Revision != expectedRevision {
+		return workflow.Workflow{}, fmt.Errorf("append Coding workflow event %q: expected revision %d, found %d: %w", id, expectedRevision, current.Revision, workflow.ErrConflict)
+	}
+	next, err := workflow.ApplyEvent(current, event)
+	if err != nil {
+		return workflow.Workflow{}, fmt.Errorf("append Coding workflow event %q: %w", id, err)
+	}
+	r.workflows[id] = workflow.Clone(next)
+	if r.workflowEvents[id] == nil {
+		r.workflowEvents[id] = make(map[string]workflow.Event)
+	}
+	r.workflowEvents[id][event.ID] = event
+	return workflow.Clone(next), nil
 }
 
 // CreatePlanVersion appends one immutable, sequential Plan revision.
@@ -466,6 +642,9 @@ func cloneSession(value codingagent.Session) codingagent.Session {
 
 func cloneTurn(value codingagent.Turn) codingagent.Turn {
 	value.Runs = append([]codingagent.RunBinding(nil), value.Runs...)
+	for index := range value.Runs {
+		value.Runs[index].TerminalOutput = append([]byte(nil), value.Runs[index].TerminalOutput...)
+	}
 	return value
 }
 

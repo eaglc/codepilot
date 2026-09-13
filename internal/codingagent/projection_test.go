@@ -57,6 +57,7 @@ func TestProjectSnapshotAggregatesTimeCostAndFailureByProductPhase(t *testing.T)
 	}
 	turn := Turn{
 		ID: "turn-phase", SessionID: "coding-phase", RequestText: "complex task", Phase: TurnPhasePlanning, Status: TurnFailed, Strategy: ExecutionSingle,
+		PlanVersion: 2, ApprovedPlanVersion: 2,
 		Runs: []RunBinding{
 			{RunID: "run-direct", Phase: TurnPhaseDirect, Profile: CapabilityDirect, Status: RunBindingHandedOff, StartedAt: started, FinishedAt: started.Add(2 * time.Second)},
 			{RunID: "run-plan", Phase: TurnPhasePlanning, Profile: CapabilityPlan, Status: RunBindingFailed, StartedAt: started.Add(2 * time.Second), FinishedAt: started.Add(5 * time.Second)},
@@ -72,6 +73,9 @@ func TestProjectSnapshotAggregatesTimeCostAndFailureByProductPhase(t *testing.T)
 	}
 	if metrics[1].Phase != TurnPhasePlanning || metrics[1].Runs != 1 || metrics[1].FailedRuns != 1 || metrics[1].TotalTokens != 250 || metrics[1].Cost != .04 || metrics[1].Elapsed != 3*time.Second {
 		t.Fatalf("Planning phase metrics = %#v", metrics)
+	}
+	if snapshot.Metrics.PlanTurns != 1 || snapshot.Metrics.PlanApprovals != 1 || snapshot.Metrics.PlanRevisions != 1 || snapshot.Metrics.PlanApprovalRate != 1 || snapshot.Metrics.PlanRevisionRate != 1 {
+		t.Fatalf("Plan lifecycle metrics count Runs instead of Product Turns: %#v", snapshot.Metrics)
 	}
 }
 
@@ -100,6 +104,20 @@ func TestProjectSnapshotDoesNotExposeThinkingOrToolArguments(t *testing.T) {
 	tool := snapshot.Transcript[1].Tool
 	if tool == nil || tool.Name != "read_file" || tool.CallID != "call-1" {
 		t.Fatalf("tool projection = %#v", tool)
+	}
+}
+
+func TestToolMessageStatusTreatsDeclinedPlanAsRevisionRequest(t *testing.T) {
+	message := &llm.Message{
+		Role: llm.RoleTool, ToolName: exitPlanModeToolName, IsError: true,
+		Details: json.RawMessage(`{"decision":"declined"}`),
+	}
+	if status := toolMessageStatus(message); status != "revision_requested" {
+		t.Fatalf("declined Plan status = %q", status)
+	}
+	message.Details = json.RawMessage(`{"decision":"cancelled"}`)
+	if status := toolMessageStatus(message); status != "error" {
+		t.Fatalf("cancelled Plan status = %q", status)
 	}
 }
 

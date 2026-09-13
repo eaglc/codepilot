@@ -13,6 +13,9 @@ type approvalChoiceKind int
 
 const (
 	approvalAllowOnce approvalChoiceKind = iota
+	approvalAllowWorkflow
+	approvalAllowMultiWorkflow
+	approvalAllowDirect
 	approvalAllowSession
 	approvalDeny
 	approvalCancel
@@ -37,9 +40,29 @@ func (m *Model) approvalChoices(pending codingagent.PendingInterrupt) []approval
 		if pending.PlanCompletion == codingagent.PlanCompletionDeliverable {
 			approveLabel = "Accept Plan and finish"
 		}
+		approve := approvalChoice{kind: approvalAllowOnce, label: approveLabel}
+		choices := []approvalChoice{approve}
+		if pending.PlanCompletion == codingagent.PlanCompletionExecute && pending.PlanStrategy == codingagent.ExecutionWorkflowSingle {
+			choices = []approvalChoice{
+				{kind: approvalAllowWorkflow, label: "Approve with single-Agent Workflow"},
+				{kind: approvalAllowDirect, label: "Approve and execute Direct with one Agent"},
+			}
+		}
+		if pending.PlanCompletion == codingagent.PlanCompletionExecute && pending.PlanStrategy == codingagent.ExecutionWorkflowMultiSerial {
+			choices = []approvalChoice{
+				{kind: approvalAllowMultiWorkflow, label: "Approve with serial multi-Agent Workflow"},
+				{kind: approvalAllowDirect, label: "Approve and execute Direct with one Agent"},
+			}
+		}
+		return append(choices,
+			approvalChoice{kind: approvalDeny, label: "Request Plan revision"},
+			approvalChoice{kind: approvalCancel, label: "Cancel task"},
+		)
+	}
+	if pending.Kind == "plan_replan_approval" {
 		return []approvalChoice{
-			{kind: approvalAllowOnce, label: approveLabel},
-			{kind: approvalDeny, label: "Request Plan revision"},
+			{kind: approvalAllowOnce, label: "Return to Plan mode"},
+			{kind: approvalDeny, label: "Continue approved Plan"},
 			{kind: approvalCancel, label: "Cancel task"},
 		}
 	}
@@ -118,7 +141,19 @@ func (m *Model) applyApprovalChoice(pending codingagent.PendingInterrupt, choice
 		if pending.Kind == "plan_approval" && pending.PlanCompletion == codingagent.PlanCompletionDeliverable {
 			m.status = "Accepting Plan..."
 		}
+		if pending.Kind == "plan_replan_approval" {
+			m.status = "Returning to read-only planning..."
+		}
 		return m.resume(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce)
+	case approvalAllowWorkflow:
+		m.status = "Starting single-Agent Workflow..."
+		return m.resumeWithStrategy(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce, codingagent.ExecutionWorkflowSingle)
+	case approvalAllowMultiWorkflow:
+		m.status = "Starting serial multi-Agent Workflow..."
+		return m.resumeWithStrategy(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce, codingagent.ExecutionWorkflowMultiSerial)
+	case approvalAllowDirect:
+		m.status = "Executing approved Plan directly..."
+		return m.resumeWithStrategy(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce, codingagent.ExecutionSingle)
 	case approvalAllowSession:
 		m.status = "Allowing this scope for the session..."
 		return m.resume(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantSession)
@@ -132,6 +167,10 @@ func (m *Model) applyApprovalChoice(pending codingagent.PendingInterrupt, choice
 		}
 		if pending.Kind == "plan_entry_approval" {
 			m.status = "Continuing Direct task..."
+			return m.resume(pending, codingagent.ResolutionDenied, codingagent.PermissionGrantOnce)
+		}
+		if pending.Kind == "plan_replan_approval" {
+			m.status = "Continuing the approved Plan..."
 			return m.resume(pending, codingagent.ResolutionDenied, codingagent.PermissionGrantOnce)
 		}
 		m.status = "Declining action..."
@@ -163,6 +202,20 @@ func (m *Model) approvalRows(pending codingagent.PendingInterrupt, width int) []
 	if pending.Kind == "plan_approval" {
 		title = "Plan approval required"
 	}
+	if pending.Kind == "plan_replan_approval" {
+		title = "Plan deviation detected"
+	}
+	if pending.ChildAgentID != "" {
+		title = "Child Agent permission required"
+		identity := fmt.Sprintf("Child %s", pending.ChildAgentID)
+		if pending.NodeID != "" {
+			identity += fmt.Sprintf("  •  node %s", pending.NodeID)
+		}
+		if pending.Role != "" {
+			identity += fmt.Sprintf("  •  %s", pending.Role)
+		}
+		summary = identity + "\n" + summary
+	}
 	lines := []string{
 		theme.header.Render(title),
 		theme.warning.Render(summary),
@@ -185,7 +238,7 @@ func (m *Model) approvalRows(pending codingagent.PendingInterrupt, width int) []
 		lines = append(lines, theme.muted.Render("Applying selection..."))
 	}
 	help := "↑/↓ choose  •  Enter confirm  •  1-9 choose directly  •  Esc cancel action"
-	if pending.Kind == "plan_entry_approval" || pending.Kind == "plan_approval" {
+	if pending.Kind == "plan_entry_approval" || pending.Kind == "plan_approval" || pending.Kind == "plan_replan_approval" {
 		help = "↑/↓ choose  •  Enter confirm  •  1-9 choose directly  •  Esc cancel task"
 	}
 	lines = append(lines, theme.muted.Render(help))

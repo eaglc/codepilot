@@ -21,6 +21,7 @@ import (
 	"github.com/eaglc/codepilot/internal/codingagent/language"
 	"github.com/eaglc/codepilot/internal/codingagent/lsp"
 	"github.com/eaglc/codepilot/internal/codingagent/prompt"
+	"github.com/eaglc/codepilot/internal/codingagent/roleprofile"
 	codingtools "github.com/eaglc/codepilot/internal/codingagent/tools"
 	"github.com/eaglc/codepilot/internal/codingagent/workspace"
 	codingfile "github.com/eaglc/codepilot/internal/codingstore/file"
@@ -51,6 +52,8 @@ type Options struct {
 	DisableProductTurns    bool
 	DisablePlanMode        bool
 	DisablePlanSuggestions bool
+	DisableWorkflows       bool
+	DisableSubagents       bool
 	Input                  io.Reader
 	Output                 io.Writer
 }
@@ -195,10 +198,21 @@ func New(ctx context.Context, options Options) (*Application, error) {
 	if options.DisablePlanSuggestions {
 		features.PlanSuggestions = false
 	}
+	if options.DisableWorkflows {
+		features.Workflows = false
+	}
+	if options.DisableSubagents {
+		features.Subagents = false
+	}
+	roles, err := roleprofile.NewDefaultRegistry()
+	if err != nil {
+		_ = bridge.Close()
+		return nil, fmt.Errorf("configure role profiles: %w", err)
+	}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, Turns: productStore, Plans: productStore, AgentSessions: agentSessions, Worktrees: workspaceManager, Workspaces: workspaceManager,
-		Agent: agentRuntime, Tools: codingtools.NewFactory(codingtools.Options{Artifacts: productStore, Security: securityPolicy, Languages: language.NewDefaultRegistry(), Navigator: languageServers}), Prompts: prompt.NewBuilder(), Events: bridge,
-		Providers: providerManager, Limits: agent.RunLimits{MaxSteps: 32, MaxDuration: 30 * time.Minute}, Features: &features,
+		Sessions: productStore, Turns: productStore, Plans: productStore, Workflows: productStore, Children: productStore, AgentSessions: agentSessions, Worktrees: workspaceManager, Workspaces: workspaceManager,
+		Agent: agentRuntime, Tools: codingtools.NewFactory(codingtools.Options{Artifacts: productStore, Security: securityPolicy, Languages: language.NewDefaultRegistry(), Navigator: languageServers, Roles: roles}), Prompts: prompt.NewBuilderWithRegistry(roles), Events: bridge,
+		Providers: providerManager, Limits: agent.RunLimits{MaxSteps: 32, MaxDuration: 30 * time.Minute}, Features: &features, Roles: roles,
 	})
 	if err != nil {
 		_ = bridge.Close()

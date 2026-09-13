@@ -690,6 +690,41 @@ func TestAssistantStreamingAndDurableTextUseTheSameRenderer(t *testing.T) {
 	}
 }
 
+func TestPlanDraftStreamsAsReplacementAndClearsAtApproval(t *testing.T) {
+	bridge, _ := NewEventBridge(2)
+	defer bridge.Close()
+	snapshot := codingagent.Snapshot{Session: codingagent.Session{ID: "session", Title: "repo"}}
+	model, err := NewModel(context.Background(), fakeClient{snapshot: snapshot}, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.applyEvent(codingagent.Event{
+		SessionID: "session", Kind: codingagent.EventPlanDraftUpdated,
+		Payload: codingagent.EventPayload{PlanDraft: &codingagent.PlanDraftEvent{Markdown: "## Plan (drafting…)\n\n**Goal:** Beijing"}},
+	})
+	if output := ansi.Strip(renderedRows(model.conversationRows(100))); !strings.Contains(output, "Beijing") {
+		t.Fatalf("streamed Plan draft is missing: %q", output)
+	}
+	model.applyEvent(codingagent.Event{SessionID: "session", Kind: codingagent.EventPlanDraftUpdated, Payload: codingagent.EventPayload{PlanDraft: &codingagent.PlanDraftEvent{Markdown: "## Plan (drafting…)\n\n**Goal:** Shanghai"}}})
+	if model.livePlanDraft == "" || strings.Contains(model.livePlanDraft, "Beijing") || !strings.Contains(model.livePlanDraft, "Shanghai") {
+		t.Fatalf("Plan draft was appended instead of replaced: %q", model.livePlanDraft)
+	}
+	model.applyEvent(codingagent.Event{SessionID: "session", Kind: codingagent.EventPlanApprovalRequested})
+	if model.livePlanDraft != "" {
+		t.Fatalf("Plan draft survived approval boundary: %q", model.livePlanDraft)
+	}
+}
+
+func TestDeclinedPlanToolRendersAsRevisionRequest(t *testing.T) {
+	model := Model{expanded: map[string]bool{}}
+	output := ansi.Strip(renderedRows(model.toolRows(codingagent.TranscriptTool{
+		CallID: "call-plan", Name: "exit_plan_mode", Status: "revision_requested", IsError: true,
+	}, 100)))
+	if !strings.Contains(output, "↻ exit_plan_mode · revision requested") || strings.Contains(output, "✗ exit_plan_mode") {
+		t.Fatalf("revision request tool row = %q", output)
+	}
+}
+
 func TestMarkdownCanBeToggledByCommandAndShortcut(t *testing.T) {
 	bridge, _ := NewEventBridge(2)
 	defer bridge.Close()
@@ -1127,6 +1162,7 @@ func TestSessionPickerSwitchResetsTransientStateAndRejectsStaleMessages(t *testi
 		t.Fatalf("session picker = %#v", model.sessionPicker)
 	}
 	model.liveAssistant = "old delta"
+	model.livePlanDraft = "old Plan draft"
 	model.activities["old-call"] = codingagent.ToolActivityEvent{CallID: "old-call", Name: "old"}
 	model.history = []string{"old prompt"}
 	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
@@ -1139,8 +1175,8 @@ func TestSessionPickerSwitchResetsTransientStateAndRejectsStaleMessages(t *testi
 	if model.sessionID != "session-b" || model.snapshot.Session.ID != "session-b" || model.generation == oldGeneration {
 		t.Fatalf("active session = %q snapshot=%q generation=%d", model.sessionID, model.snapshot.Session.ID, model.generation)
 	}
-	if model.liveAssistant != "" || len(model.activities) != 0 || len(model.history) != 0 || model.pendingApproval() != nil {
-		t.Fatalf("transient state leaked after switch: live=%q activities=%#v history=%#v approval=%#v", model.liveAssistant, model.activities, model.history, model.pendingApproval())
+	if model.liveAssistant != "" || model.livePlanDraft != "" || len(model.activities) != 0 || len(model.history) != 0 || model.pendingApproval() != nil {
+		t.Fatalf("transient state leaked after switch: live=%q Plan=%q activities=%#v history=%#v approval=%#v", model.liveAssistant, model.livePlanDraft, model.activities, model.history, model.pendingApproval())
 	}
 	model.Update(snapshotMsg{snapshot: codingagent.Snapshot{Revision: 99, Session: first.Session}, sessionID: "session-a", generation: oldGeneration})
 	model.Update(eventMsg{event: codingagent.Event{SessionID: "session-a", Kind: codingagent.EventAssistantOutputDelta, Payload: codingagent.EventPayload{AssistantOutput: &codingagent.AssistantOutputEvent{Delta: "stale"}}}})
@@ -1303,6 +1339,121 @@ func TestPlanApprovalSupportsRevisionFeedbackAtSingleUserBoundary(t *testing.T) 
 	}
 }
 
+func TestWorkflowPlanApprovalLetsUserChooseDirectAndShowsProgress(t *testing.T) {
+	bridge, _ := NewEventBridge(4)
+	snapshot := codingagent.Snapshot{
+		Session: codingagent.Session{ID: "session", Title: "repo"}, PendingPlanApproval: true,
+		ActivePlan: &codingagent.PlanSnapshot{
+			ID: "plan", TurnID: "turn", Version: 1, Goal: "Execute tracked work.", Scope: codingagent.PlanScope{Included: []string{"internal"}},
+			Findings: []string{"The work has ordered dependencies."}, Risks: []string{"Recovery must be durable."},
+			Steps:              []codingagent.PlanStep{{ID: "implement", Goal: "Implement.", Validation: []string{"Tests pass."}}},
+			AcceptanceCriteria: []string{"Complete."}, RecommendedStrategy: codingagent.ExecutionWorkflowSingle, CompletionMode: codingagent.PlanCompletionExecute,
+		},
+		PendingInterrupts: []codingagent.PendingInterrupt{{
+			TurnID: "turn", InterruptID: "plan-approval", Kind: "plan_approval", PlanID: "plan", PlanVersion: 1,
+			Summary: "Review Plan v1", PlanCompletion: codingagent.PlanCompletionExecute, PlanStrategy: codingagent.ExecutionWorkflowSingle,
+		}},
+		ActiveWorkflow: &codingagent.WorkflowSnapshot{
+			ID: "workflow", TurnID: "turn", Status: "running", CompletedNodes: 1, CurrentNode: "validate", MaxAgentSteps: 64, UsedAgentSteps: 3,
+			Nodes: []codingagent.WorkflowNodeSnapshot{
+				{ID: "implement", Goal: "Implement.", Role: "implement", Status: "completed", Attempts: 1, MaxAttempts: 2, ResultRef: "run:implement"},
+				{ID: "validate", Goal: "Validate.", DependsOn: []codingagent.NodeID{"implement"}, Role: "validate", Status: "running", Attempts: 1, MaxAttempts: 1},
+			},
+		},
+	}
+	client := &approvalClient{fakeClient: fakeClient{snapshot: snapshot}}
+	model, err := NewModel(context.Background(), client, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width, model.height = 160, 60
+	view := model.View().Content
+	for _, expected := range []string{"single-Agent Workflow", "Approve with single-Agent Workflow", "Approve and execute Direct", "1/2 nodes complete", "3/64 steps", "[validate] Validate.", "Evidence", "run:implement"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("Workflow view does not contain %q: %s", expected, view)
+		}
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if command == nil {
+		t.Fatal("Direct Plan execution choice did not create a decision command")
+	}
+	_ = command()
+	if client.calls != 1 || client.request.Decision != codingagent.ResolutionApproved || client.request.Strategy != codingagent.ExecutionSingle {
+		t.Fatalf("Direct strategy decision = %#v calls=%d", client.request, client.calls)
+	}
+}
+
+func TestPlanReplanBoundaryShowsExactVersionReasonAndChoices(t *testing.T) {
+	bridge, _ := NewEventBridge(4)
+	replan := codingagent.PlanReplanRequest{
+		ReasonCode: codingagent.PlanReplanInvalidAssumption,
+		Summary:    "The approved Plan assumes an API that is unavailable.",
+		Decision:   "",
+	}
+	snapshot := codingagent.Snapshot{
+		Session:           codingagent.Session{ID: "session", Title: "repo"},
+		PendingPlanReplan: true,
+		ActiveTurn:        &codingagent.TurnSnapshot{ID: "turn", Phase: codingagent.TurnPhaseNeedsReplan, Status: codingagent.TurnInterrupted},
+		ActivePlan: &codingagent.PlanSnapshot{
+			ID: "plan", TurnID: "turn", Version: 3, ApprovedVersion: 3, Goal: "Implement the reviewed change.",
+			Scope:               codingagent.PlanScope{Included: []string{"internal/codingagent"}},
+			Steps:               []codingagent.PlanStep{{ID: "implement", Goal: "Implement the exact reviewed change.", Validation: []string{"Run tests."}}},
+			RecommendedStrategy: codingagent.ExecutionSingle, Replan: &replan,
+		},
+		PendingInterrupts: []codingagent.PendingInterrupt{{
+			TurnID: "turn", InterruptID: "plan-replan", Kind: "plan_replan_approval",
+			Summary: "The approved Plan assumes an API that is unavailable.", PlanVersion: 3,
+			PlanReplanReason: codingagent.PlanReplanInvalidAssumption,
+		}},
+	}
+	client := &approvalClient{fakeClient: fakeClient{snapshot: snapshot}}
+	model, err := NewModel(context.Background(), client, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width, model.height = 160, 60
+	view := model.View().Content
+	for _, expected := range []string{"Plan v3", "Approved exact version: v3", "Replan", replan.Summary, "Plan deviation detected", "Return to Plan mode", "Continue approved Plan"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("Plan replan view does not contain %q: %s", expected, view)
+		}
+	}
+	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if command == nil {
+		t.Fatal("Return to Plan mode did not create a decision command")
+	}
+	_ = command()
+	if client.calls != 1 || client.request.Decision != codingagent.ResolutionApproved || client.request.GrantScope != codingagent.PermissionGrantOnce {
+		t.Fatalf("Plan replan decision = %#v calls=%d", client.request, client.calls)
+	}
+}
+
+func TestRevisedPlanShowsReapprovalReason(t *testing.T) {
+	bridge, _ := NewEventBridge(4)
+	snapshot := codingagent.Snapshot{
+		Session: codingagent.Session{ID: "session", Title: "repo"},
+		ActivePlan: &codingagent.PlanSnapshot{
+			ID: "plan", TurnID: "turn", Version: 2, Goal: "Use the refreshed workspace baseline.",
+			Changes:        []string{"Workspace baseline refreshed"},
+			RevisionReason: "Reapproval required because material workspace drift invalidated the previous Plan baseline.",
+			Scope:          codingagent.PlanScope{Included: []string{"internal/codingagent"}},
+			Steps:          []codingagent.PlanStep{{ID: "implement", Goal: "Implement the revised change.", Validation: []string{"Run tests."}}},
+		},
+	}
+	model, err := NewModel(context.Background(), &fakeClient{snapshot: snapshot}, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width, model.height = 160, 60
+	view := model.View().Content
+	for _, expected := range []string{"Plan v2", "Changes in this version", "Workspace baseline refreshed", "Why reapproval is required", "material workspace drift"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("revised Plan view does not contain %q: %s", expected, view)
+		}
+	}
+}
+
 func TestAgentPlanEntrySuggestionRequiresExplicitUserChoice(t *testing.T) {
 	bridge, _ := NewEventBridge(4)
 	snapshot := codingagent.Snapshot{
@@ -1385,14 +1536,28 @@ func TestPlanClarificationOffersRecommendedChoicesAndFreeFormOther(t *testing.T)
 	}
 	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
 	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
-	if _, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter})); command != nil || !model.clarificationOther {
-		t.Fatal("Other choice did not open free-form input")
+	if !model.clarificationOther {
+		t.Fatal("selecting Other did not activate inline free-form input")
 	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: 'j', Text: "j"}))
+	if string(model.input) != "j" || model.clarificationCursor != 2 {
+		t.Fatalf("inline j key changed selection instead of editing: input=%q cursor=%d", string(model.input), model.clarificationCursor)
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyBackspace}))
 	for _, character := range "Use the existing embedded store" {
 		model.Update(tea.KeyPressMsg(tea.Key{Code: character, Text: string(character)}))
 	}
-	view = model.View().Content
-	if !strings.Contains(view, "Other ❯ Use the existing embedded store") || strings.Contains(view, "Current version (Recommended)") {
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyUp}))
+	if model.clarificationOther || string(model.input) != "Use the existing embedded store" {
+		t.Fatalf("moving away from Other lost the draft: active=%t input=%q", model.clarificationOther, string(model.input))
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	if !model.clarificationOther || string(model.input) != "Use the existing embedded store" {
+		t.Fatalf("returning to Other did not restore inline editing: active=%t input=%q", model.clarificationOther, string(model.input))
+	}
+	rendered := model.View()
+	view = rendered.Content
+	if !strings.Contains(view, "Other: Use the existing embedded store") || !strings.Contains(view, "Current version (Recommended)") || rendered.Cursor == nil {
 		t.Fatalf("free-form input is not shown inline: %s", view)
 	}
 	_, command := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))

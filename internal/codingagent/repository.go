@@ -17,7 +17,20 @@ var (
 	ErrTurnConflict = errors.New("Coding turn revision conflict")
 	// ErrPlanNotFound identifies a missing immutable Plan revision.
 	ErrPlanNotFound = errors.New("Coding plan not found")
+	// ErrChildAgentNotFound identifies a missing delegated child Agent.
+	ErrChildAgentNotFound = errors.New("Coding child Agent not found")
+	// ErrChildAgentConflict identifies a stale delegated child Agent update.
+	ErrChildAgentConflict = errors.New("Coding child Agent revision conflict")
 )
+
+// ChildAgentRepository persists child creation intent and lifecycle before the
+// independent generic Agent session is created or executed.
+type ChildAgentRepository interface {
+	CreateChildAgent(ctx context.Context, child ChildAgent) error
+	LoadChildAgent(ctx context.Context, id ChildAgentID) (ChildAgent, error)
+	ListChildAgents(ctx context.Context, turnID TurnID) ([]ChildAgent, error)
+	SaveChildAgent(ctx context.Context, child ChildAgent, expectedRevision uint64) error
+}
 
 // TurnRepository persists Product Turns independently from generic Agent journals.
 type TurnRepository interface {

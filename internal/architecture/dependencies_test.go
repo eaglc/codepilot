@@ -94,10 +94,12 @@ func allowedInternalImports(packagePath string) []string {
 		return []string{"agent/session", "contextmanager"}
 	case packagePath == "codingagent/workspace", strings.HasPrefix(packagePath, "codingagent/workspace/"):
 		return nil
+	case packagePath == "workflow", strings.HasPrefix(packagePath, "workflow/"):
+		return nil
 	case packagePath == "codingagent", strings.HasPrefix(packagePath, "codingagent/"):
-		return []string{"agent", "codingagent", "llm", "tool"}
+		return []string{"agent", "codingagent", "llm", "tool", "workflow"}
 	case packagePath == "codingstore", strings.HasPrefix(packagePath, "codingstore/"):
-		return []string{"codingagent"}
+		return []string{"codingagent", "workflow"}
 	case packagePath == "ui", strings.HasPrefix(packagePath, "ui/"):
 		return []string{"codingagent"}
 	case packagePath == "architecture", strings.HasPrefix(packagePath, "architecture/"):

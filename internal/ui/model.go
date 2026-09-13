@@ -83,6 +83,8 @@ type renderRow struct {
 	text        string
 	toolID      string
 	selectionID string
+	cursor      bool
+	cursorX     int
 }
 
 type scrollbarState struct {
@@ -113,6 +115,7 @@ type Model struct {
 	status                string
 	errorMessage          string
 	liveAssistant         string
+	livePlanDraft         string
 	activities            map[string]codingagent.ToolActivityEvent
 	expanded              map[string]bool
 	selectedTool          string
@@ -260,6 +263,10 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		} else if !m.busy && (m.pendingApproval() == nil || m.planFeedback) && (m.pendingClarification() == nil || m.clarificationOther) && m.pendingRecovery() == nil {
 			m.clearTextSelection()
 			m.insert([]rune(value.Content))
+			if m.clarificationOther {
+				m.errorMessage = ""
+				m.followBottom = true
+			}
 		}
 	case tea.MouseWheelMsg:
 		m.scrollbar.dragging = false
@@ -518,9 +525,6 @@ func (m *Model) handleKey(message tea.KeyPressMsg) tea.Cmd {
 	if m.planFeedback {
 		return m.handlePlanFeedbackKey(message)
 	}
-	if m.clarificationOther {
-		return m.handleClarificationOtherKey(message)
-	}
 	if pending := m.pendingClarification(); pending != nil {
 		return m.handleClarificationKey(*pending, message)
 	}
@@ -691,6 +695,7 @@ func (m *Model) submitTurn(text string, mode codingagent.TurnMode) tea.Cmd {
 	m.busy = true
 	m.errorMessage = ""
 	m.liveAssistant = ""
+	m.livePlanDraft = ""
 	m.activities = make(map[string]codingagent.ToolActivityEvent)
 	m.followBottom = true
 	m.status = "Agent is working..."
@@ -722,13 +727,22 @@ func (m *Model) resume(pending codingagent.PendingInterrupt, decision codingagen
 	return m.resumeWithDetails(pending, decision, scope, message, nil)
 }
 
+func (m *Model) resumeWithStrategy(pending codingagent.PendingInterrupt, decision codingagent.ResolutionDecision, scope codingagent.PermissionGrantScope, strategy codingagent.ExecutionStrategy) tea.Cmd {
+	return m.resumeRequest(pending, decision, scope, "", nil, strategy)
+}
+
 func (m *Model) resumeWithDetails(pending codingagent.PendingInterrupt, decision codingagent.ResolutionDecision, scope codingagent.PermissionGrantScope, message string, details []byte) tea.Cmd {
+	return m.resumeRequest(pending, decision, scope, message, details, "")
+}
+
+func (m *Model) resumeRequest(pending codingagent.PendingInterrupt, decision codingagent.ResolutionDecision, scope codingagent.PermissionGrantScope, message string, details []byte, strategy codingagent.ExecutionStrategy) tea.Cmd {
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.turnCancel = cancel
 	client, sessionID, generation := m.client, m.sessionID, m.generation
 	return func() tea.Msg {
 		result, err := client.ResumeTurn(turnCtx, codingagent.ResumeTurnRequest{
 			SessionID: sessionID, TurnID: pending.TurnID, InterruptID: pending.InterruptID, Decision: decision, GrantScope: scope, Message: strings.TrimSpace(message), Details: append([]byte(nil), details...),
+			Strategy: strategy,
 		})
 		return resumeResultMsg{result: result, err: err, sessionID: sessionID, generation: generation}
 	}
@@ -850,6 +864,7 @@ func (m *Model) activateSnapshot(snapshot codingagent.Snapshot) {
 	m.status = "Ready"
 	m.errorMessage = ""
 	m.liveAssistant = ""
+	m.livePlanDraft = ""
 	m.activities = make(map[string]codingagent.ToolActivityEvent)
 	m.expanded = make(map[string]bool)
 	m.clearAllSelections()
@@ -904,6 +919,7 @@ func (m *Model) applyEvent(event codingagent.Event) {
 	}
 	switch event.Kind {
 	case codingagent.EventTurnStarted:
+		m.livePlanDraft = ""
 		m.snapshot.Metrics.LatestTurnID = event.TurnID
 		m.snapshot.Metrics.Steps = 0
 		m.snapshot.Metrics.StartedAt = event.Timestamp
@@ -914,12 +930,19 @@ func (m *Model) applyEvent(event codingagent.Event) {
 			m.liveAssistant += event.Payload.AssistantOutput.Delta
 			m.followBottom = true
 		}
+	case codingagent.EventPlanDraftUpdated:
+		if event.Payload.PlanDraft != nil {
+			m.livePlanDraft = event.Payload.PlanDraft.Markdown
+			m.followBottom = true
+		}
 	case codingagent.EventAssistantStatusChanged:
 		if event.Payload.AssistantStatus != nil {
 			m.thinking = event.Payload.AssistantStatus.Thinking
 		}
 	case codingagent.EventAssistantOutputFinished:
 		m.liveAssistant = ""
+	case codingagent.EventPlanApprovalRequested, codingagent.EventPlanCreated, codingagent.EventPlanRevised:
+		m.livePlanDraft = ""
 	case codingagent.EventToolActivityStarted, codingagent.EventToolActivityUpdated, codingagent.EventToolActivityFinished:
 		if event.Payload.Tool != nil {
 			m.activities[event.Payload.Tool.CallID] = *event.Payload.Tool
@@ -929,9 +952,24 @@ func (m *Model) applyEvent(event codingagent.Event) {
 		m.busy = false
 		m.status = "Waiting for approval."
 		m.followBottom = true
+	case codingagent.EventWorkflowStarted:
+		m.busy = true
+		m.status = "Running single-Agent Workflow..."
+	case codingagent.EventWorkflowNodeStarted:
+		m.busy = true
+		if event.Payload.Workflow != nil && event.Payload.Workflow.Role != "" {
+			m.status = "Running Workflow node (" + event.Payload.Workflow.Role + ")..."
+		}
+	case codingagent.EventWorkflowBlocked, codingagent.EventWorkflowReplanRequested:
+		m.busy = false
+		m.status = "Workflow is waiting for a decision."
+	case codingagent.EventWorkflowCompleted, codingagent.EventWorkflowCancelled, codingagent.EventWorkflowFailed:
+		m.busy = false
+		m.thinking = false
 	case codingagent.EventTurnCompleted, codingagent.EventTurnFailed, codingagent.EventTurnCancelled:
 		m.busy = false
 		m.thinking = false
+		m.livePlanDraft = ""
 		m.snapshot.Metrics.FinishedAt = event.Timestamp
 		if !m.snapshot.Metrics.StartedAt.IsZero() && !event.Timestamp.Before(m.snapshot.Metrics.StartedAt) {
 			m.snapshot.Metrics.Elapsed = event.Timestamp.Sub(m.snapshot.Metrics.StartedAt)
@@ -942,6 +980,7 @@ func (m *Model) applyEvent(event codingagent.Event) {
 func eventNeedsSnapshot(kind codingagent.EventKind) bool {
 	switch kind {
 	case codingagent.EventAssistantOutputDelta,
+		codingagent.EventPlanDraftUpdated,
 		codingagent.EventAssistantStatusChanged,
 		codingagent.EventToolActivityUpdated,
 		codingagent.EventTurnProgressChanged:
@@ -953,7 +992,7 @@ func eventNeedsSnapshot(kind codingagent.EventKind) bool {
 
 func (m *Model) pendingApproval() *codingagent.PendingInterrupt {
 	for index := range m.snapshot.PendingInterrupts {
-		if m.snapshot.PendingInterrupts[index].Kind == "approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_entry_approval" {
+		if m.snapshot.PendingInterrupts[index].Kind == "approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_entry_approval" || m.snapshot.PendingInterrupts[index].Kind == "plan_replan_approval" {
 			return &m.snapshot.PendingInterrupts[index]
 		}
 	}
@@ -1045,6 +1084,7 @@ func (m *Model) View() tea.View {
 	}
 	m.configureScrollbar(bodyHeight, maxScroll)
 	visible := rows[m.scroll:min(len(rows), m.scroll+bodyHeight)]
+	inlineCursorX, inlineCursorY, inlineCursor := 0, 0, false
 	m.hitRows = make(map[int]string)
 	m.hitBlocks = make(map[int]string)
 	m.hitTextRows = make(map[int]textHit)
@@ -1062,6 +1102,11 @@ func (m *Model) View() tea.View {
 		left := ""
 		if index < len(visible) {
 			left = visible[index].text
+			if visible[index].cursor {
+				inlineCursorX = min(max(0, visible[index].cursorX), max(0, conversationWidth-1))
+				inlineCursorY = screenY
+				inlineCursor = true
+			}
 			m.hitTextRows[screenY] = textHit{row: m.scroll + index, text: ansi.Strip(visible[index].text)}
 			if visible[index].selectionID != "" {
 				m.hitBlocks[screenY] = visible[index].selectionID
@@ -1095,7 +1140,9 @@ func (m *Model) View() tea.View {
 	view.WindowTitle = "CodePilot"
 	view.BackgroundColor = lipgloss.Color("#111318")
 	view.ForegroundColor = lipgloss.Color("#E5E7EB")
-	if promptCursor {
+	if inlineCursor {
+		view.Cursor = nativeTextCursor(inlineCursorX, inlineCursorY)
+	} else if promptCursor {
 		view.Cursor = nativeTextCursor(promptX, promptY)
 	}
 	return view
@@ -1196,6 +1243,9 @@ func (m *Model) conversationRows(width int) []renderRow {
 	if m.liveAssistant != "" {
 		rows = m.appendAssistant(rows, "live-assistant", m.liveAssistant, contentWidth)
 	}
+	if m.livePlanDraft != "" {
+		rows = m.appendAssistant(rows, "live-plan-draft", m.livePlanDraft, contentWidth)
+	}
 	var liveCreates createFileGroup
 	for _, activity := range m.unanchoredLiveTools(results) {
 		if activity.Name == createFileToolName {
@@ -1208,12 +1258,18 @@ func (m *Model) conversationRows(width int) []renderRow {
 		rows = append(rows, m.createFileGroupRows(liveCreates, contentWidth)...)
 	}
 	if pending := m.pendingApproval(); pending != nil {
-		if pending.Kind == "plan_approval" && m.snapshot.ActivePlan != nil {
+		if (pending.Kind == "plan_approval" || pending.Kind == "plan_replan_approval") && m.snapshot.ActivePlan != nil {
 			rows = append(rows, m.planRows(*m.snapshot.ActivePlan, contentWidth)...)
 		}
 		rows = append(rows, m.approvalRows(*pending, contentWidth)...)
 	} else if m.snapshot.ActivePlan != nil {
 		rows = append(rows, m.planRows(*m.snapshot.ActivePlan, contentWidth)...)
+	}
+	if m.snapshot.ActiveWorkflow != nil {
+		rows = append(rows, m.workflowRows(*m.snapshot.ActiveWorkflow, contentWidth)...)
+	}
+	if len(m.snapshot.ChildAgents) != 0 {
+		rows = append(rows, m.childAgentRows(m.snapshot.ChildAgents, contentWidth)...)
 	}
 	if pending := m.pendingClarification(); pending != nil {
 		rows = append(rows, m.clarificationRows(*pending, contentWidth)...)
@@ -1232,7 +1288,7 @@ func (m *Model) conversationRows(width int) []renderRow {
 
 func (m *Model) appendMarkdown(rows []renderRow, id, value string, width int) []renderRow {
 	cacheKey := fmt.Sprintf("%d:%s:%s", width, id, value)
-	cacheable := id != "live-assistant"
+	cacheable := id != "live-assistant" && id != "live-plan-draft"
 	lines, found := m.markdownCache[cacheKey]
 	if !found {
 		renderer, err := glamour.NewTermRenderer(glamour.WithStandardStyle("dark"), glamour.WithWordWrap(width))
@@ -1335,11 +1391,15 @@ func (m *Model) toolRows(activity codingagent.TranscriptTool, width int) []rende
 		marker = "▼"
 	}
 	status := toolStatusGlyph(activity.Status, activity.IsError)
+	displayName := activity.Name
+	if activity.Name == "exit_plan_mode" && activity.Status == "revision_requested" {
+		displayName += " · revision requested"
+	}
 	selector := "  "
 	if id == m.selectedTool {
 		selector = "❯ "
 	}
-	line := fmt.Sprintf("%s%s %s %s", selector, marker, status, activity.Name)
+	line := fmt.Sprintf("%s%s %s %s", selector, marker, status, displayName)
 	selectionID := toolSelectionPrefix + id
 	rows := []renderRow{{text: theme.tool.Render(line), toolID: id, selectionID: selectionID}}
 	for _, resource := range activity.Resources {
@@ -1455,11 +1515,9 @@ func (m *Model) renderPrompt(width int) (string, int, bool) {
 		prefixText = "Plan ❯ "
 	} else if m.planFeedback {
 		prefixText = "Revise ❯ "
-	} else if m.clarificationOther {
-		prefixText = "Other ❯ "
 	}
 	prefix := theme.user.Render(prefixText)
-	if m.busy || (m.pendingApproval() != nil && !m.planFeedback) || (m.pendingClarification() != nil && !m.clarificationOther) || m.pendingRecovery() != nil {
+	if m.busy || (m.pendingApproval() != nil && !m.planFeedback) || m.pendingClarification() != nil || m.pendingRecovery() != nil {
 		return truncateANSI(theme.muted.Render("❯ "), width), 0, false
 	}
 	prefixWidth := ansi.StringWidth(prefix)
@@ -1471,8 +1529,6 @@ func (m *Model) renderPrompt(width int) (string, int, bool) {
 			placeholder = "Describe what should be planned…"
 		} else if m.planFeedback {
 			placeholder = "Describe the Plan changes you want…"
-		} else if m.clarificationOther {
-			placeholder = "Describe the outcome you prefer…"
 		}
 		line = prefix + " " + theme.muted.Render(placeholder)
 	}
@@ -1644,6 +1700,9 @@ func transcriptHasCall(items []codingagent.TranscriptItem, callID string) bool {
 }
 
 func toolStatusGlyph(status string, isError bool) string {
+	if status == "revision_requested" {
+		return theme.warning.Render("↻")
+	}
 	if isError || status == "failed" || status == "denied" || status == "cancelled" || status == "error" {
 		return theme.failure.Render("✗")
 	}

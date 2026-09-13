@@ -17,6 +17,7 @@ func TestRecoveredControlHandoffPreservesCancellationDecision(t *testing.T) {
 	}{
 		{name: "Plan entry", phase: TurnPhaseAwaitingPlanEntryApproval, kind: planEntryApprovalKind},
 		{name: "Plan approval", phase: TurnPhaseAwaitingPlanApproval, kind: "plan_approval"},
+		{name: "Plan replan", phase: TurnPhaseNeedsReplan, kind: planReplanApprovalKind},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -30,6 +31,22 @@ func TestRecoveredControlHandoffPreservesCancellationDecision(t *testing.T) {
 				t.Fatalf("recovered cancellation status = %q, %v", status, err)
 			}
 		})
+	}
+}
+
+func TestRecoveredPlanReplanApprovalContinuesOnlyReplanDecision(t *testing.T) {
+	turn := Turn{Phase: TurnPhaseNeedsReplan, Runs: []RunBinding{{RunID: "run-replan"}}}
+	durable := agentsession.Snapshot{Records: []agentsession.Record{{
+		Type: agentsession.RecordInterruptResolved, RunID: "run-replan",
+		Interrupt: &agentsession.InterruptData{Kind: planReplanApprovalKind, Payload: json.RawMessage(`{"decision":"replan"}`)},
+	}}}
+	status, err := (&Service{}).normalizeRecoveredControlHandoff(context.Background(), turn, agent.RunHandedOff, durable)
+	if err != nil || status != agent.RunHandedOff {
+		t.Fatalf("recovered replan status = %q, %v", status, err)
+	}
+	durable.Records[0].Interrupt.Payload = json.RawMessage(`{"decision":"continue"}`)
+	if _, err := (&Service{}).normalizeRecoveredControlHandoff(context.Background(), turn, agent.RunHandedOff, durable); err == nil {
+		t.Fatal("recovered continue decision was treated as a replan handoff")
 	}
 }
 

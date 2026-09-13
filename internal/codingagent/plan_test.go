@@ -1,6 +1,7 @@
 package codingagent
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -32,6 +33,13 @@ func TestValidatePlanRejectsInvalidDependenciesPathsAndDigest(t *testing.T) {
 	if err := ValidatePlan(tampered); err == nil {
 		t.Fatal("ValidatePlan accepted a stale digest")
 	}
+
+	nonCanonicalHead := plan
+	nonCanonicalHead.WorkspaceRevision.GitHead = strings.Repeat("a", 41)
+	nonCanonicalHead.Digest, _ = ComputePlanDigest(nonCanonicalHead)
+	if err := ValidatePlan(nonCanonicalHead); err == nil {
+		t.Fatal("ValidatePlan accepted a non-canonical Git object id")
+	}
 }
 
 func TestValidatePlanSupportsWorkspaceIndependentDeliverable(t *testing.T) {
@@ -54,25 +62,6 @@ func TestValidatePlanSupportsWorkspaceIndependentDeliverable(t *testing.T) {
 	}
 }
 
-func TestLegacyPlanCompatibilityPreservesOriginalDigest(t *testing.T) {
-	legacy := validTestPlan(t)
-	legacy.WorkspaceRelevant = false
-	legacy.CompletionMode = ""
-	legacy.Digest, _ = computeLegacyPlanDigest(legacy)
-	originalDigest := legacy.Digest
-	upgraded := ApplyPlanCompatibilityDefaults(legacy)
-	if upgraded.CompletionMode != PlanCompletionExecute || !upgraded.WorkspaceRelevant || upgraded.Digest != originalDigest {
-		t.Fatalf("legacy Plan defaults = %#v", upgraded)
-	}
-	if err := ValidatePlan(upgraded); err != nil {
-		t.Fatalf("validate upgraded legacy Plan: %v", err)
-	}
-	upgraded.Goal = "tampered"
-	if err := ValidatePlan(upgraded); err == nil {
-		t.Fatal("legacy digest compatibility accepted tampered content")
-	}
-}
-
 func validTestPlan(t *testing.T) Plan {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Millisecond)
@@ -86,8 +75,12 @@ func validTestPlan(t *testing.T) Plan {
 		},
 		AcceptanceCriteria: []string{"Planning exposes no write tools."}, RecommendedStrategy: ExecutionSingle,
 		WorkspaceRelevant: true, CompletionMode: PlanCompletionExecute,
-		WorkspaceRevision: WorkspaceRevision{WorktreeID: "worktree-1", GitHead: "0123456789abcdef0123456789abcdef01234567", StatusDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", RecordedAt: now},
-		CreatedAt:         now,
+		WorkspaceRevision: WorkspaceRevision{
+			Version: workspaceRevisionVersion, WorktreeID: "worktree-1", IdentityDigest: strings.Repeat("a", 64),
+			GitHead: "0123456789abcdef0123456789abcdef01234567", StatusDigest: strings.Repeat("b", 64), DiffDigest: strings.Repeat("c", 64),
+			RelevantPaths: []WorkspacePathRevision{{Path: "internal/codingagent/plan.go", Kind: "file", Digest: strings.Repeat("d", 64), Files: 1}}, RecordedAt: now,
+		},
+		CreatedAt: now,
 	}
 	value.Digest, _ = ComputePlanDigest(value)
 	return value

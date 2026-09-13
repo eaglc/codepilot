@@ -84,6 +84,12 @@ func (r Record) Validate() error {
 		if r.Operation == nil || r.Operation.Outcome == "" {
 			return fmt.Errorf("validate operation-finished record %q: outcome is required", r.ID)
 		}
+		if len(r.Operation.TerminalOutput) != 0 && (len(r.Operation.TerminalOutput) > 1<<20 || !validJSONObject(r.Operation.TerminalOutput)) {
+			return fmt.Errorf("validate operation-finished record %q: terminal output must be one bounded JSON object", r.ID)
+		}
+		if len(r.Operation.TerminalOutput) != 0 && r.Operation.Outcome != "completed" {
+			return fmt.Errorf("validate operation-finished record %q: only completed operations may contain terminal output", r.ID)
+		}
 	case RecordStepStarted, RecordStepFinished:
 		if r.Step == nil || r.Step.Attempt < 1 {
 			return fmt.Errorf("validate step record %q: positive attempt is required", r.ID)

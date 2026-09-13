@@ -65,6 +65,20 @@ type ControlTool interface {
 	ControlPolicy() ControlPolicy
 }
 
+// TerminalOutputPolicy bounds a provider-neutral structured result that ends
+// an Agent Run after the Tool has validated and completed it.
+type TerminalOutputPolicy struct {
+	MaxBytes int
+}
+
+// TerminalOutputTool marks a Tool as the only valid structured completion
+// boundary for a Run. Product layers own the schema; Agent owns exclusivity,
+// size validation, journaling, and terminal Run semantics.
+type TerminalOutputTool interface {
+	Tool
+	TerminalOutputPolicy() TerminalOutputPolicy
+}
+
 // ResumableTool completes an execution that previously returned ResultInterrupted.
 // The tool owns only validation and execution; Agent still owns all journaling and events.
 type ResumableTool interface {

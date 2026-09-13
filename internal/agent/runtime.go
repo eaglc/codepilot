@@ -58,6 +58,14 @@ type StreamingDataPolicy interface {
 	NewTextStreamSanitizer() TextStreamSanitizer
 }
 
+// ToolCallStreamPreviewer turns selected incremental Tool arguments into a
+// complete user-facing preview. Implementations are product-owned and must
+// return display text only; raw Tool fragments never cross the Agent event
+// boundary.
+type ToolCallStreamPreviewer interface {
+	PreviewToolCall(callID, toolName, delta string) (text string, changed bool)
+}
+
 // Dependencies contains only generic capabilities required by Runtime.
 type Dependencies struct {
 	Models      llm.ModelFactory
@@ -113,29 +121,31 @@ type RunLimits struct {
 
 // RunRequest starts one user-triggered run on an existing Agent session lane.
 type RunRequest struct {
-	SessionID        agentsession.ID
-	Lane             agentsession.Lane
-	RunID            agentsession.RunID
-	UserEntryID      agentsession.EntryID
-	SystemPrompt     string
-	Model            llm.ModelRef
-	UserMessage      llm.Message
-	UntrustedContext []llm.Message
-	Tools            *tool.Registry
-	Limits           RunLimits
+	SessionID         agentsession.ID
+	Lane              agentsession.Lane
+	RunID             agentsession.RunID
+	UserEntryID       agentsession.EntryID
+	SystemPrompt      string
+	Model             llm.ModelRef
+	UserMessage       llm.Message
+	UntrustedContext  []llm.Message
+	Tools             *tool.Registry
+	ToolCallPreviewer ToolCallStreamPreviewer
+	Limits            RunLimits
 }
 
 // ContinueRequest starts another Run in an existing conversation without
 // appending a synthetic user message.
 type ContinueRequest struct {
-	SessionID        agentsession.ID
-	Lane             agentsession.Lane
-	RunID            agentsession.RunID
-	SystemPrompt     string
-	Model            llm.ModelRef
-	UntrustedContext []llm.Message
-	Tools            *tool.Registry
-	Limits           RunLimits
+	SessionID         agentsession.ID
+	Lane              agentsession.Lane
+	RunID             agentsession.RunID
+	SystemPrompt      string
+	Model             llm.ModelRef
+	UntrustedContext  []llm.Message
+	Tools             *tool.Registry
+	ToolCallPreviewer ToolCallStreamPreviewer
+	Limits            RunLimits
 }
 
 // RunStatus describes how a generic Agent run returned to its caller.
@@ -153,27 +163,29 @@ const (
 
 // RunResult contains terminal Agent facts without Coding-specific classification.
 type RunResult struct {
-	RunID        agentsession.RunID
-	Status       RunStatus
-	FinalMessage *llm.Message
-	Steps        int
-	Reason       string
-	Interrupt    *tool.Interrupt
+	RunID          agentsession.RunID
+	Status         RunStatus
+	FinalMessage   *llm.Message
+	TerminalOutput json.RawMessage
+	Steps          int
+	Reason         string
+	Interrupt      *tool.Interrupt
 }
 
 // ResumeRequest supplies the product-resolved result for one durable interrupt.
 // It does not add another user message or create another operation.
 type ResumeRequest struct {
-	SessionID        agentsession.ID
-	Lane             agentsession.Lane
-	RunID            agentsession.RunID
-	InterruptID      string
-	Resolution       tool.Result
-	SystemPrompt     string
-	Model            llm.ModelRef
-	UntrustedContext []llm.Message
-	Tools            *tool.Registry
-	Limits           RunLimits
+	SessionID         agentsession.ID
+	Lane              agentsession.Lane
+	RunID             agentsession.RunID
+	InterruptID       string
+	Resolution        tool.Result
+	SystemPrompt      string
+	Model             llm.ModelRef
+	UntrustedContext  []llm.Message
+	Tools             *tool.Registry
+	ToolCallPreviewer ToolCallStreamPreviewer
+	Limits            RunLimits
 }
 
 // Run executes model steps and centrally journals all tool activity.
@@ -342,6 +354,15 @@ func (r *Runtime) Resume(ctx context.Context, resume ResumeRequest, sink EventSi
 		Interrupt: &agentsession.InterruptData{InterruptID: pendingInterrupt.InterruptID, Kind: pendingInterrupt.Kind, ToolCallID: pendingInterrupt.ToolCallID, Decision: string(resolution.Status), Payload: append(json.RawMessage(nil), resolution.Details...)},
 	}); err != nil {
 		return RunResult{}, fmt.Errorf("resume agent: persist interrupt resolution: %w", err)
+	}
+	if output, terminal, terminalErr := r.terminalOutput(request, pendingTool.ToolName, resolution); terminalErr != nil {
+		return r.failRun(runCtx, request, dispatcher, completedStepCount(snapshot, request.RunID), "validate_terminal_output_after_resume", terminalErr)
+	} else if terminal {
+		steps := completedStepCount(snapshot, request.RunID)
+		if err := r.finishRunWithTerminalOutput(runCtx, request, dispatcher, steps, RunCompleted, "terminal_output", output); err != nil {
+			return RunResult{}, err
+		}
+		return RunResult{RunID: request.RunID, Status: RunCompleted, TerminalOutput: output, Steps: steps, Reason: "terminal_output"}, nil
 	}
 	if policy, ok := request.Tools.ControlPolicy(pendingTool.ToolName); ok && policy.HandoffAfterResolution && resolution.Status == tool.ResultCompleted {
 		steps := completedStepCount(snapshot, request.RunID)
@@ -530,6 +551,14 @@ func (r *Runtime) runSteps(ctx context.Context, request RunRequest, dispatcher *
 				}
 				return RunResult{RunID: request.RunID, Status: RunInterrupted, Steps: step, Reason: "tool_interrupted", Interrupt: interrupted}, nil
 			}
+			if output, terminal, terminalErr := r.terminalOutput(request, call.Name, result); terminalErr != nil {
+				return r.failRun(ctx, request, dispatcher, step, "validate_terminal_output", terminalErr)
+			} else if terminal {
+				if err := r.finishRunWithTerminalOutput(ctx, request, dispatcher, step, RunCompleted, "terminal_output", output); err != nil {
+					return RunResult{}, err
+				}
+				return RunResult{RunID: request.RunID, Status: RunCompleted, TerminalOutput: output, Steps: step, Reason: "terminal_output"}, nil
+			}
 			if policy, ok := request.Tools.ControlPolicy(call.Name); ok && policy.HandoffAfterExecution && result.Status == tool.ResultCompleted {
 				if err := r.finishRun(ctx, request, dispatcher, step, RunHandedOff, "control_handoff"); err != nil {
 					return RunResult{}, err
@@ -605,7 +634,8 @@ func (r *Runtime) normalizeContinueRequest(continuation ContinueRequest) (RunReq
 	request := RunRequest{
 		SessionID: continuation.SessionID, Lane: continuation.Lane, RunID: continuation.RunID,
 		SystemPrompt: continuation.SystemPrompt, Model: continuation.Model,
-		UntrustedContext: cloneLLMMessages(continuation.UntrustedContext), Tools: continuation.Tools, Limits: continuation.Limits,
+		UntrustedContext: cloneLLMMessages(continuation.UntrustedContext), Tools: continuation.Tools,
+		ToolCallPreviewer: continuation.ToolCallPreviewer, Limits: continuation.Limits,
 	}
 	if request.Lane == "" {
 		request.Lane = agentsession.MainLane
@@ -632,6 +662,9 @@ func (r *Runtime) normalizeContinueRequest(continuation ContinueRequest) (RunReq
 
 func validateExclusiveControlCalls(registry *tool.Registry, calls []llm.ToolCall) error {
 	for _, call := range calls {
+		if _, ok := registry.TerminalOutputPolicy(call.Name); ok && len(calls) != 1 {
+			return fmt.Errorf("terminal output Tool %q must be the only Tool call in its assistant message", call.Name)
+		}
 		policy, ok := registry.ControlPolicy(call.Name)
 		if ok && policy.Exclusive && len(calls) != 1 {
 			return fmt.Errorf("exclusive control Tool %q must be the only Tool call in its assistant message", call.Name)
@@ -678,7 +711,8 @@ func (r *Runtime) normalizeResumeRequest(resume ResumeRequest) (RunRequest, erro
 	}
 	request := RunRequest{
 		SessionID: resume.SessionID, Lane: resume.Lane, RunID: resume.RunID,
-		SystemPrompt: resume.SystemPrompt, Model: resume.Model, UntrustedContext: cloneLLMMessages(resume.UntrustedContext), Tools: resume.Tools, Limits: resume.Limits,
+		SystemPrompt: resume.SystemPrompt, Model: resume.Model, UntrustedContext: cloneLLMMessages(resume.UntrustedContext), Tools: resume.Tools,
+		ToolCallPreviewer: resume.ToolCallPreviewer, Limits: resume.Limits,
 	}
 	if request.Lane == "" {
 		request.Lane = agentsession.MainLane
@@ -867,7 +901,7 @@ func mergeContextSummaryFacts(groups ...[]contextmanager.SummaryFact) []contextm
 func (r *Runtime) streamAssistantWithRetry(ctx context.Context, run RunRequest, model llm.ChatModel, request llm.ChatRequest, dispatcher *eventDispatcher) (llm.Message, error) {
 	delay := run.Limits.InitialRetryDelay
 	for attempt := 1; attempt <= run.Limits.MaxModelAttempts; attempt++ {
-		message, observed, err := r.streamAssistant(ctx, model, request, dispatcher)
+		message, observed, err := r.streamAssistant(ctx, run, model, request, dispatcher)
 		if err == nil {
 			return message, nil
 		}
@@ -891,7 +925,7 @@ func (r *Runtime) streamAssistantWithRetry(ctx context.Context, run RunRequest, 
 	return llm.Message{}, errors.New("run model step: retry loop exhausted")
 }
 
-func (r *Runtime) streamAssistant(ctx context.Context, model llm.ChatModel, request llm.ChatRequest, dispatcher *eventDispatcher) (llm.Message, bool, error) {
+func (r *Runtime) streamAssistant(ctx context.Context, run RunRequest, model llm.ChatModel, request llm.ChatRequest, dispatcher *eventDispatcher) (llm.Message, bool, error) {
 	if err := request.Validate(); err != nil {
 		return llm.Message{}, false, err
 	}
@@ -938,6 +972,17 @@ func (r *Runtime) streamAssistant(ctx context.Context, model llm.ChatModel, requ
 				thinkingActive = true
 				if err := dispatcher.publish(ctx, Event{Kind: EventAssistantThinkingChanged, Assistant: &AssistantEvent{ThinkingActive: true}}); err != nil {
 					return llm.Message{}, observed, err
+				}
+			}
+		case llm.StreamToolCallDelta:
+			observed = true
+			if run.ToolCallPreviewer != nil {
+				preview, changed := run.ToolCallPreviewer.PreviewToolCall(event.ToolCallID, event.ToolName, event.Delta)
+				preview = r.dataPolicy.SanitizeText(preview)
+				if changed && preview != "" {
+					if err := dispatcher.publish(ctx, Event{Kind: EventAssistantPreviewUpdated, Assistant: &AssistantEvent{Text: preview}}); err != nil {
+						return llm.Message{}, observed, err
+					}
 				}
 			}
 		case llm.StreamResponseFailed:
@@ -1361,11 +1406,34 @@ func (r *Runtime) sanitizeContextMessages(messages []contextmanager.Message) ([]
 }
 
 func (r *Runtime) finishRun(ctx context.Context, request RunRequest, dispatcher *eventDispatcher, steps int, status RunStatus, reason string) error {
+	return r.finishRunWithTerminalOutput(ctx, request, dispatcher, steps, status, reason, nil)
+}
+
+func (r *Runtime) finishRunWithTerminalOutput(ctx context.Context, request RunRequest, dispatcher *eventDispatcher, steps int, status RunStatus, reason string, output json.RawMessage) error {
 	outcome := string(status)
-	if err := r.appendRecord(context.WithoutCancel(ctx), request, agentsession.Record{Type: agentsession.RecordOperationFinished, RunID: request.RunID, Operation: &agentsession.OperationData{Outcome: outcome}}); err != nil {
+	if err := r.appendRecord(context.WithoutCancel(ctx), request, agentsession.Record{Type: agentsession.RecordOperationFinished, RunID: request.RunID, Operation: &agentsession.OperationData{Outcome: outcome, TerminalOutput: append(json.RawMessage(nil), output...)}}); err != nil {
 		return err
 	}
 	return dispatcher.publish(context.WithoutCancel(ctx), Event{Kind: EventRunFinished, Terminal: &TerminalEvent{Status: outcome, Reason: reason, Steps: steps}})
+}
+
+func (r *Runtime) terminalOutput(request RunRequest, toolName string, result tool.Result) (json.RawMessage, bool, error) {
+	policy, terminal := request.Tools.TerminalOutputPolicy(toolName)
+	if !terminal || result.Status != tool.ResultCompleted {
+		return nil, false, nil
+	}
+	safe := r.dataPolicy.SanitizeToolResult(toolName, result)
+	if err := safe.Validate(); err != nil {
+		return nil, false, fmt.Errorf("sanitize terminal output: %w", err)
+	}
+	if len(safe.Details) == 0 || len(safe.Details) > policy.MaxBytes || !json.Valid(safe.Details) {
+		return nil, false, errors.New("terminal output must be one bounded JSON object")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(safe.Details, &object); err != nil || object == nil {
+		return nil, false, errors.New("terminal output must be one bounded JSON object")
+	}
+	return append(json.RawMessage(nil), safe.Details...), true, nil
 }
 
 func (r *Runtime) failRun(ctx context.Context, request RunRequest, dispatcher *eventDispatcher, steps int, operation string, cause error) (RunResult, error) {

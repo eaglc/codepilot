@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/eaglc/codepilot/internal/codingagent"
 )
@@ -59,12 +60,16 @@ func (m *Model) handleClarificationKey(pending codingagent.PendingInterrupt, mes
 	mode := clarificationSelectionMode(*request)
 	key := message.Key()
 	switch {
-	case key.Code == tea.KeyUp || strings.EqualFold(key.Text, "k"):
+	case key.Code == tea.KeyUp || !m.clarificationOther && strings.EqualFold(key.Text, "k"):
 		m.clarificationCursor = max(0, m.clarificationCursor-1)
+		m.syncClarificationOtherSelection(choices)
 		m.followBottom = true
-	case key.Code == tea.KeyDown || strings.EqualFold(key.Text, "j"):
+	case key.Code == tea.KeyDown || !m.clarificationOther && strings.EqualFold(key.Text, "j"):
 		m.clarificationCursor = min(len(choices)-1, m.clarificationCursor+1)
+		m.syncClarificationOtherSelection(choices)
 		m.followBottom = true
+	case m.clarificationOther:
+		return m.handleClarificationOtherKey(pending, message)
 	case key.Code == tea.KeySpace && mode == codingagent.ClarificationSelectionMultiple:
 		return m.applyClarificationChoice(pending, choices[m.clarificationCursor])
 	case key.Code == tea.KeyEnter && mode == codingagent.ClarificationSelectionMultiple:
@@ -78,10 +83,25 @@ func (m *Model) handleClarificationKey(pending codingagent.PendingInterrupt, mes
 		index := int(key.Text[0] - '1')
 		if index < len(choices) {
 			m.clarificationCursor = index
+			m.syncClarificationOtherSelection(choices)
+			if m.clarificationOther {
+				return nil
+			}
 			return m.applyClarificationChoice(pending, choices[index])
 		}
 	}
 	return nil
+}
+
+func (m *Model) syncClarificationOtherSelection(choices []codingagent.ClarificationOption) {
+	other := m.clarificationCursor >= 0 && m.clarificationCursor < len(choices) && choices[m.clarificationCursor].ID == codingagent.ClarificationOtherOptionID
+	m.clarificationOther = other
+	m.errorMessage = ""
+	if other {
+		m.status = "Type your answer in the selected Other option."
+	} else {
+		m.status = "Waiting for your Plan choice."
+	}
 }
 
 func (m *Model) applyClarificationChoice(pending codingagent.PendingInterrupt, choice codingagent.ClarificationOption) tea.Cmd {
@@ -91,9 +111,8 @@ func (m *Model) applyClarificationChoice(pending codingagent.PendingInterrupt, c
 	}
 	if choice.ID == codingagent.ClarificationOtherOptionID {
 		m.clarificationOther = true
-		m.clearInput()
 		m.errorMessage = ""
-		m.status = "Enter your preferred answer."
+		m.status = "Type your answer in the selected Other option."
 		m.followBottom = true
 		return nil
 	}
@@ -128,11 +147,13 @@ func (m *Model) selectedClarificationOptionIDs(request codingagent.Clarification
 	return optionIDs
 }
 
-func (m *Model) handleClarificationOtherKey(message tea.KeyPressMsg) tea.Cmd {
+func (m *Model) handleClarificationOtherKey(pending codingagent.PendingInterrupt, message tea.KeyPressMsg) tea.Cmd {
 	key := message.Key()
 	if key.Code == tea.KeyEscape || key.Code == tea.KeyEsc {
 		m.clarificationOther = false
 		m.clearInput()
+		m.clarificationCursor = max(0, m.clarificationCursor-1)
+		m.errorMessage = ""
 		m.status = "Waiting for your Plan choice."
 		m.followBottom = true
 		return nil
@@ -143,13 +164,12 @@ func (m *Model) handleClarificationOtherKey(message tea.KeyPressMsg) tea.Cmd {
 			m.errorMessage = "Describe the option you prefer, or press Esc."
 			return nil
 		}
-		pending := m.pendingClarification()
-		if pending == nil || pending.Clarification == nil {
+		if pending.Clarification == nil {
 			m.clarificationOther = false
 			m.clearInput()
 			return nil
 		}
-		request := m.currentClarificationRequest(*pending)
+		request := m.currentClarificationRequest(pending)
 		if request == nil {
 			m.clarificationOther = false
 			m.clearInput()
@@ -162,7 +182,7 @@ func (m *Model) handleClarificationOtherKey(message tea.KeyPressMsg) tea.Cmd {
 		answer := codingagent.ClarificationAnswer{QuestionID: request.ID, OptionIDs: optionIDs, OtherText: other}
 		m.clarificationOther = false
 		m.clearInput()
-		return m.acceptClarificationAnswer(*pending, answer)
+		return m.acceptClarificationAnswer(pending, answer)
 	}
 	switch key.Code {
 	case tea.KeyEnter:
@@ -189,6 +209,7 @@ func (m *Model) handleClarificationOtherKey(message tea.KeyPressMsg) tea.Cmd {
 			m.insert([]rune(key.Text))
 		}
 	}
+	m.errorMessage = ""
 	m.followBottom = true
 	return nil
 }
@@ -198,6 +219,8 @@ func (m *Model) acceptClarificationAnswer(pending codingagent.PendingInterrupt, 
 		return nil
 	}
 	answers := append(append([]codingagent.ClarificationAnswer(nil), m.clarificationAnswers...), answer)
+	m.clarificationOther = false
+	m.clearInput()
 	if len(answers) < len(pending.Clarification.Questions) {
 		m.clarificationAnswers = answers
 		m.clarificationIndex++
@@ -236,17 +259,6 @@ func (m *Model) clarificationRows(pending codingagent.PendingInterrupt, width in
 	}
 	rows := []renderRow{{text: theme.header.Render("Plan needs your input  •  " + progress + "  •  " + modeLabel + "  •  " + request.Header)}}
 	rows = appendWrapped(rows, "", request.Question, width, theme.warning)
-	if m.clarificationOther {
-		value := string(m.input)
-		if value == "" {
-			value = "Describe the outcome you prefer…"
-			rows = appendWrapped(rows, "Other ❯ ", value, width, theme.muted)
-		} else {
-			rows = appendWrapped(rows, "Other ❯ ", value, width, theme.selection)
-		}
-		rows = append(rows, renderRow{text: theme.muted.Render("Enter submit  •  Alt+Enter newline  •  Esc back")}, renderRow{})
-		return rows
-	}
 	for index, choice := range choices {
 		label := choice.Label
 		if choice.Recommended {
@@ -273,14 +285,33 @@ func (m *Model) clarificationRows(pending codingagent.PendingInterrupt, width in
 			}
 			style = theme.selection
 		}
+		if index == m.clarificationCursor && choice.ID == codingagent.ClarificationOtherOptionID && m.clarificationOther {
+			if mode == codingagent.ClarificationSelectionMultiple && strings.TrimSpace(string(m.input)) != "" {
+				prefix = fmt.Sprintf("❯ [x] %d. ", index+1)
+			}
+			inputPrefix := prefix + "Other: "
+			available := max(1, width-ansi.StringWidth(inputPrefix))
+			viewport := renderInputViewport(m.input, m.cursor, available)
+			value := viewport.text
+			if len(m.input) == 0 {
+				value = "Type your answer…"
+			}
+			rows = append(rows, renderRow{
+				text: theme.selection.Render(truncateANSI(inputPrefix+value, width)), cursor: true,
+				cursorX: min(width-1, ansi.StringWidth(inputPrefix)+viewport.cursorOffset),
+			})
+			continue
+		}
 		rows = appendWrapped(rows, prefix, label+" — "+choice.Description, width, style)
 	}
 	if m.busy {
 		rows = append(rows, renderRow{text: theme.muted.Render("Applying answer...")})
+	} else if m.clarificationOther {
+		rows = append(rows, renderRow{text: theme.muted.Render("Type answer  •  Enter submit  •  Alt+Enter newline  •  ↑ move back  •  Esc clear")})
 	} else if mode == codingagent.ClarificationSelectionMultiple {
-		rows = append(rows, renderRow{text: theme.muted.Render("↑/↓ move  •  Space/1-9 toggle  •  Enter confirm  •  Other opens text input")})
+		rows = append(rows, renderRow{text: theme.muted.Render("↑/↓ move  •  Space/1-9 toggle  •  Enter confirm  •  Select Other to type")})
 	} else {
-		rows = append(rows, renderRow{text: theme.muted.Render("↑/↓ choose  •  Enter confirm  •  1-9 choose directly")})
+		rows = append(rows, renderRow{text: theme.muted.Render("↑/↓ choose  •  Enter confirm  •  1-9 choose directly  •  Select Other to type")})
 	}
 	return append(rows, renderRow{})
 }

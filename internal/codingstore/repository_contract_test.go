@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/eaglc/codepilot/internal/codingagent"
 	filecodingstore "github.com/eaglc/codepilot/internal/codingstore/file"
 	memorycodingstore "github.com/eaglc/codepilot/internal/codingstore/memory"
+	"github.com/eaglc/codepilot/internal/workflow"
 )
 
 type repository interface {
@@ -18,6 +20,8 @@ type repository interface {
 	codingagent.SessionRepository
 	codingagent.TurnRepository
 	codingagent.PlanRepository
+	workflow.Repository
+	codingagent.ChildAgentRepository
 }
 
 func TestRepositoriesEnforceTheSamePersistenceContract(t *testing.T) {
@@ -123,7 +127,10 @@ func testRepositoryContract(t *testing.T, repository repository) {
 		Steps:              []codingagent.PlanStep{{ID: "implement", Goal: "Implement the change.", Files: []string{"internal/codingagent/plan.go"}, Validation: []string{"Run tests."}}},
 		AcceptanceCriteria: []string{"Tests pass."}, RecommendedStrategy: codingagent.ExecutionSingle,
 		WorkspaceRelevant: true, CompletionMode: codingagent.PlanCompletionExecute,
-		WorkspaceRevision: codingagent.WorkspaceRevision{WorktreeID: worktree.ID, StatusDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", RecordedAt: now}, CreatedAt: now,
+		WorkspaceRevision: codingagent.WorkspaceRevision{
+			Version: 2, WorktreeID: worktree.ID, IdentityDigest: strings.Repeat("a", 64), StatusDigest: strings.Repeat("b", 64), DiffDigest: strings.Repeat("c", 64),
+			RelevantPaths: []codingagent.WorkspacePathRevision{{Path: "internal/codingagent/plan.go", Kind: "file", Digest: strings.Repeat("d", 64), Files: 1}}, RecordedAt: now,
+		}, CreatedAt: now,
 	}
 	plan.Digest, _ = codingagent.ComputePlanDigest(plan)
 	if err := repository.CreatePlanVersion(ctx, plan); err != nil {
@@ -144,6 +151,91 @@ func testRepositoryContract(t *testing.T, repository repository) {
 	versions, err := repository.ListPlanVersions(ctx, plan.ID)
 	if err != nil || len(versions) != 2 || versions[1].Version != 2 {
 		t.Fatalf("ListPlanVersions = %#v, %v", versions, err)
+	}
+	workflowValue := workflow.Workflow{
+		ID: "workflow", OwnerID: string(turn.ID), Plan: workflow.PlanReference{ID: string(plan.ID), Version: plan.Version, Digest: plan.Digest},
+		Strategy: workflow.StrategySingleAgent, Status: workflow.StatusPending, Budget: workflow.Budget{MaxNodes: 1, MaxRuns: 2, MaxAttempts: 2, MaxAgentSteps: 64},
+		Nodes:    []workflow.Node{{ID: "implement", Goal: "Implement the approved node.", Role: workflow.RoleImplement, Capability: workflow.CapabilityImplement, Scope: workflow.Scope{ReadPaths: []string{"internal"}, WritePaths: []string{"internal"}}, AcceptanceCriteria: []string{"Node completes."}, FailureAction: workflow.FailureRetry, MaxAttempts: 2, Status: workflow.NodePending}},
+		Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := repository.CreateWorkflow(ctx, workflowValue); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	startEvent := workflow.Event{ID: "workflow-start", Type: workflow.EventWorkflowStarted, OccurredAt: now.Add(time.Second)}
+	workflowValue, err = repository.AppendWorkflowEvent(ctx, workflowValue.ID, 1, startEvent)
+	if err != nil || workflowValue.Status != workflow.StatusRunning || workflowValue.Revision != 2 {
+		t.Fatalf("AppendWorkflowEvent start = %#v, %v", workflowValue, err)
+	}
+	idempotent, err := repository.AppendWorkflowEvent(ctx, workflowValue.ID, 1, startEvent)
+	if err != nil || idempotent.Revision != workflowValue.Revision {
+		t.Fatalf("AppendWorkflowEvent idempotent = %#v, %v", idempotent, err)
+	}
+	if _, err := repository.AppendWorkflowEvent(ctx, workflowValue.ID, 1, workflow.Event{ID: "node-start-stale", Type: workflow.EventNodeStarted, NodeID: "implement", OccurredAt: now.Add(2 * time.Second)}); err == nil {
+		t.Fatal("AppendWorkflowEvent accepted stale revision")
+	}
+	workflowValue, err = repository.AppendWorkflowEvent(ctx, workflowValue.ID, 2, workflow.Event{ID: "node-start", Type: workflow.EventNodeStarted, NodeID: "implement", OccurredAt: now.Add(2 * time.Second)})
+	if err != nil || workflowValue.Nodes[0].Status != workflow.NodeRunning {
+		t.Fatalf("AppendWorkflowEvent node start = %#v, %v", workflowValue, err)
+	}
+	loadedWorkflow, err := repository.LoadWorkflow(ctx, workflowValue.ID)
+	if err != nil || loadedWorkflow.Revision != 3 || loadedWorkflow.Nodes[0].Attempts != 1 {
+		t.Fatalf("LoadWorkflow = %#v, %v", loadedWorkflow, err)
+	}
+	workflows, err := repository.ListWorkflows(ctx, string(turn.ID))
+	if err != nil || len(workflows) != 1 || workflows[0].ID != workflowValue.ID {
+		t.Fatalf("ListWorkflows = %#v, %v", workflows, err)
+	}
+	childID := codingagent.WorkflowChildAgentID(string(workflowValue.ID), "implement", 1)
+	child := codingagent.ChildAgent{
+		ID: childID, Kind: codingagent.ChildAgentWorkflowNode, ParentSessionID: session.ID, ParentTurnID: turn.ID,
+		WorkflowID: string(workflowValue.ID), NodeID: "implement", PlanID: plan.ID, PlanVersion: plan.Version, PlanDigest: plan.Digest,
+		Role: workflow.RoleImplement, Profile: codingagent.CapabilityImplement,
+		Task:           codingagent.AgentTask{Goal: "Implement the bounded node.", ReadPaths: []string{"internal"}, WritePaths: []string{"internal"}, AcceptanceCriteria: []string{"Node completes."}},
+		AgentSessionID: codingagent.ChildAgentSessionID(childID), RunID: codingagent.ChildAgentRunID(childID), Attempt: 1,
+		Status: codingagent.ChildAgentCreating, Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := repository.CreateChildAgent(ctx, child); err != nil {
+		t.Fatalf("CreateChildAgent: %v", err)
+	}
+	if err := repository.CreateChildAgent(ctx, child); err != nil {
+		t.Fatalf("CreateChildAgent idempotent: %v", err)
+	}
+	conflictingChild := child
+	conflictingChild.Task.Goal = "Different task."
+	if err := repository.CreateChildAgent(ctx, conflictingChild); err == nil {
+		t.Fatal("CreateChildAgent accepted conflicting deterministic identity")
+	}
+	child.Status = codingagent.ChildAgentReady
+	child.UpdatedAt = now.Add(time.Second)
+	child.Revision++
+	if err := repository.SaveChildAgent(ctx, child, 1); err != nil {
+		t.Fatalf("SaveChildAgent ready: %v", err)
+	}
+	if err := repository.SaveChildAgent(ctx, child, 1); err == nil {
+		t.Fatal("SaveChildAgent accepted stale revision")
+	}
+	child.Status = codingagent.ChildAgentRunning
+	child.StartedAt = now.Add(2 * time.Second)
+	child.UpdatedAt = child.StartedAt
+	child.Revision++
+	if err := repository.SaveChildAgent(ctx, child, 2); err != nil {
+		t.Fatalf("SaveChildAgent running: %v", err)
+	}
+	child.Status = codingagent.ChildAgentCompleted
+	child.Result = &codingagent.AgentTaskResult{Status: codingagent.AgentTaskSucceeded, Conclusion: "Implemented.", Evidence: []codingagent.AgentTaskEvidence{{SourceID: "test", Summary: "Validation passed."}}, SubmittedAt: now.Add(3 * time.Second)}
+	child.CompletedAt = now.Add(3 * time.Second)
+	child.UpdatedAt = child.CompletedAt
+	child.Revision++
+	if err := repository.SaveChildAgent(ctx, child, 3); err != nil {
+		t.Fatalf("SaveChildAgent completed: %v", err)
+	}
+	loadedChild, err := repository.LoadChildAgent(ctx, child.ID)
+	if err != nil || loadedChild.Status != codingagent.ChildAgentCompleted || loadedChild.Result == nil || loadedChild.Result.Conclusion != "Implemented." {
+		t.Fatalf("LoadChildAgent = %#v, %v", loadedChild, err)
+	}
+	children, err := repository.ListChildAgents(ctx, turn.ID)
+	if err != nil || len(children) != 1 || children[0].ID != child.ID {
+		t.Fatalf("ListChildAgents = %#v, %v", children, err)
 	}
 	secondSession := session
 	secondSession.ID = "session-2"

@@ -19,6 +19,9 @@ const (
 	ReplaySafe ReplayPolicy = "safe"
 	// ReplayIdempotent permits retry with the original idempotency key.
 	ReplayIdempotent ReplayPolicy = "idempotent"
+
+	invalidToolArgumentsKey    = "__codepilot_invalid_tool_arguments"
+	invalidToolArgumentsReason = "provider_arguments_not_json_object"
 )
 
 // ToolDefinition is the model-visible declaration of a callable tool.
@@ -62,6 +65,33 @@ func (c ToolCall) Validate() error {
 		return fmt.Errorf("validate tool call %q: arguments must be a JSON object", c.ID)
 	}
 	return nil
+}
+
+// InvalidToolArguments returns a durable, non-executable marker for a provider
+// response whose Tool arguments were not one complete JSON object. Adapters use
+// this instead of discarding the whole assistant response; the Tool registry
+// recognizes the marker and returns model-visible repair feedback without
+// dispatching the requested capability.
+func InvalidToolArguments() json.RawMessage {
+	return json.RawMessage(`{"__codepilot_invalid_tool_arguments":"provider_arguments_not_json_object"}`)
+}
+
+// HasInvalidToolArguments reports whether arguments contain exactly the
+// reserved non-executable marker produced by InvalidToolArguments.
+func HasInvalidToolArguments(value json.RawMessage) bool {
+	if !validJSONObject(value) {
+		return false
+	}
+	var decoded map[string]json.RawMessage
+	if json.Unmarshal(value, &decoded) != nil || len(decoded) != 1 {
+		return false
+	}
+	raw, found := decoded[invalidToolArgumentsKey]
+	if !found {
+		return false
+	}
+	var reason string
+	return json.Unmarshal(raw, &reason) == nil && reason == invalidToolArgumentsReason
 }
 
 func validJSONObject(value json.RawMessage) bool {

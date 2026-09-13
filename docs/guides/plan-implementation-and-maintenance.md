@@ -339,12 +339,12 @@ git_status, git_diff, git_log, git_branches, git_show_commit
 4. 验证步骤 ID、依赖目标存在性和依赖环。
 5. 限制执行策略为当前已实现的单 Agent 策略 `single`。
 6. 要求 `execute` Plan 必须依赖当前工作区；工作区无关的 `deliverable` Plan 不得声明文件范围。
-7. 对工作区相关 Plan 采集 Git HEAD 和 Git status 摘要。
+7. 对工作区相关 Plan 采集版本化 `WorkspaceRevision`：Worktree identity、Git HEAD、Git status、暂存/未暂存 Diff 摘要，以及步骤声明的关键文件/目录内容摘要。采集有文件数、字节数和输出大小上限，且不跟随符号链接。
 8. 生成确定性的 Plan ID、递增版本号和内容摘要。
 9. 保存 Plan，并把 Turn 切换到 `awaiting_plan_approval`。
 10. 返回 `plan_approval` 中断。
 
-`Plan` 验证逻辑在 `internal/codingagent/plan.go`；这也是修改字段、摘要算法或兼容策略时最需要同步维护的位置。
+`Plan` 验证逻辑在 `internal/codingagent/plan.go`，工作区采集和漂移分类在 `plan_workspace.go`。Plan 文件采用严格的新生命周期格式；当前单用户开发阶段不读取或补齐实验期旧 Plan 数据。修改 schema 时必须同步迁移方案或明确继续拒绝旧格式，不能静默猜测字段。
 
 ## 用户审批后发生什么
 
@@ -352,9 +352,11 @@ git_status, git_diff, git_log, git_branches, git_show_commit
 
 ### 批准执行型 Plan
 
-系统重新加载 Plan，并再次验证 Turn 记录的 ID、版本和摘要一致。之后协调器创建一个新的 `CapabilityDirect` Run，并把已批准 Plan 作为低优先级用户上下文传给执行 Agent。
+系统重新加载 Plan，并再次验证 Turn 记录的 ID、版本和摘要一致。批准前与执行 Run 创建前都会重新采集工作区：只涉及 Plan 范围外的变化记录为 informational drift 并继续；关键文件内容、HEAD 或 Worktree identity 变化属于 material drift，旧批准不会生效，Turn 返回只读 Planning 并要求完整的新 Plan 版本。只有基线仍有效时，协调器才记录精确的 `ApprovedPlanVersion`/digest 并创建新的 `CapabilityDirect` Run。
 
 此时才暴露常规实现工具，并继续沿用正常的权限审批机制。**批准 Plan 不等于授予写文件或执行命令权限。**
+
+执行 profile 还注册独占控制工具 `request_plan_replan`。当关键假设失效、范围实质扩大、新增高风险动作、策略需要改变或发现工作区偏离时，Agent 必须停止后续副作用并提交一个有界 reason code 与摘要。Turn 进入 `needs_replan`，用户可以返回只读 Plan mode、继续精确的已批准版本，或取消任务；返回规划后提交的内容始终创建新版本并重新审批。
 
 ### 要求修订
 
@@ -374,36 +376,37 @@ Plan 存储由 `PlanRepository` 抽象定义（`internal/codingagent/repository.
 
 文件实现要求版本从 1 开始连续递增，并在加载时重新校验 Plan 摘要和结构。这会在异常时拒绝不完整或被篡改的历史。
 
+严格拒绝旧 Plan/Turn 格式只影响对应的旧 Turn。精确 `LoadTurn`、新 Turn 的全局 ID 检查以及新 Plan 持久化会先定位目标 journal，不会完整重放无关会话；因此一个实验期旧 journal 不得阻塞新建会话。全量 `doctor` 仍会报告该旧 journal，便于显式备份或移除。
+
 `Service.Snapshot` 通过 `projectPlanSnapshot` 组装：
 
 - `ActivePlan`：当前或最近一个 Plan；
 - `PendingPlanApproval`：是否正等待 Plan 审批；
 - `PendingPlanEntryApproval`：是否正等待用户决定 Agent 的 Plan 建议；
+- `PendingPlanReplan`：执行是否在重大偏差边界等待用户决定；
 - `PlanHistory`：版本历史摘要。
 
-`publishPlanEvent` 会发布 started、created、revised、approved、cancelled 等 Plan 事件；Plan 建议另有 suggested、approved、declined、cancelled 事件。事件载荷只带必要标识和经过敏感信息脱敏的目标文本。`SessionMetrics.ByPhase` 根据可信 Run binding 分别聚合 Direct、Planning 和 Executing 的耗时、token、cost 与失败数，避免把同一用户 Turn 的多个 Run 误算为多个请求。
+`publishPlanEvent` 会发布 started、created、revised、approved、cancelled 等 Plan 事件；Plan 建议另有 suggested、approved、declined、cancelled 事件；P3 另有 drift detected、replan requested 和 replan resolved 事件。事件载荷只带必要标识、有界路径和经过敏感信息脱敏的摘要。`SessionMetrics.ByPhase` 根据可信 Run binding 分别聚合 Direct、Planning 和 Executing 的耗时、token、cost 与失败数；生命周期指标按 Product Turn 统计 Plan 数、批准数/率、修订数/率、漂移和 replan 次数，避免把同一用户 Turn 的多个 Run 误算为多个请求。
 
 ## 维护时从哪里改
 
 | 需求 | 首要修改点 | 必须同步检查 |
 |---|---|---|
-| 增加 Plan 字段 | `plan.go` | `PlanSubmission`、JSON Schema、规范化、摘要、快照、UI、文件兼容和测试 |
+| 增加 Plan 字段 | `plan.go` | `PlanSubmission`、JSON Schema、规范化、摘要、快照、UI、严格文件格式和测试 |
 | 增加新的规划工具 | `prepareRunEnvironment`、`tools/factory.go` | 工具在两个 Plan profile 中的可见性，绝不能意外授予副作用能力 |
-| 改变审批行为 | `plan_control.go`、`service.go` | `Turn` 状态转换、恢复逻辑、UI 文案和旧中断兼容 |
+| 改变审批行为 | `plan_control.go`、`service.go` | `Turn` 状态转换、精确版本绑定、恢复逻辑、UI 文案和当前中断 schema |
 | 改变 Agent 进入建议 | `plan_entry.go`、Direct Prompt | reason code 白名单、拒绝防重复、控制工具独占性、事件/快照、崩溃恢复和评估集 |
 | 增加执行策略 | `turn.go`、`plan.go`、协调器 | 当前策略校验明确只接受 `single`；不能只放宽 enum 而不实现调度 |
-| 改变 Plan 存储 | `codingstore/file/plan.go` | 不可变性、顺序版本、摘要验证、兼容读和崩溃恢复 |
+| 改变 Plan 存储 | `codingstore/file/plan.go` | 不可变性、顺序版本、摘要验证、严格 schema 和崩溃恢复 |
+| 改变漂移规则 | `plan_workspace.go`、`plan_lifecycle.go` | 采集上限、符号链接、相关/无关范围、审批与执行两次检查、事件和恢复 |
+| 改变执行偏差行为 | `plan_replan.go`、`service.go` | 独占控制、无后续副作用、精确 Plan 绑定、三种用户决定和 crash gap |
 | 改变界面内容 | `ui/plan.go`、`ui/approval_picker.go` | Service 的 `PlanSnapshot` 投影和 UI 测试 |
 
 ## 当前已知的维护关注点
 
-### 工作区快照尚未用于执行前阻断
+### WorkspaceRevision 是有界快照，不是完整仓库归档
 
-系统会记录 `WorkspaceRevision`，但当前代码并未在批准后、开始执行前重新采集并比较该快照。用户在审批间隙修改了工作区时，执行仍可能基于旧调查结果继续。
-
-此外，`StatusDigest` 基于 `git status --porcelain` 输出；同一个已修改文件的内容再次变化、但状态仍为 `M` 时，该摘要不会变化。
-
-后续若要增强可靠性，可在进入 `executing` 前比较工作区指纹；发生变化时要求用户重新规划、确认继续或取消。
+相关路径会按内容摘要，因此同一个 `M` 文件再次变化仍会触发 material drift；范围外变化依靠 status/Diff 摘要归为 informational drift。采集超过文件、字节或 Git 输出上限时会安全失败，而不是保存原始内容或无限扫描。新增“关键依赖”语义时，应让结构化 Plan 明确声明路径并同步更新采集上限，不能依靠模型自行忽略漂移。
 
 ### 历史版本会完整加载
 
@@ -427,12 +430,13 @@ go test ./internal/codingagent ./internal/codingagent/tools ./internal/codingsto
 
 重点阅读和扩展以下测试：
 
-- `internal/codingagent/plan_test.go`：结构、路径、依赖、摘要与兼容性。
+- `internal/codingagent/plan_test.go`：结构、路径、依赖、摘要与严格 WorkspaceRevision。
 - `internal/codingagent/service_test.go`：主动进入、拒绝防重复、工作区 handoff、审批、修订、交付型 Plan 和同一 Turn 内执行。
+- `internal/codingagent/plan_workspace_test.go`、`plan_lifecycle_service_test.go`：相关/无关漂移、HEAD/identity、审批阻断、执行 replan、事件和服务重启恢复。
 - `internal/codingagent/plan_restart_e2e_test.go`、`recovery_control_test.go`：文件存储重启和批准/取消 handoff 的恢复边界。
 - `internal/codingagent/prompt/testdata/plan_entry_eval.golden.json`：简单任务与高风险任务的版本化建议评估基线和发布阈值。
 - `internal/codingagent/tools/factory_test.go`：规划 profile 的只读工具边界。
 - `internal/codingstore/repository_contract_test.go`：Plan 版本存储契约。
-- `internal/ui/model_test.go`：Plan 命令、审批及修订输入。
+- `internal/ui/model_test.go`：Plan 命令、审批、修订输入、版本差异、重审批原因和 replan 选择。
 
 修改时的底线是：**Agent 只能建议、不能自行切换；规划期不能产生副作用；审批必须精确绑定一个不可变版本；批准执行后仍必须经过普通权限控制；拒绝后不得循环提示；恢复后不得把旧审批应用到新版本。**

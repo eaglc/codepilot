@@ -17,6 +17,7 @@ const (
 	EventStepStarted              EventKind = "step_started"
 	EventStepFinished             EventKind = "step_finished"
 	EventAssistantTextDelta       EventKind = "assistant_text_delta"
+	EventAssistantPreviewUpdated  EventKind = "assistant_preview_updated"
 	EventAssistantThinkingChanged EventKind = "assistant_thinking_changed"
 	EventToolStarted              EventKind = "tool_started"
 	EventToolProgress             EventKind = "tool_progress"
