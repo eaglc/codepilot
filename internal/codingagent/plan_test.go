@@ -62,6 +62,17 @@ func TestValidatePlanSupportsWorkspaceIndependentDeliverable(t *testing.T) {
 	}
 }
 
+func TestValidatePlanRequiresExplicitP7ImplementWriteScope(t *testing.T) {
+	plan := validTestPlan(t)
+	plan.RecommendedStrategy = ExecutionWorkflowMultiParallelIsolatedWrite
+	plan.Steps = clonePlanSteps(plan.Steps[:1])
+	plan.Steps[0].Files = nil
+	plan.Digest, _ = ComputePlanDigest(plan)
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "explicit write scope") {
+		t.Fatalf("P7 Plan without explicit write scope = %v", err)
+	}
+}
+
 func validTestPlan(t *testing.T) Plan {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Millisecond)

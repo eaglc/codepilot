@@ -79,6 +79,10 @@ func (m *Model) planRows(plan codingagent.PlanSnapshot, width int) []renderRow {
 		strategy = "single-Agent Workflow"
 	} else if plan.RecommendedStrategy == codingagent.ExecutionWorkflowMultiSerial {
 		strategy = "serial multi-Agent Workflow"
+	} else if plan.RecommendedStrategy == codingagent.ExecutionWorkflowMultiParallelReadOnly {
+		strategy = "parallel read-only multi-Agent Workflow"
+	} else if plan.RecommendedStrategy == codingagent.ExecutionWorkflowMultiParallelIsolatedWrite {
+		strategy = "isolated parallel-write multi-Agent Workflow"
 	}
 	rows = appendWrapped(rows, "Recommended execution  ", strategy, width, theme.muted)
 	if plan.ApprovedVersion == plan.Version && plan.ApprovedVersion != 0 {

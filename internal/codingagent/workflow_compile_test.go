@@ -50,6 +50,36 @@ func TestCompilePlanWorkflowPinsCurrentRolePolicyVersion(t *testing.T) {
 	}
 }
 
+func TestCompilePlanWorkflowBuildsTrustedP7IntegrationGraph(t *testing.T) {
+	plan := workflowCompilerPlan(t)
+	plan.RecommendedStrategy = ExecutionWorkflowMultiParallelIsolatedWrite
+	plan.WorkspaceRevision.GitHead = "0123456789abcdef0123456789abcdef01234567"
+	plan.Digest, _ = ComputePlanDigest(plan)
+	value, err := CompilePlanWorkflow(plan, plan.CreatedAt.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Strategy != workflow.StrategyMultiAgentParallelIsolatedWrite || len(value.Nodes) != 6 || value.Budget.MaxConcurrency != 2 {
+		t.Fatalf("P7 Workflow shape = %#v", value)
+	}
+	implement := value.Nodes[1]
+	integrate := value.Nodes[3]
+	validateStep := value.Nodes[2]
+	finalValidate, finalReview := value.Nodes[4], value.Nodes[5]
+	if !implement.Isolated || workflow.NodeExecutor(implement) != workflow.ExecutorChild || len(implement.Scope.WritePaths) != 1 {
+		t.Fatalf("P7 Implement node = %#v", implement)
+	}
+	if integrate.Role != workflow.RoleIntegrate || workflow.NodeExecutor(integrate) != workflow.ExecutorMain || len(integrate.IntegrationSources) != 1 || integrate.IntegrationSources[0] != implement.ID || len(integrate.DependsOn) != 1 || integrate.DependsOn[0] != implement.ID {
+		t.Fatalf("P7 Integrate node = %#v", integrate)
+	}
+	if len(validateStep.DependsOn) != 2 || validateStep.DependsOn[0] != implement.ID || validateStep.DependsOn[1] != integrate.ID {
+		t.Fatalf("dependent P7 node bypassed integration = %#v", validateStep)
+	}
+	if finalValidate.Role != workflow.RoleValidate || workflow.NodeExecutor(finalValidate) != workflow.ExecutorChild || len(finalValidate.Scope.WritePaths) != 0 || finalReview.Role != workflow.RoleReview || workflow.NodeExecutor(finalReview) != workflow.ExecutorChild || len(finalReview.Scope.WritePaths) != 0 {
+		t.Fatalf("P7 final validation/review = %#v / %#v", finalValidate, finalReview)
+	}
+}
+
 func TestCompilePlanWorkflowRejectsDirectAndDeliverablePlans(t *testing.T) {
 	plan := workflowCompilerPlan(t)
 	plan.RecommendedStrategy = ExecutionSingle

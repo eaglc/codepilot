@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -211,7 +210,7 @@ func (s *Service) ensureWorkflowChildAgent(ctx context.Context, product Session,
 	}
 	current, err := s.deps.Children.LoadChildAgent(ctx, id)
 	if err == nil {
-		if current.ParentSessionID != product.ID || current.ParentTurnID != turn.ID || current.WorkflowID != string(durable.ID) || current.NodeID != NodeID(node.ID) || current.Attempt != node.Attempts || current.Role != node.Role || current.Profile != profile || current.PolicyVersion != 0 && current.PolicyVersion != definition.PolicyVersion || !reflect.DeepEqual(current.Task, task) {
+		if current.ParentSessionID != product.ID || current.ParentTurnID != turn.ID || current.WorkflowID != string(durable.ID) || current.NodeID != NodeID(node.ID) || current.Attempt != node.Attempts || current.Role != node.Role || current.Profile != profile || current.PolicyVersion != 0 && current.PolicyVersion != definition.PolicyVersion || !equalAgentTask(current.Task, task) {
 			return ChildAgent{}, errors.New("recover Workflow child Agent: deterministic identity conflicts with durable task")
 		}
 		return current, nil
@@ -226,6 +225,15 @@ func (s *Service) ensureWorkflowChildAgent(ctx context.Context, product Session,
 		Role: node.Role, Profile: profile, PolicyVersion: definition.PolicyVersion, Task: task,
 		AgentSessionID: ChildAgentSessionID(id), RunID: ChildAgentRunID(id), Attempt: node.Attempts,
 		Status: ChildAgentCreating, Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if durable.Strategy == workflow.StrategyMultiAgentParallelIsolatedWrite && node.Capability == workflow.CapabilityImplement {
+		plan, loadErr := s.deps.Plans.LoadPlan(ctx, turn.PlanID, turn.PlanVersion)
+		if loadErr != nil || plan.Digest != turn.PlanDigest || plan.WorkspaceRevision.GitHead == "" {
+			return ChildAgent{}, errors.New("create isolated Workflow child Agent: exact Git baseline is unavailable")
+		}
+		child.ManagedWorktree = &ManagedWorktree{
+			ID: "managed_" + string(id), BaselineCommit: plan.WorkspaceRevision.GitHead, Status: ManagedWorktreePending,
+		}
 	}
 	if err := s.deps.Children.CreateChildAgent(ctx, child); err != nil {
 		return ChildAgent{}, fmt.Errorf("create Workflow child Agent intent: %w", err)
@@ -281,6 +289,24 @@ func (s *Service) ensureChildAgentReady(ctx context.Context, product Session, ch
 	if child.Status != ChildAgentCreating {
 		return child, nil
 	}
+	if child.ManagedWorktree != nil {
+		if s.deps.ManagedWorktrees == nil {
+			return child, errors.New("prepare isolated child Agent: managed worktree service is unavailable")
+		}
+		active, loadErr := s.deps.Worktrees.LoadWorktree(ctx, product.WorktreeID)
+		if loadErr != nil {
+			return child, fmt.Errorf("prepare isolated child Agent: load active worktree: %w", loadErr)
+		}
+		bases, baseErr := s.childManagedBases(ctx, child)
+		if baseErr != nil {
+			return child, baseErr
+		}
+		prepared, prepareErr := s.deps.ManagedWorktrees.Prepare(ctx, active.Root, *child.ManagedWorktree, bases)
+		if prepareErr != nil {
+			return child, prepareErr
+		}
+		child.ManagedWorktree = &prepared
+	}
 	snapshot, err := s.deps.AgentSessions.Load(ctx, child.AgentSessionID)
 	if errors.Is(err, agentsession.ErrNotFound) {
 		now := time.Now().UTC()
@@ -298,19 +324,51 @@ func (s *Service) ensureChildAgentReady(ctx context.Context, product Session, ch
 	return s.transitionChild(ctx, child, ChildAgentReady, nil, "")
 }
 
+func (s *Service) childManagedBases(ctx context.Context, child ChildAgent) ([]ChangeSet, error) {
+	children, err := s.deps.Children.ListChildAgents(ctx, child.ParentTurnID)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[ChildAgentID]ChildAgent, len(children))
+	for _, candidate := range children {
+		byID[candidate.ID] = candidate
+	}
+	result := make([]ChangeSet, 0, len(child.Task.DependencyEvidence))
+	for _, evidence := range child.Task.DependencyEvidence {
+		candidate, found := byID[ChildAgentID(evidence.SourceID)]
+		if !found || candidate.ManagedWorktree == nil || candidate.ManagedWorktree.ChangeSet == nil {
+			continue
+		}
+		result = append(result, *candidate.ManagedWorktree.ChangeSet)
+	}
+	return result, nil
+}
+
 func (s *Service) prepareChildRunEnvironment(ctx context.Context, product Session, turn Turn, child ChildAgent) (runEnvironment, error) {
 	definition, err := s.childRoleDefinition(child)
 	if err != nil {
 		return runEnvironment{}, fmt.Errorf("prepare child Agent %q role policy: %w", child.ID, err)
 	}
-	worktree, err := s.deps.Worktrees.LoadWorktree(ctx, product.WorktreeID)
-	if err != nil {
-		return runEnvironment{}, fmt.Errorf("prepare child Agent: load worktree: %w", err)
+	worktreeID, worktreeRoot := product.WorktreeID, ""
+	permissionMode := product.PermissionMode
+	permissionGrants := clonePermissionGrants(product.PermissionGrants)
+	if child.ManagedWorktree != nil {
+		if child.ManagedWorktree.Status != ManagedWorktreeReady {
+			return runEnvironment{}, errors.New("prepare isolated child Agent: managed worktree is not ready")
+		}
+		worktreeID, worktreeRoot = WorktreeID(child.ManagedWorktree.ID), child.ManagedWorktree.Root
+		permissionMode, permissionGrants = PermissionAutoEdit, nil
+	} else {
+		worktree, loadErr := s.deps.Worktrees.LoadWorktree(ctx, product.WorktreeID)
+		if loadErr != nil {
+			return runEnvironment{}, fmt.Errorf("prepare child Agent: load worktree: %w", loadErr)
+		}
+		worktreeRoot = worktree.Root
 	}
 	tools, err := s.deps.Tools.CreateTools(ctx, ToolScope{
 		Profile: child.Profile, PolicyVersion: child.PolicyVersion, TurnID: turn.ID, RunID: RunID(child.RunID), NodeID: child.NodeID,
-		SessionID: product.ID, WorkspaceID: product.WorkspaceID, WorktreeID: product.WorktreeID, WorktreeRoot: worktree.Root,
-		PermissionMode: product.PermissionMode, PermissionGrants: clonePermissionGrants(product.PermissionGrants),
+		SessionID: product.ID, WorkspaceID: product.WorkspaceID, WorktreeID: worktreeID, WorktreeRoot: worktreeRoot,
+		PermissionMode: permissionMode, PermissionGrants: permissionGrants,
 		SensitivePaths: append([]string(nil), product.SensitivePaths...), ReadScope: append([]string(nil), child.Task.ReadPaths...), WriteScope: append([]string(nil), child.Task.WritePaths...),
 	})
 	if err != nil {
@@ -327,7 +385,7 @@ func (s *Service) prepareChildRunEnvironment(ctx context.Context, product Sessio
 	}
 	scope := PromptScope{
 		Profile: child.Profile, PolicyVersion: child.PolicyVersion, TurnID: turn.ID, RunID: RunID(child.RunID), NodeID: child.NodeID,
-		WorkspaceID: product.WorkspaceID, WorktreeID: product.WorktreeID, WorktreeRoot: worktree.Root,
+		WorkspaceID: product.WorkspaceID, WorktreeID: worktreeID, WorktreeRoot: worktreeRoot,
 		ToolNames: names, SensitivePaths: append([]string(nil), product.SensitivePaths...),
 		ReadScope: append([]string(nil), child.Task.ReadPaths...), WriteScope: append([]string(nil), child.Task.WritePaths...),
 	}
@@ -402,6 +460,21 @@ func (s *Service) finishChildAfterRun(ctx context.Context, child ChildAgent, res
 	if output.Status != AgentTaskSucceeded {
 		return s.transitionChild(ctx, current, ChildAgentFailed, &output, output.Conclusion)
 	}
+	if current.ManagedWorktree != nil {
+		if s.deps.ManagedWorktrees == nil {
+			return s.transitionChild(ctx, current, ChildAgentFailed, &output, "managed worktree service is unavailable while capturing the isolated change")
+		}
+		captured, captureErr := s.deps.ManagedWorktrees.Capture(ctx, *current.ManagedWorktree, current, output.Validation)
+		if captureErr != nil {
+			return s.transitionChild(ctx, current, ChildAgentFailed, &output, captureErr.Error())
+		}
+		current.ManagedWorktree = &captured
+		output.Changes = changeSetPaths(*captured.ChangeSet)
+		if !containsString(output.ArtifactRefs, captured.ChangeSet.Patch.ID) {
+			output.ArtifactRefs = append(output.ArtifactRefs, captured.ChangeSet.Patch.ID)
+			sort.Strings(output.ArtifactRefs)
+		}
+	}
 	return s.transitionChild(ctx, current, ChildAgentCompleted, &output, "")
 }
 
@@ -436,6 +509,11 @@ func (s *Service) transitionChild(ctx context.Context, child ChildAgent, status 
 	child.Revision++
 	child.Result = result
 	child.Failure = failure
+	if child.ManagedWorktree != nil && (status == ChildAgentFailed || status == ChildAgentCancelled) && child.ManagedWorktree.Status == ManagedWorktreeReady {
+		managed := *child.ManagedWorktree
+		managed.Status = ManagedWorktreeRetained
+		child.ManagedWorktree = &managed
+	}
 	if status == ChildAgentRunning && child.StartedAt.IsZero() {
 		child.StartedAt = now
 	}
@@ -446,6 +524,15 @@ func (s *Service) transitionChild(ctx context.Context, child ChildAgent, status 
 		return child, fmt.Errorf("transition child Agent %q to %q: %w", child.ID, status, err)
 	}
 	return child, nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func childWorkflowOutcome(child ChildAgent, result agent.RunResult, runErr error) (agent.RunResult, error) {

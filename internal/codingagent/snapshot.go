@@ -271,6 +271,11 @@ type ChildAgentSnapshot struct {
 	Artifacts     []string
 	Unresolved    []string
 	Failure       string
+	ManagedStatus ManagedWorktreeStatus
+	ChangeSetID   string
+	ChangeFiles   []string
+	PatchArtifact string
+	IntegratedAt  time.Time
 	StartedAt     time.Time
 	CompletedAt   time.Time
 }

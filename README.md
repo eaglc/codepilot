@@ -10,6 +10,7 @@ CodePilot is a terminal AI coding agent for working with a local Git repository.
 - Safe file reading, search, exact or whole-file editing, multi-file patches, Git inspection, and approved checks.
 - Explicit `/plan` tasks plus Agent-suggested Plan entry with a user confirmation boundary and read-only planning tools.
 - Bounded parallel read-only child Agents for independent Plan explorations and approved Explore/Validate/Review Workflows.
+- Isolated parallel Implement child Agents with exact ChangeSet approval, serial integration, and combined validation/review.
 - `read-only`, `ask`, and `auto-edit` permission modes.
 - Optional Go and Python language-server navigation.
 
@@ -69,7 +70,9 @@ Common commands:
 
 Plan mode is scoped to one task. An Agent suggestion offers **Enter Plan mode**, **Continue Direct**, or **Cancel task**; it never switches modes or grants write permission without the user's choice. Every submitted Plan is an immutable version bound to an exact workspace baseline and digest. Before approval and execution, CodePilot distinguishes unrelated workspace drift from changes to Plan-relevant files or worktree identity; material drift returns to read-only planning and requires a new version. During execution, a material assumption, scope, risk, strategy, or workspace deviation pauses at an explicit **Return to Plan mode / Continue approved Plan / Cancel task** boundary. `--disable-plan-suggestions` disables new Agent suggestions while preserving explicit `/plan`; `--disable-plan-mode` disables both new Plan entry paths while keeping previously persisted Plan decisions recoverable.
 
-Parallel child Agents are limited to read-only Explore, Validate, and Review profiles on the shared worktree. `--max-parallel-agents` sets the process-wide child concurrency cap (default 8), while each compiled read-only Workflow currently uses at most two concurrent nodes. `--disable-parallel-subagents` blocks new parallel delegations but preserves loading, cancellation, and recovery of durable work already created; `--disable-subagents` disables all new child delegation.
+Parallel read-only child Agents use the shared worktree only for Explore, Validate, and Review. An approved isolated-write Workflow may instead run independent Implement nodes in CodePilot-managed Git worktrees pinned to the Plan commit. Each child produces a content-addressed ChangeSet; the coordinator verifies target digests, shows the exact diff for one-time approval, integrates ChangeSets serially, and then runs combined Validate and Review nodes on the active worktree. Target drift or conflicts stop integration without deleting the child artifact or managed worktree.
+
+`--max-parallel-agents` sets the process-wide child concurrency cap (default 8), while each compiled parallel Workflow currently uses at most two concurrent nodes. `--disable-parallel-subagents` blocks all new parallel delegation; `--disable-parallel-write-subagents` independently blocks new isolated-write Workflows while preserving durable recovery. `--disable-subagents` disables all new child delegation.
 
 ## Permissions and safety
 

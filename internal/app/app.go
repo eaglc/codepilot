@@ -39,25 +39,26 @@ import (
 
 // Options contains process-owned CodePilot paths and terminal streams.
 type Options struct {
-	WorkingDirectory         string
-	ConfigDir                string
-	StateDir                 string
-	ProviderProfile          string
-	Model                    string
-	Permission               string
-	SensitivePaths           []string
-	TrustWorkspace           bool
-	RelocateWorktree         codingagent.WorktreeID
-	SkipRelocation           bool
-	DisableProductTurns      bool
-	DisablePlanMode          bool
-	DisablePlanSuggestions   bool
-	DisableWorkflows         bool
-	DisableSubagents         bool
-	DisableParallelSubagents bool
-	MaxParallelAgents        int
-	Input                    io.Reader
-	Output                   io.Writer
+	WorkingDirectory              string
+	ConfigDir                     string
+	StateDir                      string
+	ProviderProfile               string
+	Model                         string
+	Permission                    string
+	SensitivePaths                []string
+	TrustWorkspace                bool
+	RelocateWorktree              codingagent.WorktreeID
+	SkipRelocation                bool
+	DisableProductTurns           bool
+	DisablePlanMode               bool
+	DisablePlanSuggestions        bool
+	DisableWorkflows              bool
+	DisableSubagents              bool
+	DisableParallelSubagents      bool
+	DisableParallelWriteSubagents bool
+	MaxParallelAgents             int
+	Input                         io.Reader
+	Output                        io.Writer
 }
 
 // Application owns the composed product lifecycle.
@@ -190,6 +191,11 @@ func New(ctx context.Context, options Options) (*Application, error) {
 		_ = bridge.Close()
 		return nil, err
 	}
+	managedWorktrees, err := codingagent.NewGitManagedWorktreeManager(filepath.Join(stateDir, "managed-worktrees"), productStore)
+	if err != nil {
+		_ = bridge.Close()
+		return nil, err
+	}
 	features := codingagent.DefaultFeatureFlags()
 	if options.DisableProductTurns {
 		features.ProductTurns = false
@@ -209,13 +215,14 @@ func New(ctx context.Context, options Options) (*Application, error) {
 	if options.DisableParallelSubagents {
 		features.ParallelSubagents = false
 	}
+	features.ParallelWriteSubagents = !options.DisableParallelSubagents && !options.DisableParallelWriteSubagents
 	roles, err := roleprofile.NewDefaultRegistry()
 	if err != nil {
 		_ = bridge.Close()
 		return nil, fmt.Errorf("configure role profiles: %w", err)
 	}
 	service, err := codingagent.NewService(codingagent.Dependencies{
-		Sessions: productStore, Turns: productStore, Plans: productStore, Workflows: productStore, Children: productStore, AgentSessions: agentSessions, Worktrees: workspaceManager, Workspaces: workspaceManager,
+		Sessions: productStore, Turns: productStore, Plans: productStore, Workflows: productStore, Children: productStore, ManagedWorktrees: managedWorktrees, AgentSessions: agentSessions, Worktrees: workspaceManager, Workspaces: workspaceManager,
 		Agent: agentRuntime, Tools: codingtools.NewFactory(codingtools.Options{Artifacts: productStore, Security: securityPolicy, Languages: language.NewDefaultRegistry(), Navigator: languageServers, Roles: roles}), Prompts: prompt.NewBuilderWithRegistry(roles), Events: bridge,
 		Providers: providerManager, Limits: agent.RunLimits{MaxSteps: 32, MaxDuration: 30 * time.Minute}, MaxParallelAgents: options.MaxParallelAgents, Features: &features, Roles: roles,
 	})

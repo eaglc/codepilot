@@ -35,7 +35,27 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 	if now.IsZero() {
 		return workflow.Workflow{}, errors.New("compile Coding workflow: creation time is required")
 	}
-	nodes := make([]workflow.Node, 0, len(plan.Steps)+1)
+	parallelWrite := plan.RecommendedStrategy == ExecutionWorkflowMultiParallelIsolatedWrite
+	integrationIDs := make(map[string]workflow.NodeID)
+	if parallelWrite {
+		used := make([]workflow.Node, 0, len(plan.Steps)*2)
+		for _, step := range plan.Steps {
+			used = append(used, workflow.Node{ID: workflow.NodeID(step.ID)})
+		}
+		for _, step := range plan.Steps {
+			role := step.Role
+			if role == "" {
+				role = workflow.RoleImplement
+			}
+			if role != workflow.RoleImplement {
+				continue
+			}
+			id := uniqueFinalNodeID(used, "workflow-integrate-"+step.ID)
+			integrationIDs[step.ID] = id
+			used = append(used, workflow.Node{ID: id})
+		}
+	}
+	nodes := make([]workflow.Node, 0, len(plan.Steps)+len(integrationIDs)+2)
 	maximumAttempts, totalRuns := 1, 0
 	for _, step := range plan.Steps {
 		role := step.Role
@@ -55,21 +75,46 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 		if definition.Result.AllowChanges {
 			writePaths = append([]string(nil), step.Files...)
 		}
-		dependencies := make([]workflow.NodeID, len(step.DependsOn))
-		for index, dependency := range step.DependsOn {
-			dependencies[index] = workflow.NodeID(dependency)
+		dependencies := make([]workflow.NodeID, 0, len(step.DependsOn)*2)
+		for _, dependency := range step.DependsOn {
+			dependencies = append(dependencies, workflow.NodeID(dependency))
+			if parallelWrite {
+				if integrationID := integrationIDs[dependency]; integrationID != "" {
+					dependencies = append(dependencies, integrationID)
+				}
+			}
 		}
 		executor := workflow.ExecutorMain
-		if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial || plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly {
+		if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial || parallelExecutionStrategy(plan.RecommendedStrategy) {
 			executor = workflow.ExecutorChild
 		}
 		nodes = append(nodes, workflow.Node{
 			ID: workflow.NodeID(step.ID), Goal: step.Goal, DependsOn: dependencies,
-			Role: role, Capability: capability, Executor: executor, Delegated: executor == workflow.ExecutorChild, PolicyVersion: definition.PolicyVersion, Scope: workflow.Scope{ReadPaths: readPaths, WritePaths: writePaths},
+			Role: role, Capability: capability, Executor: executor, Delegated: executor == workflow.ExecutorChild, Isolated: parallelWrite && role == workflow.RoleImplement, PolicyVersion: definition.PolicyVersion, Scope: workflow.Scope{ReadPaths: readPaths, WritePaths: writePaths, Unknown: role == workflow.RoleImplement && len(writePaths) == 0},
 			AcceptanceCriteria: append([]string(nil), step.Validation...), FailureAction: failure, MaxAttempts: attempts, Status: workflow.NodePending,
 		})
 		maximumAttempts = max(maximumAttempts, attempts)
 		totalRuns += attempts
+	}
+	if parallelWrite {
+		integrateDefinition, resolveErr := roles.ResolveRole(workflow.RoleIntegrate)
+		if resolveErr != nil {
+			return workflow.Workflow{}, fmt.Errorf("compile Coding workflow: integration role: %w", resolveErr)
+		}
+		for _, step := range plan.Steps {
+			integrationID := integrationIDs[step.ID]
+			if integrationID == "" {
+				continue
+			}
+			nodes = append(nodes, workflow.Node{
+				ID: integrationID, Goal: "Integrate the exact verified change set from " + step.ID + ".", DependsOn: []workflow.NodeID{workflow.NodeID(step.ID)},
+				Role: integrateDefinition.Role, Capability: integrateDefinition.Workflow.Capability, Executor: workflow.ExecutorMain, PolicyVersion: integrateDefinition.PolicyVersion,
+				IntegrationSources: []workflow.NodeID{workflow.NodeID(step.ID)}, Scope: workflow.Scope{ReadPaths: append([]string(nil), step.Files...), WritePaths: append([]string(nil), step.Files...)},
+				AcceptanceCriteria: []string{"The exact approved change set is applied without overwriting workspace drift."}, FailureAction: workflow.FailureReplan, MaxAttempts: 1, Status: workflow.NodePending,
+			})
+			totalRuns++
+			maximumAttempts = max(maximumAttempts, 1)
+		}
 	}
 	finalID := uniqueFinalNodeID(nodes, "workflow-final-validate")
 	leaves := workflowLeaves(nodes)
@@ -80,12 +125,12 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 	}
 	nodes = append(nodes, workflow.Node{
 		ID: finalID, Goal: "Validate the combined result against the approved Plan acceptance criteria.", DependsOn: leaves,
-		Role: validateDefinition.Role, Capability: validateDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(plan.RecommendedStrategy), Delegated: plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly, PolicyVersion: validateDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
+		Role: validateDefinition.Role, Capability: validateDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(plan.RecommendedStrategy), Delegated: parallelExecutionStrategy(plan.RecommendedStrategy), PolicyVersion: validateDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
 		AcceptanceCriteria: append([]string(nil), plan.AcceptanceCriteria...), FailureAction: validateDefinition.Workflow.DefaultFailure, MaxAttempts: validateDefinition.Workflow.DefaultAttempts, Status: workflow.NodePending,
 	})
 	totalRuns += validateDefinition.Workflow.DefaultAttempts
 	maximumAttempts = max(maximumAttempts, validateDefinition.Workflow.DefaultAttempts)
-	if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial || plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly {
+	if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial || parallelExecutionStrategy(plan.RecommendedStrategy) {
 		reviewDefinition, resolveErr := roles.ResolveRole(workflow.RoleReview)
 		if resolveErr != nil {
 			return workflow.Workflow{}, fmt.Errorf("compile Coding workflow: final review role: %w", resolveErr)
@@ -93,7 +138,7 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 		reviewID := uniqueFinalNodeID(nodes, "workflow-final-review")
 		nodes = append(nodes, workflow.Node{
 			ID: reviewID, Goal: "Review and summarize the complete multi-Agent result for the user.", DependsOn: []workflow.NodeID{finalID},
-			Role: reviewDefinition.Role, Capability: reviewDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(plan.RecommendedStrategy), Delegated: plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly, PolicyVersion: reviewDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
+			Role: reviewDefinition.Role, Capability: reviewDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(plan.RecommendedStrategy), Delegated: parallelExecutionStrategy(plan.RecommendedStrategy), PolicyVersion: reviewDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
 			AcceptanceCriteria: append([]string(nil), plan.AcceptanceCriteria...), FailureAction: reviewDefinition.Workflow.DefaultFailure, MaxAttempts: reviewDefinition.Workflow.DefaultAttempts, Status: workflow.NodePending,
 		})
 		totalRuns += reviewDefinition.Workflow.DefaultAttempts
@@ -106,7 +151,7 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 		Status: workflow.StatusPending, Budget: workflow.Budget{MaxNodes: len(nodes), MaxRuns: totalRuns, MaxAttempts: maximumAttempts, MaxAgentSteps: totalRuns * 32},
 		Nodes: nodes, Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}
-	if plan.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly {
+	if parallelExecutionStrategy(plan.RecommendedStrategy) {
 		value.Budget.MaxAgents = len(nodes)
 		value.Budget.MaxConcurrency = min(2, len(nodes))
 		value.Budget.MaxTotalTokens = 2_000_000
@@ -175,11 +220,14 @@ func workflowStrategyForExecution(value ExecutionStrategy) workflow.Strategy {
 	if value == ExecutionWorkflowMultiParallelReadOnly {
 		return workflow.StrategyMultiAgentParallelReadOnly
 	}
+	if value == ExecutionWorkflowMultiParallelIsolatedWrite {
+		return workflow.StrategyMultiAgentParallelIsolatedWrite
+	}
 	return workflow.StrategySingleAgent
 }
 
 func workflowExecutorForStrategy(value ExecutionStrategy) workflow.Executor {
-	if value == ExecutionWorkflowMultiParallelReadOnly {
+	if parallelExecutionStrategy(value) {
 		return workflow.ExecutorChild
 	}
 	return workflow.ExecutorMain

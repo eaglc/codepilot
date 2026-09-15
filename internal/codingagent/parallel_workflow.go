@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +32,11 @@ func (s *Service) continueParallelWorkflowLocked(ctx context.Context, product Se
 	runnable, err := workflow.RunnableNodes(durable)
 	if err != nil {
 		return last, false, fmt.Errorf("continue parallel Coding workflow: schedule: %w", err)
+	}
+	if durable.Strategy == workflow.StrategyMultiAgentParallelIsolatedWrite && len(runnable) == 1 {
+		if node, found := workflowNode(durable, runnable[0]); found && workflow.NodeExecutor(node) == workflow.ExecutorMain {
+			return last, false, nil
+		}
 	}
 	for _, nodeID := range runnable {
 		durable, err = s.appendWorkflowTransition(ctx, durable, workflow.Event{Type: workflow.EventNodeStarted, NodeID: nodeID})
@@ -67,8 +74,10 @@ func (s *Service) runParallelWorkflowNodesLocked(ctx context.Context, product Se
 	}
 	executions := make([]parallelNodeExecution, 0, len(nodes))
 	for _, node := range nodes {
-		if !workflow.ReadOnlyCapability(node.Capability) || workflow.NodeExecutor(node) != workflow.ExecutorChild || len(node.Scope.WritePaths) != 0 {
-			return last, fmt.Errorf("run parallel Coding workflow node %q: trusted read-only boundary is invalid", node.ID)
+		readOnly := workflow.ReadOnlyCapability(node.Capability) && len(node.Scope.WritePaths) == 0
+		isolatedWrite := durable.Strategy == workflow.StrategyMultiAgentParallelIsolatedWrite && node.Capability == workflow.CapabilityImplement && node.Isolated && len(node.Scope.WritePaths) != 0
+		if workflow.NodeExecutor(node) != workflow.ExecutorChild || (!readOnly && !isolatedWrite) {
+			return last, fmt.Errorf("run parallel Coding workflow node %q: trusted parallel boundary is invalid", node.ID)
 		}
 		execution, prepareErr := s.prepareParallelNodeExecution(ctx, product, turn, durable, node)
 		if prepareErr != nil {
@@ -221,7 +230,7 @@ func (s *Service) runParallelChild(ctx context.Context, product Session, executi
 		return result, finishErr
 	}
 	if result.Status == agent.RunInterrupted {
-		child, finishErr = s.transitionChild(context.WithoutCancel(ctx), child, ChildAgentFailed, nil, "parallel read-only child cannot suspend the entire wave for approval")
+		child, finishErr = s.transitionChild(context.WithoutCancel(ctx), child, ChildAgentFailed, nil, "parallel child cannot suspend the entire wave for approval")
 		result.Status, result.Reason = agent.RunFailed, "parallel_approval_not_supported"
 		runErr = errors.New(child.Failure)
 	}
@@ -292,7 +301,7 @@ func (s *Service) mergeParallelWorkflowResults(ctx context.Context, product Sess
 		last.Status, last.Reason = string(workflow.StatusCancelled), "workflow_cancelled"
 		return last, nil
 	}
-	drift, err := s.assessPlanWorkspace(ctx, product, turn, WorkspaceDriftDuringExecution)
+	drift, err := s.assessParallelWorkflowWorkspace(ctx, product, turn, durable)
 	if err != nil {
 		return last, fmt.Errorf("verify parallel Workflow workspace after read-only wave: %w", err)
 	}
@@ -323,6 +332,67 @@ func (s *Service) mergeParallelWorkflowResults(ctx context.Context, product Sess
 		return last, err
 	}
 	return s.continueWorkflowLocked(ctx, product, turn, last)
+}
+
+func (s *Service) assessParallelWorkflowWorkspace(ctx context.Context, product Session, turn Turn, durable workflow.Workflow) (WorkspaceDrift, error) {
+	if durable.Strategy != workflow.StrategyMultiAgentParallelIsolatedWrite {
+		return s.assessPlanWorkspace(ctx, product, turn, WorkspaceDriftDuringExecution)
+	}
+	children, err := s.deps.Children.ListChildAgents(ctx, turn.ID)
+	if err != nil {
+		return WorkspaceDrift{}, err
+	}
+	var integrated []ChangeSet
+	for _, child := range children {
+		if child.WorkflowID == string(durable.ID) && child.ManagedWorktree != nil && child.ManagedWorktree.ChangeSet != nil && !child.ManagedWorktree.ChangeSet.IntegratedAt.IsZero() {
+			integrated = append(integrated, *child.ManagedWorktree.ChangeSet)
+		}
+	}
+	if len(integrated) == 0 {
+		return s.assessPlanWorkspace(ctx, product, turn, WorkspaceDriftDuringExecution)
+	}
+	plan, err := s.deps.Plans.LoadPlan(ctx, turn.PlanID, turn.PlanVersion)
+	if err != nil || plan.Digest != turn.PlanDigest {
+		return WorkspaceDrift{}, errors.New("assess isolated-write workspace: exact Plan revision is unavailable or changed")
+	}
+	active, err := s.deps.Worktrees.LoadWorktree(ctx, product.WorktreeID)
+	if err != nil {
+		return WorkspaceDrift{}, err
+	}
+	head, err := managedGitText(ctx, active.Root, "rev-parse", "HEAD")
+	if err != nil {
+		return WorkspaceDrift{}, err
+	}
+	paths := make([]string, 0)
+	state := make([]string, 0)
+	if head != plan.WorkspaceRevision.GitHead {
+		paths = append(paths, ".git/HEAD")
+	}
+	for _, change := range integrated {
+		for _, file := range change.Files {
+			current, digestErr := managedFileDigest(active.Root, file.Path)
+			if digestErr != nil {
+				return WorkspaceDrift{}, digestErr
+			}
+			state = append(state, change.ID+"\x00"+file.Path+"\x00"+current)
+			if current != file.AfterSHA256 {
+				paths = append(paths, file.Path)
+			}
+		}
+	}
+	sort.Strings(paths)
+	sort.Strings(state)
+	baselineDigest, err := ComputeWorkspaceRevisionDigest(plan.WorkspaceRevision)
+	if err != nil {
+		return WorkspaceDrift{}, err
+	}
+	currentDigest := digestBytes([]byte(strings.Join(state, "\n") + "\nHEAD\x00" + head))
+	now := time.Now().UTC()
+	drift := WorkspaceDrift{Severity: WorkspaceDriftNone, Source: WorkspaceDriftDuringExecution, Reason: "integrated_state_unchanged", Summary: "Approved change sets remain at their recorded integrated state.", PlanVersion: plan.Version, PlanDigest: plan.Digest, BaselineDigest: baselineDigest, CurrentDigest: currentDigest, DetectedAt: now}
+	if len(paths) != 0 {
+		drift.Severity, drift.Reason, drift.Summary, drift.Paths = WorkspaceDriftMaterial, "integrated_target_changed", "One or more approved integration targets changed after exact integration; execution was blocked.", paths
+	}
+	return drift, nil
 }
 
 func (s *Service) parallelChildUsage(ctx context.Context, child ChildAgent) (int, float64, error) {

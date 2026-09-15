@@ -1384,6 +1384,38 @@ func TestWorkflowPlanApprovalLetsUserChooseDirectAndShowsProgress(t *testing.T) 
 	}
 }
 
+func TestParallelWorkflowStrategiesAndChangeArtifactsAreVisible(t *testing.T) {
+	model := &Model{}
+	tests := []struct {
+		strategy codingagent.ExecutionStrategy
+		label    string
+		kind     approvalChoiceKind
+	}{
+		{codingagent.ExecutionWorkflowMultiParallelReadOnly, "parallel read-only multi-Agent Workflow", approvalAllowParallelWorkflow},
+		{codingagent.ExecutionWorkflowMultiParallelIsolatedWrite, "isolated parallel-write multi-Agent Workflow", approvalAllowParallelWriteWorkflow},
+	}
+	for _, test := range tests {
+		pending := codingagent.PendingInterrupt{Kind: "plan_approval", PlanCompletion: codingagent.PlanCompletionExecute, PlanStrategy: test.strategy}
+		choices := model.approvalChoices(pending)
+		if len(choices) != 4 || choices[0].kind != test.kind || !strings.Contains(choices[0].label, test.label) || choices[1].kind != approvalAllowDirect {
+			t.Fatalf("parallel approval choices for %q = %#v", test.strategy, choices)
+		}
+		rows := renderedRows(model.planRows(codingagent.PlanSnapshot{Version: 1, RecommendedStrategy: test.strategy}, 120))
+		if !strings.Contains(rows, test.label) {
+			t.Fatalf("parallel Plan label for %q = %q", test.strategy, rows)
+		}
+	}
+	children := renderedRows(model.childAgentRows([]codingagent.ChildAgentSnapshot{{
+		ID: "child", Role: "implement", Status: codingagent.ChildAgentCompleted, Goal: "Implement A.",
+		ManagedStatus: codingagent.ManagedWorktreeCleaned, ChangeSetID: "changeset_123", ChangeFiles: []string{"a.txt"}, PatchArtifact: "sha256:abc",
+	}}, 120))
+	for _, expected := range []string{"Isolated change", "cleaned", "changeset_123", "a.txt", "Patch artifact", "sha256:abc"} {
+		if !strings.Contains(children, expected) {
+			t.Fatalf("P7 child artifact rows do not contain %q: %s", expected, children)
+		}
+	}
+}
+
 func TestPlanReplanBoundaryShowsExactVersionReasonAndChoices(t *testing.T) {
 	bridge, _ := NewEventBridge(4)
 	replan := codingagent.PlanReplanRequest{

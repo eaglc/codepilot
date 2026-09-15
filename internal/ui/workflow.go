@@ -89,6 +89,19 @@ func (m *Model) childAgentRows(values []codingagent.ChildAgentSnapshot, width in
 		if child.Failure != "" {
 			rows = appendWrapped(rows, "     Failure  ", child.Failure, width, theme.failure)
 		}
+		if child.ManagedStatus != "" {
+			rows = appendWrapped(rows, "     Isolated change  ", string(child.ManagedStatus), width, theme.muted)
+		}
+		if child.ChangeSetID != "" {
+			change := child.ChangeSetID
+			if len(child.ChangeFiles) != 0 {
+				change += " · " + strings.Join(child.ChangeFiles, ", ")
+			}
+			rows = appendWrapped(rows, "     Change set  ", change, width, theme.muted)
+		}
+		if child.PatchArtifact != "" {
+			rows = appendWrapped(rows, "     Patch artifact  ", child.PatchArtifact, width, theme.muted)
+		}
 	}
 	return append(rows, renderRow{})
 }

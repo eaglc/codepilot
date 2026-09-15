@@ -24,7 +24,7 @@ func (s *Service) beginWorkflowLocked(ctx context.Context, product Session, turn
 	if err != nil {
 		return TurnResult{}, err
 	}
-	if compiled.Strategy == workflow.StrategyMultiAgentParallelReadOnly {
+	if compiled.Strategy == workflow.StrategyMultiAgentParallelReadOnly || compiled.Strategy == workflow.StrategyMultiAgentParallelIsolatedWrite {
 		compiled.Budget.MaxConcurrency = min(compiled.Budget.MaxConcurrency, s.deps.MaxParallelAgents)
 		if s.deps.Limits.MaxTotalTokens > 0 {
 			compiled.Budget.MaxTotalTokens = s.deps.Limits.MaxTotalTokens
@@ -76,7 +76,7 @@ func (s *Service) continueWorkflowLocked(ctx context.Context, product Session, t
 
 func (s *Service) continueWorkflowWithRevisionLocked(ctx context.Context, product Session, turn Turn, durable workflow.Workflow, expectedTurnRevision uint64, last TurnResult) (TurnResult, error) {
 	for transitions := 0; transitions < workflow.MaxNodes*4; transitions++ {
-		if durable.Strategy == workflow.StrategyMultiAgentParallelReadOnly && durable.Status == workflow.StatusRunning {
+		if (durable.Strategy == workflow.StrategyMultiAgentParallelReadOnly || durable.Strategy == workflow.StrategyMultiAgentParallelIsolatedWrite) && durable.Status == workflow.StatusRunning {
 			result, handled, parallelErr := s.continueParallelWorkflowLocked(ctx, product, turn, durable, last)
 			if handled || parallelErr != nil {
 				return result, parallelErr

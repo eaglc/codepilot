@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"path"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +37,9 @@ const (
 	// StrategyMultiAgentParallelReadOnly permits concurrent child Agents only
 	// for capability profiles that cannot mutate the shared Worktree.
 	StrategyMultiAgentParallelReadOnly Strategy = "workflow_multi_parallel_readonly"
+	// StrategyMultiAgentParallelIsolatedWrite permits bounded write nodes to run
+	// concurrently only in separate coordinator-managed Git worktrees.
+	StrategyMultiAgentParallelIsolatedWrite Strategy = "workflow_multi_parallel_isolated_write"
 )
 
 // Executor identifies whether the parent Agent or an independent child Agent
@@ -126,6 +130,7 @@ type Budget struct {
 type Scope struct {
 	ReadPaths  []string `json:"read_paths,omitempty"`
 	WritePaths []string `json:"write_paths,omitempty"`
+	Unknown    bool     `json:"unknown,omitempty"`
 }
 
 type Node struct {
@@ -136,6 +141,8 @@ type Node struct {
 	Capability         Capability    `json:"capability"`
 	Executor           Executor      `json:"executor,omitempty"`
 	Delegated          bool          `json:"delegated,omitempty"`
+	Isolated           bool          `json:"isolated,omitempty"`
+	IntegrationSources []NodeID      `json:"integration_sources,omitempty"`
 	PolicyVersion      uint32        `json:"policy_version,omitempty"`
 	Scope              Scope         `json:"scope"`
 	AcceptanceCriteria []string      `json:"acceptance_criteria"`
@@ -206,7 +213,7 @@ func Validate(value Workflow) error {
 	if strings.TrimSpace(value.Plan.ID) == "" || value.Plan.Version == 0 || !hexDigest(value.Plan.Digest, 64) {
 		return errors.New("workflow requires an exact immutable Plan reference")
 	}
-	if value.Strategy != StrategySingleAgent && value.Strategy != StrategyMultiAgentSerial && value.Strategy != StrategyMultiAgentParallelReadOnly {
+	if value.Strategy != StrategySingleAgent && value.Strategy != StrategyMultiAgentSerial && value.Strategy != StrategyMultiAgentParallelReadOnly && value.Strategy != StrategyMultiAgentParallelIsolatedWrite {
 		return fmt.Errorf("workflow strategy %q is unsupported", value.Strategy)
 	}
 	if !validStatus(value.Status) || value.Revision == 0 || value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() || value.UpdatedAt.Before(value.CreatedAt) {
@@ -260,17 +267,35 @@ func Validate(value Workflow) error {
 				return errors.New("parallel Workflow nodes must use read-only capabilities without write scope")
 			}
 		}
+		if value.Strategy == StrategyMultiAgentParallelIsolatedWrite {
+			switch node.Capability {
+			case CapabilityImplement:
+				if NodeExecutor(node) != ExecutorChild || !node.Delegated || !node.Isolated {
+					return errors.New("parallel write Implement nodes must be delegated to isolated child Agents")
+				}
+			case CapabilityIntegrate:
+				if NodeExecutor(node) != ExecutorMain || node.Delegated || node.Isolated || len(node.IntegrationSources) != 1 {
+					return errors.New("parallel write Integrate nodes must be serial parent nodes with one exact source")
+				}
+			default:
+				if !ReadOnlyCapability(node.Capability) || NodeExecutor(node) != ExecutorChild || !node.Delegated || node.Isolated {
+					return errors.New("parallel write read-only nodes must be delegated non-isolated child Agents")
+				}
+			}
+		} else if node.Isolated || len(node.IntegrationSources) != 0 {
+			return errors.New("isolated execution and integration sources require the parallel isolated-write strategy")
+		}
 		if NodeExecutor(node) == ExecutorChild || node.Delegated {
 			childNodes++
 		}
 	}
-	if (value.Strategy == StrategyMultiAgentSerial || value.Strategy == StrategyMultiAgentParallelReadOnly) && childNodes == 0 {
+	if (value.Strategy == StrategyMultiAgentSerial || parallelStrategy(value.Strategy)) && childNodes == 0 {
 		return errors.New("multi-Agent workflow requires at least one child Agent node")
 	}
-	if value.Strategy != StrategyMultiAgentParallelReadOnly && running > 1 {
+	if !parallelStrategy(value.Strategy) && running > 1 {
 		return errors.New("single-Agent workflow cannot contain multiple running nodes")
 	}
-	if value.Strategy == StrategyMultiAgentParallelReadOnly {
+	if parallelStrategy(value.Strategy) {
 		if value.Budget.MaxAgents < len(value.Nodes) || value.Budget.MaxAgents > MaxNodes || value.Budget.MaxConcurrency < 2 || value.Budget.MaxConcurrency > value.Budget.MaxAgents {
 			return errors.New("parallel Workflow requires bounded Agent and concurrency quotas")
 		}
@@ -279,6 +304,9 @@ func Validate(value Workflow) error {
 		}
 		if running > value.Budget.MaxConcurrency {
 			return errors.New("parallel Workflow exceeds its concurrency quota")
+		}
+		if value.Strategy == StrategyMultiAgentParallelIsolatedWrite && !runningNodesCompatible(value) {
+			return errors.New("parallel isolated-write Workflow has conflicting running nodes")
 		}
 	} else if value.Budget.MaxAgents != 0 || value.Budget.MaxConcurrency != 0 || value.Budget.MaxTotalTokens != 0 || value.Budget.UsedTotalTokens != 0 || value.Budget.MaxCost != 0 || value.Budget.UsedCost != 0 || value.Budget.MaxDurationSeconds != 0 {
 		return errors.New("serial Workflow cannot declare parallel Agent quotas")
@@ -299,6 +327,15 @@ func Validate(value Workflow) error {
 				return fmt.Errorf("workflow node %q repeats dependency %q", node.ID, dependency)
 			}
 			seen[dependency] = struct{}{}
+		}
+		for _, source := range node.IntegrationSources {
+			candidate, exists := findNode(value, source)
+			if !exists || candidate.Capability != CapabilityImplement {
+				return fmt.Errorf("workflow Integrate node %q references a non-Implement source %q", node.ID, source)
+			}
+			if _, depends := seen[source]; !depends {
+				return fmt.Errorf("workflow Integrate node %q must depend on its source %q", node.ID, source)
+			}
 		}
 	}
 	if hasCycle(value.Nodes) {
@@ -336,6 +373,12 @@ func validateNode(node Node, budget Budget) error {
 	}
 	if (node.Capability == CapabilityExplore || node.Capability == CapabilityValidate || node.Capability == CapabilityReview) && len(node.Scope.WritePaths) != 0 {
 		return errors.New("read-only node capability cannot declare write scope")
+	}
+	if node.Scope.Unknown && node.Capability != CapabilityImplement {
+		return errors.New("only an Implement node may carry an unknown resource scope")
+	}
+	if len(node.IntegrationSources) > 1 || len(node.IntegrationSources) == 1 && node.Capability != CapabilityIntegrate {
+		return errors.New("integration sources are valid only for one-source Integrate nodes")
 	}
 	if len(node.AcceptanceCriteria) == 0 || len(node.AcceptanceCriteria) > MaxAcceptanceItems {
 		return errors.New("acceptance criteria are required and bounded")
@@ -458,7 +501,7 @@ func ApplyEvent(current Workflow, event Event) (Workflow, error) {
 		}
 		next.Budget.UsedAgentSteps += event.AgentSteps
 		if event.AgentTokens != 0 || event.AgentCost != 0 {
-			if next.Strategy != StrategyMultiAgentParallelReadOnly || next.Budget.UsedTotalTokens+event.AgentTokens > next.Budget.MaxTotalTokens || next.Budget.UsedCost+event.AgentCost > next.Budget.MaxCost {
+			if !parallelStrategy(next.Strategy) || next.Budget.UsedTotalTokens+event.AgentTokens > next.Budget.MaxTotalTokens || next.Budget.UsedCost+event.AgentCost > next.Budget.MaxCost {
 				return errors.New("workflow Agent token or cost budget was exceeded")
 			}
 			next.Budget.UsedTotalTokens += event.AgentTokens
@@ -477,7 +520,7 @@ func ApplyEvent(current Workflow, event Event) (Workflow, error) {
 		if err != nil {
 			return Workflow{}, err
 		}
-		parallelCapacity := current.Strategy == StrategyMultiAgentParallelReadOnly && runningNodeCount(current) < current.Budget.MaxConcurrency
+		parallelCapacity := parallelStrategy(current.Strategy) && runningNodeCount(current) < current.Budget.MaxConcurrency && nodeCompatibleWithRunning(current, current.Nodes[index])
 		if current.Status != StatusRunning || current.Nodes[index].Status != NodePending || (!parallelCapacity && activeNode(current) != "") || !dependenciesCompleted(current, current.Nodes[index]) || totalAttempts(current) >= current.Budget.MaxRuns || current.Budget.UsedAgentSteps >= current.Budget.MaxAgentSteps {
 			return Workflow{}, fmt.Errorf("workflow node %q is not runnable", event.NodeID)
 		}
@@ -625,6 +668,7 @@ func Clone(value Workflow) Workflow {
 		clone.Nodes[index].DependsOn = append([]NodeID(nil), value.Nodes[index].DependsOn...)
 		clone.Nodes[index].Scope.ReadPaths = append([]string(nil), value.Nodes[index].Scope.ReadPaths...)
 		clone.Nodes[index].Scope.WritePaths = append([]string(nil), value.Nodes[index].Scope.WritePaths...)
+		clone.Nodes[index].IntegrationSources = append([]NodeID(nil), value.Nodes[index].IntegrationSources...)
 		clone.Nodes[index].AcceptanceCriteria = append([]string(nil), value.Nodes[index].AcceptanceCriteria...)
 	}
 	return clone
@@ -750,6 +794,73 @@ func runningNodeCount(value Workflow) int {
 		}
 	}
 	return count
+}
+
+func parallelStrategy(value Strategy) bool {
+	return value == StrategyMultiAgentParallelReadOnly || value == StrategyMultiAgentParallelIsolatedWrite
+}
+
+func runningNodesCompatible(value Workflow) bool {
+	running := make([]Node, 0, value.Budget.MaxConcurrency)
+	for _, node := range value.Nodes {
+		if node.Status != NodeRunning {
+			continue
+		}
+		for _, other := range running {
+			if !NodesConcurrent(other, node) {
+				return false
+			}
+		}
+		running = append(running, node)
+	}
+	return true
+}
+
+func nodeCompatibleWithRunning(value Workflow, candidate Node) bool {
+	if value.Strategy != StrategyMultiAgentParallelIsolatedWrite {
+		return true
+	}
+	for _, node := range value.Nodes {
+		if node.Status == NodeRunning && !NodesConcurrent(node, candidate) {
+			return false
+		}
+	}
+	return true
+}
+
+// NodesConcurrent applies the trusted resource-conflict matrix. Unknown scope
+// is always exclusive. Two readers may share the active worktree; any write is
+// concurrent only when every read/write intersection is disjoint and the writer
+// is an isolated child.
+func NodesConcurrent(left, right Node) bool {
+	if left.Scope.Unknown || right.Scope.Unknown {
+		return false
+	}
+	leftWrites, rightWrites := len(left.Scope.WritePaths) != 0, len(right.Scope.WritePaths) != 0
+	if !leftWrites && !rightWrites {
+		return NodeExecutor(left) == ExecutorChild && NodeExecutor(right) == ExecutorChild
+	}
+	if leftWrites && (!left.Isolated || NodeExecutor(left) != ExecutorChild) || rightWrites && (!right.Isolated || NodeExecutor(right) != ExecutorChild) {
+		return false
+	}
+	return !pathSetsOverlap(left.Scope.WritePaths, right.Scope.WritePaths) &&
+		!pathSetsOverlap(left.Scope.WritePaths, right.Scope.ReadPaths) &&
+		!pathSetsOverlap(right.Scope.WritePaths, left.Scope.ReadPaths)
+}
+
+func pathSetsOverlap(left, right []string) bool {
+	for _, leftPath := range left {
+		for _, rightPath := range right {
+			a, b := leftPath, rightPath
+			if runtime.GOOS == "windows" {
+				a, b = strings.ToLower(a), strings.ToLower(b)
+			}
+			if a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func dependenciesCompleted(value Workflow, node Node) bool {

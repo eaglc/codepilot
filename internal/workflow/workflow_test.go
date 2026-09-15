@@ -182,6 +182,40 @@ func TestParallelReadOnlyFailureIsolatedUntilDependencyPropagation(t *testing.T)
 	assertAction(t, value, ActionBlockWorkflow, "")
 }
 
+func TestParallelIsolatedWriteSchedulerUsesConflictMatrix(t *testing.T) {
+	value := parallelIsolatedWriteWorkflow()
+	now := value.CreatedAt
+	value = apply(t, value, Event{ID: "p7-start", Type: EventWorkflowStarted, OccurredAt: now.Add(time.Second)})
+	runnable, err := RunnableNodes(value)
+	if err != nil || len(runnable) != 2 || runnable[0] != "implement-api" || runnable[1] != "implement-ui" {
+		t.Fatalf("independent isolated writes = %#v, %v", runnable, err)
+	}
+	value.Nodes[1].Scope.WritePaths = []string{"internal/api/client"}
+	runnable, err = RunnableNodes(value)
+	if err != nil || len(runnable) != 1 || runnable[0] != "implement-api" {
+		t.Fatalf("overlapping isolated writes were parallel: %#v, %v", runnable, err)
+	}
+	value.Nodes[0].Scope.Unknown = true
+	runnable, err = RunnableNodes(value)
+	if err != nil || len(runnable) != 1 || runnable[0] != "implement-api" {
+		t.Fatalf("unknown write scope was not serialized: %#v, %v", runnable, err)
+	}
+}
+
+func TestParallelIsolatedWriteIntegrateNodeRunsAlone(t *testing.T) {
+	value := parallelIsolatedWriteWorkflow()
+	now := value.CreatedAt
+	value = apply(t, value, Event{ID: "p7-integrate-start", Type: EventWorkflowStarted, OccurredAt: now.Add(time.Second)})
+	value = apply(t, value, Event{ID: "p7-api-start", Type: EventNodeStarted, NodeID: "implement-api", OccurredAt: now.Add(2 * time.Second)})
+	value = apply(t, value, Event{ID: "p7-ui-start", Type: EventNodeStarted, NodeID: "implement-ui", OccurredAt: now.Add(3 * time.Second)})
+	value = apply(t, value, Event{ID: "p7-api-done", Type: EventNodeCompleted, NodeID: "implement-api", ResultRef: "child:api", OccurredAt: now.Add(4 * time.Second)})
+	value = apply(t, value, Event{ID: "p7-ui-done", Type: EventNodeCompleted, NodeID: "implement-ui", ResultRef: "child:ui", OccurredAt: now.Add(5 * time.Second)})
+	runnable, err := RunnableNodes(value)
+	if err != nil || len(runnable) != 1 || runnable[0] != "integrate-api" {
+		t.Fatalf("first deterministic Integrate node = %#v, %v", runnable, err)
+	}
+}
+
 func testWorkflow() Workflow {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	return Workflow{
@@ -208,6 +242,21 @@ func parallelReadOnlyWorkflow() Workflow {
 			{ID: "review", Goal: "Review evidence.", DependsOn: []NodeID{"explore-api", "explore-ui"}, Role: RoleReview, Capability: CapabilityReview, Executor: ExecutorChild, Delegated: true, Scope: Scope{ReadPaths: []string{"internal"}}, AcceptanceCriteria: []string{"Evidence reviewed."}, FailureAction: FailureBlock, MaxAttempts: 1, Status: NodePending},
 		},
 		Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func parallelIsolatedWriteWorkflow() Workflow {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	return Workflow{
+		ID: "isolated-write-workflow", OwnerID: "turn-1", Plan: PlanReference{ID: "plan-1", Version: 1, Digest: strings.Repeat("a", 64)},
+		Strategy: StrategyMultiAgentParallelIsolatedWrite, Status: StatusPending,
+		Budget: Budget{MaxNodes: 4, MaxRuns: 4, MaxAttempts: 1, MaxAgentSteps: 128, MaxAgents: 4, MaxConcurrency: 2, MaxTotalTokens: 4000, MaxCost: 4, MaxDurationSeconds: 60},
+		Nodes: []Node{
+			{ID: "implement-api", Goal: "Implement API.", Role: RoleImplement, Capability: CapabilityImplement, Executor: ExecutorChild, Delegated: true, Isolated: true, Scope: Scope{ReadPaths: []string{"internal/api"}, WritePaths: []string{"internal/api"}}, AcceptanceCriteria: []string{"API complete."}, FailureAction: FailureBlock, MaxAttempts: 1, Status: NodePending},
+			{ID: "implement-ui", Goal: "Implement UI.", Role: RoleImplement, Capability: CapabilityImplement, Executor: ExecutorChild, Delegated: true, Isolated: true, Scope: Scope{ReadPaths: []string{"internal/ui"}, WritePaths: []string{"internal/ui"}}, AcceptanceCriteria: []string{"UI complete."}, FailureAction: FailureBlock, MaxAttempts: 1, Status: NodePending},
+			{ID: "integrate-api", Goal: "Integrate API.", DependsOn: []NodeID{"implement-api"}, Role: RoleIntegrate, Capability: CapabilityIntegrate, Executor: ExecutorMain, IntegrationSources: []NodeID{"implement-api"}, Scope: Scope{ReadPaths: []string{"internal/api"}, WritePaths: []string{"internal/api"}}, AcceptanceCriteria: []string{"API integrated."}, FailureAction: FailureReplan, MaxAttempts: 1, Status: NodePending},
+			{ID: "integrate-ui", Goal: "Integrate UI.", DependsOn: []NodeID{"implement-ui"}, Role: RoleIntegrate, Capability: CapabilityIntegrate, Executor: ExecutorMain, IntegrationSources: []NodeID{"implement-ui"}, Scope: Scope{ReadPaths: []string{"internal/ui"}, WritePaths: []string{"internal/ui"}}, AcceptanceCriteria: []string{"UI integrated."}, FailureAction: FailureReplan, MaxAttempts: 1, Status: NodePending},
+		}, Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}
 }
 

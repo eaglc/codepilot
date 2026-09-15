@@ -64,6 +64,7 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	disableWorkflows := flags.Bool("disable-workflows", false, "disable starting new Workflows while preserving existing Workflow recovery")
 	disableSubagents := flags.Bool("disable-subagents", false, "disable new Plan exploration and serial multi-Agent delegation while preserving recovery")
 	disableParallelSubagents := flags.Bool("disable-parallel-subagents", false, "disable new parallel read-only child Agents while preserving recovery")
+	disableParallelWriteSubagents := flags.Bool("disable-parallel-write-subagents", false, "disable new parallel isolated-write child Agents while preserving recovery")
 	maxParallelAgents := flags.Int("max-parallel-agents", 8, "maximum child Agents running concurrently across Coding sessions")
 	if err := flags.Parse(arguments); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -92,25 +93,26 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	// Preserve the original reader so Bubble Tea can recognize an *os.File and
 	// use native Windows console input for arrows and other special keys.
 	options := app.Options{
-		WorkingDirectory:         workingDirectory,
-		ConfigDir:                strings.TrimSpace(*configDir),
-		StateDir:                 strings.TrimSpace(*stateDir),
-		ProviderProfile:          strings.TrimSpace(*providerProfile),
-		Model:                    strings.TrimSpace(*modelID),
-		Permission:               strings.TrimSpace(*permission),
-		SensitivePaths:           append([]string(nil), sensitivePaths...),
-		TrustWorkspace:           *trustWorkspace,
-		RelocateWorktree:         codingagent.WorktreeID(strings.TrimSpace(*relocateWorktree)),
-		SkipRelocation:           *skipRelocation,
-		DisableProductTurns:      *disableProductTurns,
-		DisablePlanMode:          *disablePlanMode,
-		DisablePlanSuggestions:   *disablePlanSuggestions,
-		DisableWorkflows:         *disableWorkflows,
-		DisableSubagents:         *disableSubagents,
-		DisableParallelSubagents: *disableParallelSubagents,
-		MaxParallelAgents:        *maxParallelAgents,
-		Input:                    stdin,
-		Output:                   stdout,
+		WorkingDirectory:              workingDirectory,
+		ConfigDir:                     strings.TrimSpace(*configDir),
+		StateDir:                      strings.TrimSpace(*stateDir),
+		ProviderProfile:               strings.TrimSpace(*providerProfile),
+		Model:                         strings.TrimSpace(*modelID),
+		Permission:                    strings.TrimSpace(*permission),
+		SensitivePaths:                append([]string(nil), sensitivePaths...),
+		TrustWorkspace:                *trustWorkspace,
+		RelocateWorktree:              codingagent.WorktreeID(strings.TrimSpace(*relocateWorktree)),
+		SkipRelocation:                *skipRelocation,
+		DisableProductTurns:           *disableProductTurns,
+		DisablePlanMode:               *disablePlanMode,
+		DisablePlanSuggestions:        *disablePlanSuggestions,
+		DisableWorkflows:              *disableWorkflows,
+		DisableSubagents:              *disableSubagents,
+		DisableParallelSubagents:      *disableParallelSubagents,
+		DisableParallelWriteSubagents: *disableParallelWriteSubagents,
+		MaxParallelAgents:             *maxParallelAgents,
+		Input:                         stdin,
+		Output:                        stdout,
 	}
 	application, err := app.New(ctx, options)
 	input := bufio.NewReader(stdin)

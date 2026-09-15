@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -103,7 +102,7 @@ func (t *delegatePlanExploreTool) Execute(ctx context.Context, call tool.Call, _
 		if child.Kind != ChildAgentPlanExplore {
 			continue
 		}
-		if child.ID != id || !reflect.DeepEqual(child.Task, task) {
+		if child.ID != id || !equalAgentTask(child.Task, task) {
 			return planExploreInvalid("This Plan turn already used its one read-only exploration child."), nil
 		}
 		if child.Status == ChildAgentCompleted || child.Status == ChildAgentFailed || child.Status == ChildAgentCancelled {
@@ -248,7 +247,7 @@ func (t *delegatePlanExploresTool) Execute(ctx context.Context, call tool.Call, 
 		id := PlanExploreChildAgentID(turn.ID, fmt.Sprintf("%s:%d", call.ID, index))
 		ids[index] = id
 		if child, ok := existing[id]; ok {
-			if !reflect.DeepEqual(child.Task, task) {
+			if !equalAgentTask(child.Task, task) {
 				return planExploreInvalid("A replayed parallel Plan exploration task conflicts with its durable child."), nil
 			}
 			delete(existing, id)

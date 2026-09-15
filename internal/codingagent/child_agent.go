@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -105,6 +104,7 @@ type ChildAgent struct {
 	Attempt         int                `json:"attempt"`
 	Status          ChildAgentStatus   `json:"status"`
 	Result          *AgentTaskResult   `json:"result,omitempty"`
+	ManagedWorktree *ManagedWorktree   `json:"managed_worktree,omitempty"`
 	Failure         string             `json:"failure,omitempty"`
 	Revision        uint64             `json:"revision"`
 	CreatedAt       time.Time          `json:"created_at"`
@@ -154,6 +154,18 @@ func CloneChildAgent(value ChildAgent) ChildAgent {
 		result.ArtifactRefs = append([]string(nil), value.Result.ArtifactRefs...)
 		result.Unresolved = append([]string(nil), value.Result.Unresolved...)
 		clone.Result = &result
+	}
+	if value.ManagedWorktree != nil {
+		managed := *value.ManagedWorktree
+		managed.BaseChangeSetIDs = append([]string(nil), value.ManagedWorktree.BaseChangeSetIDs...)
+		if value.ManagedWorktree.ChangeSet != nil {
+			change := *value.ManagedWorktree.ChangeSet
+			change.BaseChangeSetIDs = append([]string(nil), value.ManagedWorktree.ChangeSet.BaseChangeSetIDs...)
+			change.Files = append([]ChangeFile(nil), value.ManagedWorktree.ChangeSet.Files...)
+			change.Validation = append([]string(nil), value.ManagedWorktree.ChangeSet.Validation...)
+			managed.ChangeSet = &change
+		}
+		clone.ManagedWorktree = &managed
 	}
 	return clone
 }
@@ -211,6 +223,33 @@ func ValidateChildAgent(value ChildAgent) error {
 	if value.Result != nil {
 		if err := ValidateAgentTaskResult(*value.Result); err != nil {
 			return err
+		}
+	}
+	if value.ManagedWorktree != nil {
+		if value.Kind != ChildAgentWorkflowNode || value.Role != workflow.RoleImplement || value.Profile != CapabilityImplement {
+			return errors.New("managed worktree is valid only for a Workflow Implement child")
+		}
+		if err := validateManagedWorktree(*value.ManagedWorktree); err != nil {
+			return err
+		}
+		managedStatus := value.ManagedWorktree.Status
+		switch value.Status {
+		case ChildAgentCreating:
+			if managedStatus != ManagedWorktreePending {
+				return errors.New("creating isolated child requires a pending managed worktree")
+			}
+		case ChildAgentReady, ChildAgentRunning, ChildAgentAwaitingApproval:
+			if managedStatus != ManagedWorktreeReady {
+				return errors.New("active isolated child requires a ready managed worktree")
+			}
+		case ChildAgentCompleted:
+			if managedStatus != ManagedWorktreeCaptured && managedStatus != ManagedWorktreeCleanupPending && managedStatus != ManagedWorktreeCleaned {
+				return errors.New("completed isolated child requires a captured change set")
+			}
+		case ChildAgentFailed, ChildAgentCancelled:
+			if managedStatus != ManagedWorktreeRetained {
+				return errors.New("failed or cancelled isolated child must retain its managed worktree")
+			}
 		}
 	}
 	if len(value.Failure) > 4096 {
@@ -294,18 +333,89 @@ func ValidateChildAgentTransition(previous, next ChildAgent) error {
 	if err := ValidateChildAgent(next); err != nil {
 		return err
 	}
-	stable := previous.ID == next.ID && previous.Kind == next.Kind && previous.ParentSessionID == next.ParentSessionID && previous.ParentTurnID == next.ParentTurnID && previous.WorkflowID == next.WorkflowID && previous.NodeID == next.NodeID && previous.PlanID == next.PlanID && previous.PlanVersion == next.PlanVersion && previous.PlanDigest == next.PlanDigest && previous.Role == next.Role && previous.Profile == next.Profile && previous.PolicyVersion == next.PolicyVersion && reflect.DeepEqual(previous.Task, next.Task) && previous.AgentSessionID == next.AgentSessionID && previous.RunID == next.RunID && previous.Attempt == next.Attempt && previous.CreatedAt.Equal(next.CreatedAt)
+	stable := previous.ID == next.ID && previous.Kind == next.Kind && previous.ParentSessionID == next.ParentSessionID && previous.ParentTurnID == next.ParentTurnID && previous.WorkflowID == next.WorkflowID && previous.NodeID == next.NodeID && previous.PlanID == next.PlanID && previous.PlanVersion == next.PlanVersion && previous.PlanDigest == next.PlanDigest && previous.Role == next.Role && previous.Profile == next.Profile && previous.PolicyVersion == next.PolicyVersion && equalAgentTask(previous.Task, next.Task) && previous.AgentSessionID == next.AgentSessionID && previous.RunID == next.RunID && previous.Attempt == next.Attempt && previous.CreatedAt.Equal(next.CreatedAt)
 	if !stable || next.Revision != previous.Revision+1 || next.UpdatedAt.Before(previous.UpdatedAt) {
 		return errors.New("child Agent immutable identity changed or revision did not advance")
 	}
 	allowed := previous.Status == ChildAgentCreating && next.Status == ChildAgentReady ||
 		previous.Status == ChildAgentReady && (next.Status == ChildAgentRunning || next.Status == ChildAgentCancelled) ||
 		previous.Status == ChildAgentRunning && (next.Status == ChildAgentAwaitingApproval || next.Status == ChildAgentCompleted || next.Status == ChildAgentFailed || next.Status == ChildAgentCancelled) ||
-		previous.Status == ChildAgentAwaitingApproval && (next.Status == ChildAgentRunning || next.Status == ChildAgentCompleted || next.Status == ChildAgentFailed || next.Status == ChildAgentCancelled)
+		previous.Status == ChildAgentAwaitingApproval && (next.Status == ChildAgentRunning || next.Status == ChildAgentCompleted || next.Status == ChildAgentFailed || next.Status == ChildAgentCancelled) ||
+		previous.Status == ChildAgentCompleted && next.Status == ChildAgentCompleted && managedIntegrationTransition(previous.ManagedWorktree, next.ManagedWorktree)
 	if !allowed {
 		return fmt.Errorf("child Agent status cannot transition from %q to %q", previous.Status, next.Status)
 	}
+	if !managedChildTransition(previous, next) {
+		return errors.New("child Agent managed worktree transition is invalid")
+	}
 	return nil
+}
+
+func equalAgentTask(left, right AgentTask) bool {
+	if left.Goal != right.Goal || !equalStrings(left.ReadPaths, right.ReadPaths) || !equalStrings(left.WritePaths, right.WritePaths) || !equalStrings(left.AcceptanceCriteria, right.AcceptanceCriteria) || len(left.DependencyEvidence) != len(right.DependencyEvidence) {
+		return false
+	}
+	for index := range left.DependencyEvidence {
+		if left.DependencyEvidence[index].SourceID != right.DependencyEvidence[index].SourceID || left.DependencyEvidence[index].Summary != right.DependencyEvidence[index].Summary || !equalStrings(left.DependencyEvidence[index].ArtifactRefs, right.DependencyEvidence[index].ArtifactRefs) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func managedChildTransition(previous, next ChildAgent) bool {
+	if previous.ManagedWorktree == nil || next.ManagedWorktree == nil {
+		return previous.ManagedWorktree == nil && next.ManagedWorktree == nil
+	}
+	before, after := previous.ManagedWorktree, next.ManagedWorktree
+	if before.ID != after.ID || before.BaselineCommit != after.BaselineCommit {
+		return false
+	}
+	if before.Status == after.Status {
+		return equalManagedWorktree(*before, *after)
+	}
+	return before.Status == ManagedWorktreePending && after.Status == ManagedWorktreeReady ||
+		before.Status == ManagedWorktreeReady && (after.Status == ManagedWorktreeCaptured || after.Status == ManagedWorktreeRetained) ||
+		before.Status == ManagedWorktreeCaptured && after.Status == ManagedWorktreeCleanupPending ||
+		before.Status == ManagedWorktreeCleanupPending && after.Status == ManagedWorktreeCleaned
+}
+
+func equalManagedWorktree(left, right ManagedWorktree) bool {
+	if left.ID != right.ID || left.Root != right.Root || left.GitCommonDir != right.GitCommonDir || left.BaselineCommit != right.BaselineCommit || left.Status != right.Status || !equalStrings(left.BaseChangeSetIDs, right.BaseChangeSetIDs) || !left.PreparedAt.Equal(right.PreparedAt) || !left.CapturedAt.Equal(right.CapturedAt) || !left.CleanedAt.Equal(right.CleanedAt) {
+		return false
+	}
+	if left.ChangeSet == nil || right.ChangeSet == nil {
+		return left.ChangeSet == nil && right.ChangeSet == nil
+	}
+	return equalChangeSet(*left.ChangeSet, *right.ChangeSet)
+}
+
+func equalChangeSet(left, right ChangeSet) bool {
+	if left.Version != right.Version || left.ID != right.ID || left.ChildAgentID != right.ChildAgentID || left.WorkflowID != right.WorkflowID || left.NodeID != right.NodeID || left.BaselineCommit != right.BaselineCommit || left.Patch != right.Patch || left.PatchSHA256 != right.PatchSHA256 || !equalStrings(left.BaseChangeSetIDs, right.BaseChangeSetIDs) || !equalStrings(left.Validation, right.Validation) || !left.CreatedAt.Equal(right.CreatedAt) || !left.IntegratedAt.Equal(right.IntegratedAt) || len(left.Files) != len(right.Files) {
+		return false
+	}
+	for index := range left.Files {
+		if left.Files[index] != right.Files[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func managedIntegrationTransition(previous, next *ManagedWorktree) bool {
+	return previous != nil && next != nil && (previous.Status == ManagedWorktreeCaptured && next.Status == ManagedWorktreeCleanupPending || previous.Status == ManagedWorktreeCleanupPending && next.Status == ManagedWorktreeCleaned)
 }
 
 func validChildRoleProfile(role workflow.Role, profile CapabilityProfile) bool {

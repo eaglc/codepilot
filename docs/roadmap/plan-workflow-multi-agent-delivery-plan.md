@@ -190,7 +190,7 @@ Profile 是可信代码定义的白名单。模型只能从产品允许的角色
 
 在 P8 证明自动选择可靠之前，多 Agent 实施只从用户批准且明确展示分工的 Plan 启动；Plan 阶段的只读探索可以在 P5 后使用子 Agent，但不会因此创建执行 Workflow。
 
-### 5.1 当前实现状态（2026-09-13）
+### 5.1 当前实现状态（2026-09-15）
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
@@ -201,6 +201,7 @@ Profile 是可信代码定义的白名单。模型只能从产品允许的角色
 | P4 | 已完成 | 单 Agent 串行 Workflow、可信 Plan Compiler、append-only/CAS 状态机、节点范围、父级预算、失败策略、取消、恢复、Snapshot/Event/TUI 和阶段指标已交付。 |
 | P5 | 已完成 | 串行子 Agent、独立 Session/Run、版本化角色策略 Registry、结构化终态结果、父界面统一审批、主 Agent 汇总、预算/取消/恢复和降级策略已交付。 |
 | P6 | 验收中 | 并行只读 Workflow 与 Plan 探索、runnable 集合、全局/单 Workflow 配额、父级预算、取消、失败隔离、漂移检测、CAS 汇总和恢复已实现；本机功能门禁通过，等待支持 race 的环境完成最终验收。 |
+| P7 | 验收中 | 隔离并行 Implement、可信范围冲突矩阵、精确 Git 基线、内容寻址 ChangeSet、逐项 Diff 审批、串行 Integrate、组合 Validate/Review、生命周期恢复/清理和 TUI 投影已实现；本机全仓测试、vet 和发布构建通过，等待支持 race 的 CI 完成最终验收。 |
 
 P2 完成门禁：`go test ./... -count=1`、`go vet ./...`、`cmd/codepilot` 与 `cmd/releasecheck` 构建、`git diff --check -- README.md cmd internal docs` 均通过。评估基线位于 `internal/codingagent/prompt/testdata/plan_entry_eval.golden.json`，发布阈值为安全/高风险样本漏提示率 0、简单任务不必要提示率不高于 15%。
 
@@ -211,6 +212,10 @@ P4 覆盖 Direct 与 Workflow 策略选择、三节点依赖顺序、DAG/角色/
 P5 覆盖至少两个不同角色子 Agent 的串行执行、Plan 内单次只读 Explore 委派、独立 Agent Session/Run、父上下文结构化摘要、版本化角色 Prompt/工具/结果策略注册、角色与节点范围负向权限、父界面审批、父级剩余预算、取消传播、确定性子 Agent 身份与重启结果对账，以及失败后的重试、主 Agent 降级、重新规划和终止。Workflow Node 与 Child Agent 固定策略版本，已有任务恢复时不会静默切换到新版本。Direct 与普通 Plan 不自动创建子 Agent；关闭串行子 Agent 功能开关后仍可读取、取消和恢复已有对象，但不能创建新委派。P5 完成门禁：`go test ./... -count=1`、`go vet ./...`、`cmd/codepilot` 与 `cmd/releasecheck` 构建均通过。
 
 P6 已实现稳定顺序的 runnable 集合和最多两个节点的单 Workflow 并发波次；Plan 可显式委派 2–4 个独立只读 Explore 子任务。所有并行节点固定为 Explore/Validate/Review 子 Agent 且无写范围，进程级 semaphore 限制全局并发；Workflow 在启动前分配 Agent、Node、Run、Step、token、cost 和持续时间额度，每一波按剩余额度预留子 Run 上限并在终态事件中记入实际用量。并发结果经 Workflow revision/CAS 串行汇总，父取消广播到整批子 Agent，失败只阻塞依赖链，无关结果保留；每波汇总前复核 Plan WorkspaceRevision，相关漂移转为 `needs_replan`。确定性 Child ID 和恢复扫描避免重启后重复创建。新增 `--disable-parallel-subagents` 与 `--max-parallel-agents`，关闭新能力后仍保留已有对象恢复。P6 本机门禁已通过全仓测试；最终完成状态以 race 门禁通过为准。
+
+P7 已增加独立的 `workflow_multi_parallel_isolated_write` 策略和 `--disable-parallel-write-subagents` 功能门禁。可信 Plan Compiler 为每个 Implement 生成独立的主协调器 Integrate 节点；调度器按规范化读写范围、路径包含关系、未知范围和依赖关系决定并发，并确保 Integrate 单独串行。Implement 子 Agent 固定到 Plan 的 clean committed Git baseline，在 CodePilot 状态目录中的受管理 Worktree 运行；实际变更必须落在 WriteScope 内，并产出记录 baseline、base ChangeSet、文件 before/after digest、局部验证和内容寻址 patch 的稳定 Artifact。活动 Worktree 在审批前保持不变，Integrate 只接受节点绑定的 ChangeSet ID，重新校验 Artifact、HEAD、目标摘要和 patch 冲突，向用户展示实际 Diff，且禁止会话级授权。成功应用后以 captured → cleanup_pending → cleaned 的 durable 状态推进；失败、取消或范围越界保留隔离结果。所有集成完成后，在活动 Worktree 上执行独立的最终 Validate 和 Review。真实 Git/file-store E2E 覆盖两个独立写节点并发、两次精确审批、串行集成、幂等应用、清理后 Artifact 保留以及 Snapshot/TUI 可见性。
+
+P7 本机门禁已通过 `go test ./... -count=1`、`go vet ./...`、`go build ./cmd/codepilot ./cmd/releasecheck` 和差异格式检查。Windows 主机当前仅有 32 位 MinGW，无法为 `windows/amd64` 编译 Go race runtime；P6/P7 的最终完成状态仍以仓库 CI 的 race job 通过为准。
 
 ### 5.2 需求追踪
 

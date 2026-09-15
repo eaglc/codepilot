@@ -210,7 +210,7 @@ func validatePlanSubmission(value PlanSubmission) error {
 		if step.Role != "" && step.Role != workflow.RoleExplore && step.Role != workflow.RoleImplement && step.Role != workflow.RoleValidate && step.Role != workflow.RoleReview && step.Role != workflow.RoleIntegrate {
 			return fmt.Errorf("Coding plan step %q has unknown role %q", step.ID, step.Role)
 		}
-		if step.Role == workflow.RoleExplore && value.RecommendedStrategy != ExecutionWorkflowMultiSerial && value.RecommendedStrategy != ExecutionWorkflowMultiParallelReadOnly {
+		if step.Role == workflow.RoleExplore && value.RecommendedStrategy != ExecutionWorkflowMultiSerial && !parallelExecutionStrategy(value.RecommendedStrategy) {
 			return fmt.Errorf("Coding plan step %q can use Explore only with multi-Agent execution", step.ID)
 		}
 		if value.RecommendedStrategy == ExecutionWorkflowMultiParallelReadOnly {
@@ -220,6 +220,18 @@ func validatePlanSubmission(value PlanSubmission) error {
 			}
 			if role != workflow.RoleExplore && role != workflow.RoleValidate && role != workflow.RoleReview {
 				return fmt.Errorf("Coding plan step %q uses a write-capable role in parallel read-only execution", step.ID)
+			}
+		}
+		if value.RecommendedStrategy == ExecutionWorkflowMultiParallelIsolatedWrite && step.Role == workflow.RoleIntegrate {
+			return fmt.Errorf("Coding plan step %q cannot declare Integrate directly; the trusted compiler creates exact artifact integration nodes", step.ID)
+		}
+		if value.RecommendedStrategy == ExecutionWorkflowMultiParallelIsolatedWrite {
+			role := step.Role
+			if role == "" {
+				role = workflow.RoleImplement
+			}
+			if role == workflow.RoleImplement && len(step.Files) == 0 {
+				return fmt.Errorf("Coding plan step %q must declare an explicit write scope for isolated parallel implementation", step.ID)
 			}
 		}
 		if step.FailureAction != "" && step.FailureAction != workflow.FailureRetry && step.FailureAction != workflow.FailureBlock && step.FailureAction != workflow.FailureReplan && step.FailureAction != workflow.FailureTerminate && step.FailureAction != workflow.FailureFallbackMain {

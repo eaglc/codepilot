@@ -73,7 +73,7 @@ func NextAction(value Workflow) (Action, error) {
 	if value.Budget.UsedAgentSteps >= value.Budget.MaxAgentSteps {
 		return Action{Kind: ActionFailWorkflow, Reason: "workflow exhausted its Agent step budget"}, nil
 	}
-	if value.Strategy == StrategyMultiAgentParallelReadOnly && (value.Budget.UsedTotalTokens >= value.Budget.MaxTotalTokens || value.Budget.UsedCost >= value.Budget.MaxCost) {
+	if parallelStrategy(value.Strategy) && (value.Budget.UsedTotalTokens >= value.Budget.MaxTotalTokens || value.Budget.UsedCost >= value.Budget.MaxCost) {
 		return Action{Kind: ActionFailWorkflow, Reason: "workflow exhausted its Agent token or cost budget"}, nil
 	}
 	if totalAttempts(value) >= value.Budget.MaxRuns {
@@ -112,7 +112,7 @@ func RunnableNodes(value Workflow) ([]NodeID, error) {
 		return nil, nil
 	}
 	capacity := 1
-	if value.Strategy == StrategyMultiAgentParallelReadOnly {
+	if parallelStrategy(value.Strategy) {
 		capacity = value.Budget.MaxConcurrency - runningNodeCount(value)
 	}
 	if capacity <= 0 || totalAttempts(value) >= value.Budget.MaxRuns || value.Budget.UsedAgentSteps >= value.Budget.MaxAgentSteps {
@@ -122,7 +122,7 @@ func RunnableNodes(value Workflow) ([]NodeID, error) {
 	if capacity > remainingSteps {
 		capacity = remainingSteps
 	}
-	if value.Strategy == StrategyMultiAgentParallelReadOnly {
+	if parallelStrategy(value.Strategy) {
 		remainingTokens := value.Budget.MaxTotalTokens - value.Budget.UsedTotalTokens
 		if capacity > remainingTokens {
 			capacity = remainingTokens
@@ -139,12 +139,30 @@ func RunnableNodes(value Workflow) ([]NodeID, error) {
 		capacity = remainingRuns
 	}
 	result := make([]NodeID, 0, capacity)
+	selected := make([]Node, 0, capacity)
 	for _, node := range value.Nodes {
-		if node.Status == NodePending && dependenciesCompleted(value, node) {
-			result = append(result, node.ID)
-			if len(result) == capacity {
-				break
+		if node.Status != NodePending || !dependenciesCompleted(value, node) {
+			continue
+		}
+		if value.Strategy == StrategyMultiAgentParallelIsolatedWrite {
+			compatible := nodeCompatibleWithRunning(value, node)
+			for _, other := range selected {
+				compatible = compatible && NodesConcurrent(other, node)
 			}
+			if !compatible {
+				continue
+			}
+			if NodeExecutor(node) == ExecutorMain {
+				if len(result) == 0 && runningNodeCount(value) == 0 {
+					return []NodeID{node.ID}, nil
+				}
+				continue
+			}
+		}
+		result = append(result, node.ID)
+		selected = append(selected, node)
+		if len(result) == capacity {
+			break
 		}
 	}
 	return result, nil

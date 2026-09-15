@@ -465,20 +465,21 @@ func projectApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage) {
 		return
 	}
 	var payload struct {
-		Kind          string   `json:"kind"`
-		Version       int      `json:"version"`
-		Summary       string   `json:"summary"`
-		PlanID        string   `json:"plan_id"`
-		Command       string   `json:"command"`
-		Patch         string   `json:"patch"`
-		Files         []string `json:"files"`
-		Path          string   `json:"path"`
-		ToolName      string   `json:"tool_name"`
-		Language      string   `json:"language"`
-		Program       string   `json:"program"`
-		Arguments     []string `json:"arguments"`
-		GrantToolName string   `json:"grant_tool_name"`
-		RequestedTool string   `json:"requested_tool"`
+		Kind              string   `json:"kind"`
+		Version           int      `json:"version"`
+		Summary           string   `json:"summary"`
+		PlanID            string   `json:"plan_id"`
+		Command           string   `json:"command"`
+		Patch             string   `json:"patch"`
+		Files             []string `json:"files"`
+		Path              string   `json:"path"`
+		ToolName          string   `json:"tool_name"`
+		Language          string   `json:"language"`
+		Program           string   `json:"program"`
+		Arguments         []string `json:"arguments"`
+		GrantToolName     string   `json:"grant_tool_name"`
+		RequestedTool     string   `json:"requested_tool"`
+		AllowSessionGrant *bool    `json:"allow_session_grant"`
 	}
 	if json.Unmarshal(raw, &payload) != nil {
 		return
@@ -534,7 +535,7 @@ func projectApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage) {
 		Kind: "patch", Summary: target.Summary, Diff: InlineDiff{Text: patch, Files: files},
 		AddedLines: added, DeletedLines: deleted,
 	}
-	target.CanGrantSession = len(files) != 0
+	target.CanGrantSession = len(files) != 0 && (payload.AllowSessionGrant == nil || *payload.AllowSessionGrant)
 }
 
 func diffLineCounts(patch string) (added, deleted int) {

@@ -41,6 +41,9 @@ type FeatureFlags struct {
 	Workflows         bool
 	Subagents         bool
 	ParallelSubagents bool
+	// ParallelWriteSubagents is a separate experimental gate because isolated
+	// write generation and active-worktree integration have higher risk.
+	ParallelWriteSubagents bool
 }
 
 // DefaultFeatureFlags returns the current stable product defaults.
@@ -50,20 +53,21 @@ func DefaultFeatureFlags() FeatureFlags {
 
 // ToolScope contains immutable trusted Coding facts captured before model-controlled execution.
 type ToolScope struct {
-	Profile          CapabilityProfile
-	PolicyVersion    uint32
-	TurnID           TurnID
-	RunID            RunID
-	NodeID           NodeID
-	SessionID        SessionID
-	WorkspaceID      WorkspaceID
-	WorktreeID       WorktreeID
-	WorktreeRoot     string
-	PermissionMode   PermissionMode
-	PermissionGrants []PermissionGrant
-	SensitivePaths   []string
-	ReadScope        []string
-	WriteScope       []string
+	Profile            CapabilityProfile
+	PolicyVersion      uint32
+	TurnID             TurnID
+	RunID              RunID
+	NodeID             NodeID
+	SessionID          SessionID
+	WorkspaceID        WorkspaceID
+	WorktreeID         WorktreeID
+	WorktreeRoot       string
+	PermissionMode     PermissionMode
+	PermissionGrants   []PermissionGrant
+	SensitivePaths     []string
+	ReadScope          []string
+	WriteScope         []string
+	TrustedIntegration bool
 }
 
 // ToolFactory creates the exact Coding tool set available to one turn.
@@ -101,20 +105,21 @@ type UntrustedContextBuilder interface {
 
 // Dependencies contains concrete capabilities required by Service.
 type Dependencies struct {
-	Sessions      SessionRepository
-	Turns         TurnRepository
-	Plans         PlanRepository
-	Workflows     workflow.Repository
-	Children      ChildAgentRepository
-	AgentSessions agentsession.Repository
-	Worktrees     WorktreeReader
-	Workspaces    WorkspaceController
-	Agent         AgentRunner
-	Tools         ToolFactory
-	Prompts       PromptBuilder
-	Events        EventSink
-	Providers     ProviderManager
-	Limits        agent.RunLimits
+	Sessions         SessionRepository
+	Turns            TurnRepository
+	Plans            PlanRepository
+	Workflows        workflow.Repository
+	Children         ChildAgentRepository
+	ManagedWorktrees ManagedWorktreeManager
+	AgentSessions    agentsession.Repository
+	Worktrees        WorktreeReader
+	Workspaces       WorkspaceController
+	Agent            AgentRunner
+	Tools            ToolFactory
+	Prompts          PromptBuilder
+	Events           EventSink
+	Providers        ProviderManager
+	Limits           agent.RunLimits
 	// MaxParallelAgents bounds child Agent executions across all sessions owned
 	// by this Service. Zero selects the product default.
 	MaxParallelAgents int
@@ -621,11 +626,17 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 		if isWorkflowStrategy(selected) && (!s.features.Workflows || s.deps.Workflows == nil) {
 			return TurnResult{}, errors.New("resume Coding Agent turn: Workflow execution is disabled")
 		}
-		if (selected == ExecutionWorkflowMultiSerial || selected == ExecutionWorkflowMultiParallelReadOnly) && (!s.features.Subagents || s.deps.Children == nil) {
+		if (selected == ExecutionWorkflowMultiSerial || parallelExecutionStrategy(selected)) && (!s.features.Subagents || s.deps.Children == nil) {
 			return TurnResult{}, errors.New("resume Coding Agent turn: multi-Agent execution is disabled")
 		}
 		if selected == ExecutionWorkflowMultiParallelReadOnly && !s.features.ParallelSubagents {
 			return TurnResult{}, errors.New("resume Coding Agent turn: parallel read-only execution is disabled")
+		}
+		if selected == ExecutionWorkflowMultiParallelIsolatedWrite && (!s.features.ParallelWriteSubagents || s.deps.ManagedWorktrees == nil) {
+			return TurnResult{}, errors.New("resume Coding Agent turn: parallel isolated-write execution is disabled")
+		}
+		if selected == ExecutionWorkflowMultiParallelIsolatedWrite && (reviewedPlan.WorkspaceRevision.GitHead == "" || len(reviewedPlan.WorkspaceRevision.ChangedPaths) != 0) {
+			return TurnResult{}, errors.New("resume Coding Agent turn: parallel isolated-write execution requires a clean committed Plan baseline")
 		}
 		if turn.Strategy != selected {
 			expected := turn.Revision
@@ -996,6 +1007,14 @@ func (s *Service) projectChildAgentSnapshot(ctx context.Context, snapshot *Snaps
 				value.Artifacts = append([]string(nil), child.Result.ArtifactRefs...)
 				value.Unresolved = append([]string(nil), child.Result.Unresolved...)
 			}
+			if child.ManagedWorktree != nil {
+				value.ManagedStatus = child.ManagedWorktree.Status
+				if child.ManagedWorktree.ChangeSet != nil {
+					change := child.ManagedWorktree.ChangeSet
+					value.ChangeSetID, value.PatchArtifact, value.IntegratedAt = change.ID, change.Patch.ID, change.IntegratedAt
+					value.ChangeFiles = changeSetPaths(*change)
+				}
+			}
 			snapshot.ChildAgents = append(snapshot.ChildAgents, value)
 			durable, loadErr := s.deps.AgentSessions.Load(ctx, child.AgentSessionID)
 			if errors.Is(loadErr, agentsession.ErrNotFound) && child.Status == ChildAgentCreating {
@@ -1107,6 +1126,8 @@ func (s *Service) projectWorkflowSnapshot(ctx context.Context, snapshot *Snapsho
 		strategy = ExecutionWorkflowMultiSerial
 	} else if durable.Strategy == workflow.StrategyMultiAgentParallelReadOnly {
 		strategy = ExecutionWorkflowMultiParallelReadOnly
+	} else if durable.Strategy == workflow.StrategyMultiAgentParallelIsolatedWrite {
+		strategy = ExecutionWorkflowMultiParallelIsolatedWrite
 	}
 	value := WorkflowSnapshot{
 		ID: string(durable.ID), TurnID: selected.ID, PlanID: selected.PlanID, PlanVersion: durable.Plan.Version, PlanDigest: durable.Plan.Digest,

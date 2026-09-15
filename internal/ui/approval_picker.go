@@ -15,6 +15,8 @@ const (
 	approvalAllowOnce approvalChoiceKind = iota
 	approvalAllowWorkflow
 	approvalAllowMultiWorkflow
+	approvalAllowParallelWorkflow
+	approvalAllowParallelWriteWorkflow
 	approvalAllowDirect
 	approvalAllowSession
 	approvalDeny
@@ -51,6 +53,18 @@ func (m *Model) approvalChoices(pending codingagent.PendingInterrupt) []approval
 		if pending.PlanCompletion == codingagent.PlanCompletionExecute && pending.PlanStrategy == codingagent.ExecutionWorkflowMultiSerial {
 			choices = []approvalChoice{
 				{kind: approvalAllowMultiWorkflow, label: "Approve with serial multi-Agent Workflow"},
+				{kind: approvalAllowDirect, label: "Approve and execute Direct with one Agent"},
+			}
+		}
+		if pending.PlanCompletion == codingagent.PlanCompletionExecute && pending.PlanStrategy == codingagent.ExecutionWorkflowMultiParallelReadOnly {
+			choices = []approvalChoice{
+				{kind: approvalAllowParallelWorkflow, label: "Approve with parallel read-only multi-Agent Workflow"},
+				{kind: approvalAllowDirect, label: "Approve and execute Direct with one Agent"},
+			}
+		}
+		if pending.PlanCompletion == codingagent.PlanCompletionExecute && pending.PlanStrategy == codingagent.ExecutionWorkflowMultiParallelIsolatedWrite {
+			choices = []approvalChoice{
+				{kind: approvalAllowParallelWriteWorkflow, label: "Approve with isolated parallel-write multi-Agent Workflow"},
 				{kind: approvalAllowDirect, label: "Approve and execute Direct with one Agent"},
 			}
 		}
@@ -151,6 +165,12 @@ func (m *Model) applyApprovalChoice(pending codingagent.PendingInterrupt, choice
 	case approvalAllowMultiWorkflow:
 		m.status = "Starting serial multi-Agent Workflow..."
 		return m.resumeWithStrategy(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce, codingagent.ExecutionWorkflowMultiSerial)
+	case approvalAllowParallelWorkflow:
+		m.status = "Starting parallel read-only multi-Agent Workflow..."
+		return m.resumeWithStrategy(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce, codingagent.ExecutionWorkflowMultiParallelReadOnly)
+	case approvalAllowParallelWriteWorkflow:
+		m.status = "Starting isolated parallel-write multi-Agent Workflow..."
+		return m.resumeWithStrategy(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce, codingagent.ExecutionWorkflowMultiParallelIsolatedWrite)
 	case approvalAllowDirect:
 		m.status = "Executing approved Plan directly..."
 		return m.resumeWithStrategy(pending, codingagent.ResolutionApproved, codingagent.PermissionGrantOnce, codingagent.ExecutionSingle)

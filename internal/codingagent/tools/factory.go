@@ -242,6 +242,18 @@ func (f *Factory) CreateTools(ctx context.Context, scope codingagent.ToolScope) 
 		}
 		executables = bounded
 	}
+	if scope.TrustedIntegration {
+		bounded := executables[:0]
+		for _, executable := range executables {
+			switch executable.Definition().Name {
+			case "apply_patch", "create_file", "edit_file", "replace_file":
+				continue
+			default:
+				bounded = append(bounded, executable)
+			}
+		}
+		executables = bounded
+	}
 	for index := range executables {
 		if scope.NodeID != "" || roleProfile && roleDefinition.Tools.NodeScoped {
 			executables[index] = withNodeScopeBoundary(executables[index], scope.ReadScope, scope.WriteScope)
