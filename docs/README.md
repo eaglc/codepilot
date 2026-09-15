@@ -16,6 +16,7 @@
 
 - [产品补全路线图](roadmap/product-completion-roadmap.md)：当前产品实现状态、已完成阶段和发布前剩余事项。
 - [Plan、Workflow 与多 Agent 可持续交付方案](roadmap/plan-workflow-multi-agent-delivery-plan.md)：依据产品需求基线制定的分阶段设计、具体改造步骤、设计原因和验收门槛。
+- [下一阶段：产品体验与扩展能力路线图](roadmap/product-experience-and-extensibility-roadmap.md)：在核心 Agent、Plan、Workflow、上下文和安全闭环完成后，推进指令可见性、Skills、任务工作台与受控扩展生态。
 
 ### 设计
 
