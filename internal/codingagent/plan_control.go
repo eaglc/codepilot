@@ -20,24 +20,24 @@ import (
 const exitPlanModeToolName = "exit_plan_mode"
 
 type exitPlanModeTool struct {
-	plans        PlanRepository
-	turns        TurnRepository
-	turnID       TurnID
-	worktreeID   WorktreeID
-	worktreeRoot string
-	workflows    bool
-	subagents    bool
+	plans          PlanRepository
+	turns          TurnRepository
+	turnID         TurnID
+	worktreeID     WorktreeID
+	worktreeRoot   string
+	strategyPolicy strategyPolicy
 }
 
 type planApprovalPayload struct {
-	Kind           string             `json:"kind"`
-	Version        int                `json:"version"`
-	PlanID         PlanID             `json:"plan_id"`
-	Revision       uint64             `json:"plan_version"`
-	Digest         string             `json:"digest"`
-	Summary        string             `json:"summary"`
-	CompletionMode PlanCompletionMode `json:"completion_mode"`
-	Strategy       ExecutionStrategy  `json:"recommended_strategy"`
+	Kind           string                  `json:"kind"`
+	Version        int                     `json:"version"`
+	PlanID         PlanID                  `json:"plan_id"`
+	Revision       uint64                  `json:"plan_version"`
+	Digest         string                  `json:"digest"`
+	Summary        string                  `json:"summary"`
+	CompletionMode PlanCompletionMode      `json:"completion_mode"`
+	Strategy       ExecutionStrategy       `json:"recommended_strategy"`
+	Recommendation *StrategyRecommendation `json:"strategy_recommendation,omitempty"`
 }
 
 func (*exitPlanModeTool) Definition() llm.ToolDefinition {
@@ -74,12 +74,6 @@ func (t *exitPlanModeTool) Execute(ctx context.Context, call tool.Call, _ tool.P
 	if err := validatePlanSubmission(submission); err != nil {
 		return planInvalidResult(err.Error()), nil
 	}
-	if submission.RecommendedStrategy == ExecutionWorkflowSingle && !t.workflows {
-		return planInvalidResult("Single-Agent Workflow execution is currently disabled; recommend Direct single-Agent execution."), nil
-	}
-	if submission.RecommendedStrategy == ExecutionWorkflowMultiSerial && (!t.workflows || !t.subagents) {
-		return planInvalidResult("Serial multi-Agent Workflow execution is currently disabled; recommend Direct or single-Agent Workflow execution."), nil
-	}
 	turn, err := t.turns.LoadTurn(ctx, t.turnID)
 	if err != nil {
 		return tool.Result{}, fmt.Errorf("submit Coding plan: load Product Turn: %w", err)
@@ -107,6 +101,7 @@ func (t *exitPlanModeTool) Execute(ctx context.Context, call tool.Call, _ tool.P
 			return tool.Result{}, err
 		}
 	}
+	recommendedStrategy, recommendation := recommendExecutionStrategy(submission, workspaceRevision, t.strategyPolicy)
 	planID := deterministicPlanID(turn.ID)
 	if turn.PlanVersion == ^uint64(0) {
 		return planInvalidResult("The Plan revision limit has been reached."), nil
@@ -117,7 +112,7 @@ func (t *exitPlanModeTool) Execute(ctx context.Context, call tool.Call, _ tool.P
 		ID: planID, TurnID: turn.ID, Version: version, Goal: submission.Goal, Scope: submission.Scope,
 		Findings: submission.Findings, Assumptions: submission.Assumptions, Risks: submission.Risks,
 		Steps: submission.Steps, AcceptanceCriteria: submission.AcceptanceCriteria,
-		RecommendedStrategy: submission.RecommendedStrategy, WorkspaceRelevant: submission.WorkspaceRelevant,
+		RecommendedStrategy: recommendedStrategy, StrategyRecommendation: &recommendation, WorkspaceRelevant: submission.WorkspaceRelevant,
 		CompletionMode: submission.CompletionMode, WorkspaceRevision: workspaceRevision, CreatedAt: now,
 	}
 	value.Digest, err = ComputePlanDigest(value)
@@ -162,6 +157,7 @@ func planApprovalInterruptResult(value Plan) tool.Result {
 		Digest: value.Digest, Summary: "Review Plan v" + fmt.Sprint(value.Version) + ": " + value.Goal,
 		CompletionMode: value.CompletionMode,
 		Strategy:       value.RecommendedStrategy,
+		Recommendation: value.StrategyRecommendation,
 	}
 	encoded, _ := json.Marshal(payload)
 	return tool.Result{
@@ -178,7 +174,7 @@ func (t *exitPlanModeTool) Resume(ctx context.Context, _ tool.Call, interrupt to
 		return tool.Result{}, errors.New("resume Coding plan approval: durable approval payload is invalid")
 	}
 	normalizePlanApprovalPayload(&payload)
-	if payload.Kind != "coding_plan_approval_v1" || payload.Version != 1 || payload.PlanID == "" || payload.Revision == 0 || !isHexDigest(payload.Digest, 64, 64) || !validExecutionStrategy(payload.Strategy) {
+	if payload.Kind != "coding_plan_approval_v1" || payload.Version != 1 || payload.PlanID == "" || payload.Revision == 0 || !isHexDigest(payload.Digest, 64, 64) || !validExecutionStrategy(payload.Strategy) || payload.Recommendation != nil && validateStrategyRecommendation(*payload.Recommendation, payload.Strategy) != nil {
 		return tool.Result{}, errors.New("resume Coding plan approval: durable approval payload is invalid")
 	}
 	turn, err := t.turns.LoadTurn(ctx, t.turnID)
@@ -250,10 +246,14 @@ func planApprovalInterruptID(value Plan) string {
 }
 
 func planSubmissionFromPlan(value Plan) PlanSubmission {
+	strategy := value.RecommendedStrategy
+	if value.StrategyRecommendation != nil {
+		strategy = value.StrategyRecommendation.ProposedStrategy
+	}
 	return PlanSubmission{
 		Goal: value.Goal, Scope: value.Scope, Findings: value.Findings, Assumptions: value.Assumptions,
 		Risks: value.Risks, Steps: value.Steps, AcceptanceCriteria: value.AcceptanceCriteria,
-		RecommendedStrategy: value.RecommendedStrategy, WorkspaceRelevant: value.WorkspaceRelevant,
+		RecommendedStrategy: strategy, WorkspaceRelevant: value.WorkspaceRelevant,
 		CompletionMode: value.CompletionMode,
 	}
 }

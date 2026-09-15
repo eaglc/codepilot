@@ -202,6 +202,7 @@ Profile 是可信代码定义的白名单。模型只能从产品允许的角色
 | P5 | 已完成 | 串行子 Agent、独立 Session/Run、版本化角色策略 Registry、结构化终态结果、父界面统一审批、主 Agent 汇总、预算/取消/恢复和降级策略已交付。 |
 | P6 | 验收中 | 并行只读 Workflow 与 Plan 探索、runnable 集合、全局/单 Workflow 配额、父级预算、取消、失败隔离、漂移检测、CAS 汇总和恢复已实现；本机功能门禁通过，等待支持 race 的环境完成最终验收。 |
 | P7 | 验收中 | 隔离并行 Implement、可信范围冲突矩阵、精确 Git 基线、内容寻址 ChangeSet、逐项 Diff 审批、串行 Integrate、组合 Validate/Review、生命周期恢复/清理和 TUI 投影已实现；本机全仓测试、vet 和发布构建通过，等待支持 race 的 CI 完成最终验收。 |
+| P8 | 验收中 | 版本化可信策略评估、可解释推荐、用户单 Agent 偏好、功能/平台/资源降级、推荐与选择指标以及按策略归集的质量/耗时/成本指标已实现；本机全仓测试、vet 和发布构建通过，等待三平台 CI/race 最终验收。 |
 
 P2 完成门禁：`go test ./... -count=1`、`go vet ./...`、`cmd/codepilot` 与 `cmd/releasecheck` 构建、`git diff --check -- README.md cmd internal docs` 均通过。评估基线位于 `internal/codingagent/prompt/testdata/plan_entry_eval.golden.json`，发布阈值为安全/高风险样本漏提示率 0、简单任务不必要提示率不高于 15%。
 
@@ -216,6 +217,10 @@ P6 已实现稳定顺序的 runnable 集合和最多两个节点的单 Workflow 
 P7 已增加独立的 `workflow_multi_parallel_isolated_write` 策略和 `--disable-parallel-write-subagents` 功能门禁。可信 Plan Compiler 为每个 Implement 生成独立的主协调器 Integrate 节点；调度器按规范化读写范围、路径包含关系、未知范围和依赖关系决定并发，并确保 Integrate 单独串行。Implement 子 Agent 固定到 Plan 的 clean committed Git baseline，在 CodePilot 状态目录中的受管理 Worktree 运行；实际变更必须落在 WriteScope 内，并产出记录 baseline、base ChangeSet、文件 before/after digest、局部验证和内容寻址 patch 的稳定 Artifact。活动 Worktree 在审批前保持不变，Integrate 只接受节点绑定的 ChangeSet ID，重新校验 Artifact、HEAD、目标摘要和 patch 冲突，向用户展示实际 Diff，且禁止会话级授权。成功应用后以 captured → cleanup_pending → cleaned 的 durable 状态推进；失败、取消或范围越界保留隔离结果。所有集成完成后，在活动 Worktree 上执行独立的最终 Validate 和 Review。真实 Git/file-store E2E 覆盖两个独立写节点并发、两次精确审批、串行集成、幂等应用、清理后 Artifact 保留以及 Snapshot/TUI 可见性。
 
 P7 本机门禁已通过 `go test ./... -count=1`、`go vet ./...`、`go build ./cmd/codepilot ./cmd/releasecheck` 和差异格式检查。Windows 主机当前仅有 32 位 MinGW，无法为 `windows/amd64` 编译 Go race runtime；P6/P7 的最终完成状态仍以仓库 CI 的 race job 通过为准。
+
+P8 将模型在 Plan 中填写的策略降为“提议”，由 `codingagent` 的版本化可信策略政策产生最终推荐。政策使用依赖关系和 P7 路径冲突矩阵识别真正独立的工作流，并结合 Workflow/子 Agent/并行读/并行写功能开关、clean committed Git baseline、全局并发上限和 `--prefer-single-agent` 偏好做确定性降级。不可变 Plan 同时保存提议、推荐、reason code、简短说明、预计 Agent 数、独立工作流和评估集版本；旧 Plan 不含该可选字段时仍保持原摘要可验证。TUI 在批准前展示这些信息并始终提供 Direct 单 Agent 选项。
+
+P8 的维护评估基线位于 `internal/codingagent/testdata/execution_strategy_eval.golden.json`，首版发布阈值要求简单任务多 Agent 推荐率为 0、不安全并行推荐率为 0、推荐 Agent 数和资源放大均不超过 4。用例覆盖局部修复、依赖型 Workflow、串行角色隔离、并行只读、独立写、重叠写、dirty baseline、功能关闭和单 Agent 偏好。Snapshot 额外记录推荐/选择/退回单 Agent比例，并按实际选择策略归集完成、失败、取消、Run、重试、replan、漂移、耗时、token 和成本，支持连续版本对照。仓库现有 CI 已在 Windows、Linux、macOS 运行全量原生测试和构建，并在 Linux 执行核心 race 门禁；P8 完成状态仍以这些远端门禁通过为准。
 
 ### 5.2 需求追踪
 

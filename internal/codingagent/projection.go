@@ -129,6 +129,13 @@ func projectPlanApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage)
 	target.PlanDigest = payload.Digest
 	target.PlanCompletion = payload.CompletionMode
 	target.PlanStrategy = payload.Strategy
+	if payload.Recommendation != nil {
+		target.PlanRecommendation = *payload.Recommendation
+		target.PlanRecommendation.Summary = boundedUTF8(redactSensitiveText(target.PlanRecommendation.Summary), 2048)
+		for index := range target.PlanRecommendation.Workstreams {
+			target.PlanRecommendation.Workstreams[index] = boundedUTF8(redactSensitiveText(target.PlanRecommendation.Workstreams[index]), 2048)
+		}
+	}
 }
 
 func projectPlanReplanApprovalInterrupt(target *PendingInterrupt, raw json.RawMessage) {
@@ -225,6 +232,7 @@ func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, la
 	}
 	snapshot.Metrics.ByPhase = projectPhaseMetrics(durable, lane, turns)
 	snapshot.Metrics.Workflow = projectWorkflowMetrics(durable, turns)
+	snapshot.Metrics.Strategy.Outcomes = projectStrategyOutcomeMetrics(durable, turns)
 	if snapshot.Metrics.LatestTurnID != "" {
 		steps := 0
 		for _, turn := range turns {
@@ -239,6 +247,92 @@ func ProjectSnapshotWithTurns(product Session, durable agentsession.Snapshot, la
 		snapshot.Metrics.Steps = steps
 	}
 	return snapshot, nil
+}
+
+func projectStrategyOutcomeMetrics(durable agentsession.Snapshot, turns []Turn) []StrategyOutcomeMetrics {
+	byStrategy := make(map[ExecutionStrategy]*StrategyOutcomeMetrics)
+	runStrategies := make(map[agentsession.RunID]ExecutionStrategy)
+	for _, turn := range turns {
+		metric := byStrategy[turn.Strategy]
+		if metric == nil {
+			metric = &StrategyOutcomeMetrics{Strategy: turn.Strategy}
+			byStrategy[turn.Strategy] = metric
+		}
+		metric.Turns++
+		switch turn.Status {
+		case TurnCompleted:
+			metric.CompletedTurns++
+		case TurnFailed:
+			metric.FailedTurns++
+		case TurnCancelled:
+			metric.CancelledTurns++
+		}
+		metric.Replans += int(turn.PlanReplanCount)
+		metric.WorkspaceDrifts += int(turn.WorkspaceDriftCount)
+		finish := turn.CompletedAt
+		if finish.IsZero() {
+			finish = turn.UpdatedAt
+		}
+		if !turn.CreatedAt.IsZero() && !finish.IsZero() && !finish.Before(turn.CreatedAt) {
+			metric.Elapsed += finish.Sub(turn.CreatedAt)
+		}
+		nodeRuns := make(map[NodeID]int)
+		for _, binding := range turn.Runs {
+			metric.Runs++
+			metric.Steps += binding.Steps
+			if binding.Status == RunBindingFailed {
+				metric.FailedRuns++
+			}
+			if binding.NodeID != "" {
+				nodeRuns[binding.NodeID]++
+			}
+			runStrategies[binding.RunID] = turn.Strategy
+		}
+		for _, count := range nodeRuns {
+			if count > 1 {
+				metric.Retries += count - 1
+			}
+		}
+	}
+	for _, record := range durable.Records {
+		strategy, found := runStrategies[record.RunID]
+		if !found || record.Type != agentsession.RecordUsage || record.Usage == nil {
+			continue
+		}
+		metric := byStrategy[strategy]
+		total := record.Usage.TotalTokens
+		if total <= 0 {
+			total = record.Usage.InputTokens + record.Usage.OutputTokens
+		}
+		metric.TotalTokens += max(0, total)
+		if record.Usage.Cost > 0 {
+			metric.Cost += record.Usage.Cost
+		}
+	}
+	order := []ExecutionStrategy{ExecutionSingle, ExecutionWorkflowSingle, ExecutionWorkflowMultiSerial, ExecutionWorkflowMultiParallelReadOnly, ExecutionWorkflowMultiParallelIsolatedWrite}
+	result := make([]StrategyOutcomeMetrics, 0, len(byStrategy))
+	for _, strategy := range order {
+		if metric := byStrategy[strategy]; metric != nil {
+			result = append(result, *metric)
+		}
+	}
+	return result
+}
+
+func addStrategyOutcomeUsage(metrics *StrategyMetrics, strategy ExecutionStrategy, tokens int, cost float64) {
+	if metrics == nil {
+		return
+	}
+	for index := range metrics.Outcomes {
+		if metrics.Outcomes[index].Strategy != strategy {
+			continue
+		}
+		metrics.Outcomes[index].TotalTokens += max(0, tokens)
+		if cost > 0 {
+			metrics.Outcomes[index].Cost += cost
+		}
+		return
+	}
 }
 
 func projectWorkflowMetrics(durable agentsession.Snapshot, turns []Turn) WorkflowMetrics {

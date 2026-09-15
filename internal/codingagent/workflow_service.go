@@ -20,7 +20,7 @@ func (s *Service) beginWorkflowLocked(ctx context.Context, product Session, turn
 	if err != nil || plan.Digest != turn.PlanDigest {
 		return TurnResult{}, errors.New("start Coding workflow: exact approved Plan is unavailable")
 	}
-	compiled, err := CompilePlanWorkflowWithRegistry(plan, time.Now().UTC(), s.deps.Roles)
+	compiled, err := compilePlanWorkflowWithStrategy(plan, turn.Strategy, time.Now().UTC(), s.deps.Roles)
 	if err != nil {
 		return TurnResult{}, err
 	}

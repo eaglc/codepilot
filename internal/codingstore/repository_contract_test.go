@@ -126,6 +126,12 @@ func testRepositoryContract(t *testing.T, repository repository) {
 		Findings: []string{"Product Turn exists."}, Risks: []string{"Keep write approval separate."},
 		Steps:              []codingagent.PlanStep{{ID: "implement", Goal: "Implement the change.", Files: []string{"internal/codingagent/plan.go"}, Validation: []string{"Run tests."}}},
 		AcceptanceCriteria: []string{"Tests pass."}, RecommendedStrategy: codingagent.ExecutionSingle,
+		StrategyRecommendation: &codingagent.StrategyRecommendation{
+			Version: codingagent.StrategyRecommendationVersion, PolicyVersion: 1, EvaluationSet: codingagent.StrategyEvaluationSetVersion,
+			ProposedStrategy: codingagent.ExecutionSingle, SelectedStrategy: codingagent.ExecutionSingle,
+			ReasonCodes: []codingagent.StrategyReasonCode{codingagent.StrategyReasonDirectDefault}, Summary: "Direct execution has the lowest overhead.",
+			EstimatedAgents: 1, EstimatedConcurrency: 1, IndependentStreams: 1, AutoEligible: true,
+		},
 		WorkspaceRelevant: true, CompletionMode: codingagent.PlanCompletionExecute,
 		WorkspaceRevision: codingagent.WorkspaceRevision{
 			Version: 2, WorktreeID: worktree.ID, IdentityDigest: strings.Repeat("a", 64), StatusDigest: strings.Repeat("b", 64), DiffDigest: strings.Repeat("c", 64),
@@ -137,8 +143,13 @@ func testRepositoryContract(t *testing.T, repository repository) {
 		t.Fatalf("CreatePlanVersion: %v", err)
 	}
 	loadedPlan, err := repository.LoadPlan(ctx, plan.ID, plan.Version)
-	if err != nil || loadedPlan.Digest != plan.Digest {
+	if err != nil || loadedPlan.Digest != plan.Digest || loadedPlan.StrategyRecommendation == nil || loadedPlan.StrategyRecommendation.SelectedStrategy != codingagent.ExecutionSingle {
 		t.Fatalf("LoadPlan = %#v, %v", loadedPlan, err)
+	}
+	loadedPlan.StrategyRecommendation.ReasonCodes[0] = codingagent.StrategyReasonWorkflowDisabled
+	reloadedPlan, reloadErr := repository.LoadPlan(ctx, plan.ID, plan.Version)
+	if reloadErr != nil || reloadedPlan.StrategyRecommendation.ReasonCodes[0] != codingagent.StrategyReasonDirectDefault {
+		t.Fatalf("Plan recommendation was not deeply cloned: %#v, %v", reloadedPlan.StrategyRecommendation, reloadErr)
 	}
 	secondPlan := plan
 	secondPlan.Version = 2

@@ -169,6 +169,12 @@ func TestP7ParallelIsolatedWritesIntegrateExactArtifactsAndFinishCombinedReview(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if snapshot.ActivePlan == nil || snapshot.ActivePlan.StrategyRecommendation.Version != codingagent.StrategyRecommendationVersion || snapshot.ActivePlan.StrategyRecommendation.IndependentStreams != 2 || snapshot.ActivePlan.StrategyRecommendation.EstimatedAgents != 4 || snapshot.ActivePlan.StrategyRecommendation.EstimatedConcurrency != 2 || snapshot.Metrics.Strategy.Recommendations != 1 || snapshot.Metrics.Strategy.MultiAgentRecommendations != 1 || snapshot.Metrics.Strategy.ApprovedSelections != 1 || snapshot.Metrics.Strategy.SelectedMultiAgent != 1 {
+		t.Fatalf("P8 recommendation/selection projection = plan %#v metrics %#v", snapshot.ActivePlan, snapshot.Metrics.Strategy)
+	}
+	if len(snapshot.Metrics.Strategy.Outcomes) != 1 || snapshot.Metrics.Strategy.Outcomes[0].Strategy != codingagent.ExecutionWorkflowMultiParallelIsolatedWrite || snapshot.Metrics.Strategy.Outcomes[0].CompletedTurns != 1 || snapshot.Metrics.Strategy.Outcomes[0].Runs < 6 {
+		t.Fatalf("P8 strategy outcomes = %#v", snapshot.Metrics.Strategy.Outcomes)
+	}
 	visibleArtifacts := 0
 	for _, child := range snapshot.ChildAgents {
 		if child.ManagedStatus == codingagent.ManagedWorktreeCleaned && child.ChangeSetID != "" && child.PatchArtifact != "" && len(child.ChangeFiles) == 1 {

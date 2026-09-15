@@ -85,6 +85,20 @@ func (m *Model) planRows(plan codingagent.PlanSnapshot, width int) []renderRow {
 		strategy = "isolated parallel-write multi-Agent Workflow"
 	}
 	rows = appendWrapped(rows, "Recommended execution  ", strategy, width, theme.muted)
+	if plan.StrategyRecommendation.Version != 0 {
+		rows = appendWrapped(rows, "Why  ", plan.StrategyRecommendation.Summary, width, theme.muted)
+		resources := fmt.Sprintf("%d Agent(s), up to %d concurrent", plan.StrategyRecommendation.EstimatedAgents, plan.StrategyRecommendation.EstimatedConcurrency)
+		if plan.StrategyRecommendation.IndependentStreams > 1 {
+			resources += fmt.Sprintf("  •  %d independent workstreams", plan.StrategyRecommendation.IndependentStreams)
+		}
+		rows = appendWrapped(rows, "Expected resources  ", resources, width, theme.muted)
+		if plan.StrategyRecommendation.ProposedStrategy != "" && plan.StrategyRecommendation.ProposedStrategy != plan.RecommendedStrategy {
+			rows = appendWrapped(rows, "Planner proposed  ", string(plan.StrategyRecommendation.ProposedStrategy)+" (adjusted by product policy)", width, theme.warning)
+		}
+		if len(plan.StrategyRecommendation.Workstreams) != 0 {
+			rows = appendPlanList(rows, "Parallel workstreams", plan.StrategyRecommendation.Workstreams, width)
+		}
+	}
 	if plan.ApprovedVersion == plan.Version && plan.ApprovedVersion != 0 {
 		rows = append(rows, renderRow{text: theme.muted.Render(fmt.Sprintf("Approved exact version: v%d", plan.ApprovedVersion))})
 	}

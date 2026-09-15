@@ -11,6 +11,7 @@ CodePilot is a terminal AI coding agent for working with a local Git repository.
 - Explicit `/plan` tasks plus Agent-suggested Plan entry with a user confirmation boundary and read-only planning tools.
 - Bounded parallel read-only child Agents for independent Plan explorations and approved Explore/Validate/Review Workflows.
 - Isolated parallel Implement child Agents with exact ChangeSet approval, serial integration, and combined validation/review.
+- Trusted adaptive execution recommendations with visible rationale, expected Agent count, user override, and versioned quality gates.
 - `read-only`, `ask`, and `auto-edit` permission modes.
 - Optional Go and Python language-server navigation.
 
@@ -73,6 +74,8 @@ Plan mode is scoped to one task. An Agent suggestion offers **Enter Plan mode**,
 Parallel read-only child Agents use the shared worktree only for Explore, Validate, and Review. An approved isolated-write Workflow may instead run independent Implement nodes in CodePilot-managed Git worktrees pinned to the Plan commit. Each child produces a content-addressed ChangeSet; the coordinator verifies target digests, shows the exact diff for one-time approval, integrates ChangeSets serially, and then runs combined Validate and Review nodes on the active worktree. Target drift or conflicts stop integration without deleting the child artifact or managed worktree.
 
 `--max-parallel-agents` sets the process-wide child concurrency cap (default 8), while each compiled parallel Workflow currently uses at most two concurrent nodes. `--disable-parallel-subagents` blocks all new parallel delegation; `--disable-parallel-write-subagents` independently blocks new isolated-write Workflows while preserving durable recovery. `--disable-subagents` disables all new child delegation.
+
+For each new executable Plan, CodePilot records the model proposal but independently evaluates it against a versioned task-shape baseline, enabled capabilities, dependency and path-conflict rules, the clean Git baseline requirement, and hard Agent limits. The Plan and approval card show the resulting recommendation, concise reason, expected Agent count, and independent workstreams; users can always choose Direct single-Agent execution. `--prefer-single-agent` makes that the product recommendation for new Plans, and `--disable-adaptive-strategy` restores proposal-only selection while leaving existing Plan data readable. Snapshot metrics compare recommendations and approved choices, and group completion, retries, replans, elapsed time, token use, and cost by execution strategy.
 
 ## Permissions and safety
 

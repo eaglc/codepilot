@@ -240,6 +240,10 @@ func (m *Model) approvalRows(pending codingagent.PendingInterrupt, width int) []
 		theme.header.Render(title),
 		theme.warning.Render(summary),
 	}
+	if pending.Kind == "plan_approval" && pending.PlanRecommendation.Version != 0 {
+		lines = append(lines, theme.muted.Render("Why: "+pending.PlanRecommendation.Summary))
+		lines = append(lines, theme.muted.Render(fmt.Sprintf("Expected resources: %d Agent(s), up to %d concurrent; %d independent workstream(s)", pending.PlanRecommendation.EstimatedAgents, pending.PlanRecommendation.EstimatedConcurrency, pending.PlanRecommendation.IndependentStreams)))
+	}
 	details := approvalProposalLines(pending.Proposed, max(8, width-4))
 	lines = append(lines, details...)
 	if pending.CanGrantSession && m.pendingToolName(pending) == createFileToolName {

@@ -656,6 +656,12 @@ func clonePlan(value codingagent.Plan) codingagent.Plan {
 	value.Assumptions = append([]string(nil), value.Assumptions...)
 	value.Risks = append([]string(nil), value.Risks...)
 	value.AcceptanceCriteria = append([]string(nil), value.AcceptanceCriteria...)
+	if value.StrategyRecommendation != nil {
+		recommendation := *value.StrategyRecommendation
+		recommendation.ReasonCodes = append([]codingagent.StrategyReasonCode(nil), recommendation.ReasonCodes...)
+		recommendation.Workstreams = append([]string(nil), recommendation.Workstreams...)
+		value.StrategyRecommendation = &recommendation
+	}
 	value.Steps = append([]codingagent.PlanStep(nil), value.Steps...)
 	for index := range value.Steps {
 		value.Steps[index].DependsOn = append([]string(nil), value.Steps[index].DependsOn...)

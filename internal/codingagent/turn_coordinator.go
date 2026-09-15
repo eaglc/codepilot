@@ -112,8 +112,11 @@ func (s *Service) prepareRunEnvironment(ctx context.Context, product Session, tu
 		extra := []tool.Tool{&exitPlanModeTool{
 			plans: s.deps.Plans, turns: s.deps.Turns, turnID: turn.ID,
 			worktreeID: product.WorktreeID, worktreeRoot: worktree.Root,
-			workflows: s.features.Workflows,
-			subagents: s.features.Subagents,
+			strategyPolicy: strategyPolicy{
+				Enabled: s.features.AdaptiveStrategy, Workflows: s.features.Workflows, Subagents: s.features.Subagents,
+				ParallelRead: s.features.ParallelSubagents, ParallelWrite: s.features.ParallelWriteSubagents,
+				Preferences: s.deps.ExecutionPreferences,
+			},
 		}, &clarificationTool{turns: s.deps.Turns, turnID: turn.ID}}
 		if profile == CapabilityPlan {
 			extra = append(extra, &workspaceContextTool{turns: s.deps.Turns, turnID: turn.ID})

@@ -77,22 +77,23 @@ type WorkspaceRevision struct {
 
 // Plan is one immutable, structured implementation-plan revision.
 type Plan struct {
-	ID                  PlanID             `json:"id"`
-	TurnID              TurnID             `json:"turn_id"`
-	Version             uint64             `json:"version"`
-	Goal                string             `json:"goal"`
-	Scope               PlanScope          `json:"scope"`
-	Findings            []string           `json:"findings"`
-	Assumptions         []string           `json:"assumptions,omitempty"`
-	Risks               []string           `json:"risks"`
-	Steps               []PlanStep         `json:"steps"`
-	AcceptanceCriteria  []string           `json:"acceptance_criteria"`
-	RecommendedStrategy ExecutionStrategy  `json:"recommended_strategy"`
-	WorkspaceRelevant   bool               `json:"workspace_relevant"`
-	CompletionMode      PlanCompletionMode `json:"completion_mode"`
-	WorkspaceRevision   WorkspaceRevision  `json:"workspace_revision"`
-	Digest              string             `json:"digest"`
-	CreatedAt           time.Time          `json:"created_at"`
+	ID                     PlanID                  `json:"id"`
+	TurnID                 TurnID                  `json:"turn_id"`
+	Version                uint64                  `json:"version"`
+	Goal                   string                  `json:"goal"`
+	Scope                  PlanScope               `json:"scope"`
+	Findings               []string                `json:"findings"`
+	Assumptions            []string                `json:"assumptions,omitempty"`
+	Risks                  []string                `json:"risks"`
+	Steps                  []PlanStep              `json:"steps"`
+	AcceptanceCriteria     []string                `json:"acceptance_criteria"`
+	RecommendedStrategy    ExecutionStrategy       `json:"recommended_strategy"`
+	StrategyRecommendation *StrategyRecommendation `json:"strategy_recommendation,omitempty"`
+	WorkspaceRelevant      bool                    `json:"workspace_relevant"`
+	CompletionMode         PlanCompletionMode      `json:"completion_mode"`
+	WorkspaceRevision      WorkspaceRevision       `json:"workspace_revision"`
+	Digest                 string                  `json:"digest"`
+	CreatedAt              time.Time               `json:"created_at"`
 }
 
 // PlanSubmission is the model-proposed portion of a Plan. Trusted identities,
@@ -118,10 +119,17 @@ func ValidatePlan(value Plan) error {
 	if !validExecutionStrategy(value.RecommendedStrategy) {
 		return fmt.Errorf("Coding plan execution strategy %q is unsupported", value.RecommendedStrategy)
 	}
+	proposedStrategy := value.RecommendedStrategy
+	if value.StrategyRecommendation != nil {
+		if err := validateStrategyRecommendation(*value.StrategyRecommendation, value.RecommendedStrategy); err != nil {
+			return err
+		}
+		proposedStrategy = value.StrategyRecommendation.ProposedStrategy
+	}
 	if err := validatePlanSubmission(PlanSubmission{
 		Goal: value.Goal, Scope: value.Scope, Findings: value.Findings, Assumptions: value.Assumptions,
 		Risks: value.Risks, Steps: value.Steps, AcceptanceCriteria: value.AcceptanceCriteria,
-		RecommendedStrategy: value.RecommendedStrategy, WorkspaceRelevant: value.WorkspaceRelevant,
+		RecommendedStrategy: proposedStrategy, WorkspaceRelevant: value.WorkspaceRelevant,
 		CompletionMode: value.CompletionMode,
 	}); err != nil {
 		return err

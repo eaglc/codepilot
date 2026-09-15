@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "policy_version": 1,
+  "release_thresholds": {
+    "max_simple_multi_agent_rate": 0,
+    "max_unsafe_parallel_rate": 0,
+    "max_parallel_agents": 4,
+    "max_resource_amplification": 4
+  },
+  "cases": [
+    {
+      "id": "localized-fix",
+      "benefit": "lowest_overhead",
+      "proposed_strategy": "single",
+      "steps": [{"id":"fix","goal":"Fix one localized defect.","files":["internal/a.go"],"role":"implement"}],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "single",
+      "expected_reason": "direct_default"
+    },
+    {
+      "id": "localized-fix-rejects-multi-agent",
+      "benefit": "lowest_overhead",
+      "proposed_strategy": "workflow_multi_serial",
+      "steps": [{"id":"fix","goal":"Fix one localized defect.","files":["internal/a.go"],"role":"implement"}],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "single",
+      "expected_reason": "insufficient_separation"
+    },
+    {
+      "id": "durable-dependent-workflow",
+      "benefit": "recovery",
+      "proposed_strategy": "workflow_single",
+      "steps": [
+        {"id":"change","goal":"Change the contract.","files":["internal/api.go"],"role":"implement"},
+        {"id":"verify","goal":"Verify callers.","depends_on":["change"],"files":["internal/api.go"],"role":"validate"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_single",
+      "expected_reason": "dependency_tracking"
+    },
+    {
+      "id": "serial-role-isolation",
+      "benefit": "context",
+      "proposed_strategy": "workflow_multi_serial",
+      "steps": [
+        {"id":"implement","goal":"Implement the bounded change.","files":["internal/a.go"],"role":"implement"},
+        {"id":"review","goal":"Review the result independently.","depends_on":["implement"],"files":["internal/a.go"],"role":"review"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_multi_serial",
+      "expected_reason": "role_isolation"
+    },
+    {
+      "id": "parallel-read-fanout",
+      "benefit": "time",
+      "proposed_strategy": "workflow_multi_parallel_readonly",
+      "steps": [
+        {"id":"api","goal":"Inspect API compatibility.","files":["internal/api"],"role":"explore"},
+        {"id":"store","goal":"Inspect persistence compatibility.","files":["internal/store"],"role":"explore"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_multi_parallel_readonly",
+      "expected_reason": "parallel_read_benefit",
+      "minimum_streams": 2
+    },
+    {
+      "id": "parallel-read-dependent",
+      "benefit": "safety",
+      "proposed_strategy": "workflow_multi_parallel_readonly",
+      "steps": [
+        {"id":"inspect","goal":"Inspect the API.","files":["internal/api"],"role":"explore"},
+        {"id":"review","goal":"Review the inspection.","depends_on":["inspect"],"files":["internal/api"],"role":"review"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_multi_serial",
+      "expected_reason": "insufficient_separation"
+    },
+    {
+      "id": "parallel-write-disjoint",
+      "benefit": "time",
+      "proposed_strategy": "workflow_multi_parallel_isolated_write",
+      "steps": [
+        {"id":"api","goal":"Implement the API change.","files":["internal/api"],"role":"implement"},
+        {"id":"store","goal":"Implement the store change.","files":["internal/store"],"role":"implement"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_multi_parallel_isolated_write",
+      "expected_reason": "parallel_write_benefit",
+      "minimum_streams": 2
+    },
+    {
+      "id": "parallel-write-overlap",
+      "benefit": "safety",
+      "proposed_strategy": "workflow_multi_parallel_isolated_write",
+      "steps": [
+        {"id":"api","goal":"Change the API directory.","files":["internal/api"],"role":"implement"},
+        {"id":"handler","goal":"Change one API handler.","files":["internal/api/handler.go"],"role":"implement"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_single",
+      "expected_reason": "insufficient_separation"
+    },
+    {
+      "id": "parallel-write-dirty-baseline",
+      "benefit": "safety",
+      "proposed_strategy": "workflow_multi_parallel_isolated_write",
+      "steps": [
+        {"id":"api","goal":"Implement the API change.","files":["internal/api"],"role":"implement"},
+        {"id":"store","goal":"Implement the store change.","files":["internal/store"],"role":"implement"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "changed_paths": ["user-change.txt"],
+      "expected_strategy": "workflow_multi_serial",
+      "expected_reason": "insufficient_separation"
+    },
+    {
+      "id": "parallel-write-disabled",
+      "benefit": "control",
+      "proposed_strategy": "workflow_multi_parallel_isolated_write",
+      "parallel_write": false,
+      "steps": [
+        {"id":"api","goal":"Implement the API change.","files":["internal/api"],"role":"implement"},
+        {"id":"store","goal":"Implement the store change.","files":["internal/store"],"role":"implement"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_multi_serial",
+      "expected_reason": "parallel_write_disabled"
+    },
+    {
+      "id": "parallel-read-capped-to-one",
+      "benefit": "control",
+      "proposed_strategy": "workflow_multi_parallel_readonly",
+      "max_parallel_agents": 1,
+      "steps": [
+        {"id":"api","goal":"Inspect the API.","files":["internal/api"],"role":"explore"},
+        {"id":"store","goal":"Inspect the store.","files":["internal/store"],"role":"explore"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_multi_serial",
+      "expected_reason": "parallel_read_disabled"
+    },
+    {
+      "id": "parallel-read-resource-envelope",
+      "benefit": "cost",
+      "proposed_strategy": "workflow_multi_parallel_readonly",
+      "steps": [
+        {"id":"api","goal":"Inspect the API.","files":["internal/api"],"role":"explore"},
+        {"id":"store","goal":"Inspect the store.","files":["internal/store"],"role":"explore"},
+        {"id":"ui","goal":"Inspect the UI.","files":["internal/ui"],"role":"explore"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "workflow_single",
+      "expected_reason": "resource_limit"
+    },
+    {
+      "id": "single-agent-preference",
+      "benefit": "control",
+      "proposed_strategy": "workflow_multi_parallel_readonly",
+      "prefer_single": true,
+      "steps": [
+        {"id":"api","goal":"Inspect the API.","files":["internal/api"],"role":"explore"},
+        {"id":"store","goal":"Inspect the store.","files":["internal/store"],"role":"explore"}
+      ],
+      "git_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_strategy": "single",
+      "expected_reason": "user_prefers_single"
+    }
+  ]
+}

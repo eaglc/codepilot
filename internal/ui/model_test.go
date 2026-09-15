@@ -1348,10 +1348,12 @@ func TestWorkflowPlanApprovalLetsUserChooseDirectAndShowsProgress(t *testing.T) 
 			Findings: []string{"The work has ordered dependencies."}, Risks: []string{"Recovery must be durable."},
 			Steps:              []codingagent.PlanStep{{ID: "implement", Goal: "Implement.", Validation: []string{"Tests pass."}}},
 			AcceptanceCriteria: []string{"Complete."}, RecommendedStrategy: codingagent.ExecutionWorkflowSingle, CompletionMode: codingagent.PlanCompletionExecute,
+			StrategyRecommendation: codingagent.StrategyRecommendation{Version: 1, ProposedStrategy: codingagent.ExecutionWorkflowSingle, SelectedStrategy: codingagent.ExecutionWorkflowSingle, Summary: "Durable dependency tracking improves recovery.", EstimatedAgents: 1, EstimatedConcurrency: 1, IndependentStreams: 1},
 		},
 		PendingInterrupts: []codingagent.PendingInterrupt{{
 			TurnID: "turn", InterruptID: "plan-approval", Kind: "plan_approval", PlanID: "plan", PlanVersion: 1,
 			Summary: "Review Plan v1", PlanCompletion: codingagent.PlanCompletionExecute, PlanStrategy: codingagent.ExecutionWorkflowSingle,
+			PlanRecommendation: codingagent.StrategyRecommendation{Version: 1, Summary: "Durable dependency tracking improves recovery.", EstimatedAgents: 1, EstimatedConcurrency: 1, IndependentStreams: 1},
 		}},
 		ActiveWorkflow: &codingagent.WorkflowSnapshot{
 			ID: "workflow", TurnID: "turn", Status: "running", CompletedNodes: 1, CurrentNode: "validate", MaxAgentSteps: 64, UsedAgentSteps: 3,
@@ -1368,7 +1370,7 @@ func TestWorkflowPlanApprovalLetsUserChooseDirectAndShowsProgress(t *testing.T) 
 	}
 	model.width, model.height = 160, 60
 	view := model.View().Content
-	for _, expected := range []string{"single-Agent Workflow", "Approve with single-Agent Workflow", "Approve and execute Direct", "1/2 nodes complete", "3/64 steps", "[validate] Validate.", "Evidence", "run:implement"} {
+	for _, expected := range []string{"single-Agent Workflow", "Approve with single-Agent Workflow", "Approve and execute Direct", "Why", "Durable dependency tracking", "Expected resources", "1/2 nodes complete", "3/64 steps", "[validate] Validate.", "Evidence", "run:implement"} {
 		if !strings.Contains(view, expected) {
 			t.Fatalf("Workflow view does not contain %q: %s", expected, view)
 		}

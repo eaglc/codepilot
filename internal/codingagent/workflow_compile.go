@@ -26,16 +26,24 @@ func CompilePlanWorkflow(plan Plan, now time.Time) (workflow.Workflow, error) {
 // CompilePlanWorkflowWithRegistry compiles against the exact immutable role
 // policies wired into the product service.
 func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofile.Registry) (workflow.Workflow, error) {
+	return compilePlanWorkflowWithStrategy(plan, plan.RecommendedStrategy, now, roles)
+}
+
+// compilePlanWorkflowWithStrategy compiles the immutable approved Plan using
+// the execution strategy selected at approval time. The Plan digest continues
+// to identify the reviewed proposal and recommendation; the durable Turn is
+// the authority for a user override.
+func compilePlanWorkflowWithStrategy(plan Plan, strategy ExecutionStrategy, now time.Time, roles *roleprofile.Registry) (workflow.Workflow, error) {
 	if err := ValidatePlan(plan); err != nil {
 		return workflow.Workflow{}, fmt.Errorf("compile Coding workflow: invalid Plan: %w", err)
 	}
-	if plan.CompletionMode != PlanCompletionExecute || !isWorkflowStrategy(plan.RecommendedStrategy) {
+	if plan.CompletionMode != PlanCompletionExecute || !isWorkflowStrategy(strategy) {
 		return workflow.Workflow{}, errors.New("compile Coding workflow: Plan does not select Workflow execution")
 	}
 	if now.IsZero() {
 		return workflow.Workflow{}, errors.New("compile Coding workflow: creation time is required")
 	}
-	parallelWrite := plan.RecommendedStrategy == ExecutionWorkflowMultiParallelIsolatedWrite
+	parallelWrite := strategy == ExecutionWorkflowMultiParallelIsolatedWrite
 	integrationIDs := make(map[string]workflow.NodeID)
 	if parallelWrite {
 		used := make([]workflow.Node, 0, len(plan.Steps)*2)
@@ -85,7 +93,7 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 			}
 		}
 		executor := workflow.ExecutorMain
-		if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial || parallelExecutionStrategy(plan.RecommendedStrategy) {
+		if strategy == ExecutionWorkflowMultiSerial || parallelExecutionStrategy(strategy) {
 			executor = workflow.ExecutorChild
 		}
 		nodes = append(nodes, workflow.Node{
@@ -125,12 +133,12 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 	}
 	nodes = append(nodes, workflow.Node{
 		ID: finalID, Goal: "Validate the combined result against the approved Plan acceptance criteria.", DependsOn: leaves,
-		Role: validateDefinition.Role, Capability: validateDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(plan.RecommendedStrategy), Delegated: parallelExecutionStrategy(plan.RecommendedStrategy), PolicyVersion: validateDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
+		Role: validateDefinition.Role, Capability: validateDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(strategy), Delegated: parallelExecutionStrategy(strategy), PolicyVersion: validateDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
 		AcceptanceCriteria: append([]string(nil), plan.AcceptanceCriteria...), FailureAction: validateDefinition.Workflow.DefaultFailure, MaxAttempts: validateDefinition.Workflow.DefaultAttempts, Status: workflow.NodePending,
 	})
 	totalRuns += validateDefinition.Workflow.DefaultAttempts
 	maximumAttempts = max(maximumAttempts, validateDefinition.Workflow.DefaultAttempts)
-	if plan.RecommendedStrategy == ExecutionWorkflowMultiSerial || parallelExecutionStrategy(plan.RecommendedStrategy) {
+	if strategy == ExecutionWorkflowMultiSerial || parallelExecutionStrategy(strategy) {
 		reviewDefinition, resolveErr := roles.ResolveRole(workflow.RoleReview)
 		if resolveErr != nil {
 			return workflow.Workflow{}, fmt.Errorf("compile Coding workflow: final review role: %w", resolveErr)
@@ -138,7 +146,7 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 		reviewID := uniqueFinalNodeID(nodes, "workflow-final-review")
 		nodes = append(nodes, workflow.Node{
 			ID: reviewID, Goal: "Review and summarize the complete multi-Agent result for the user.", DependsOn: []workflow.NodeID{finalID},
-			Role: reviewDefinition.Role, Capability: reviewDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(plan.RecommendedStrategy), Delegated: parallelExecutionStrategy(plan.RecommendedStrategy), PolicyVersion: reviewDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
+			Role: reviewDefinition.Role, Capability: reviewDefinition.Workflow.Capability, Executor: workflowExecutorForStrategy(strategy), Delegated: parallelExecutionStrategy(strategy), PolicyVersion: reviewDefinition.PolicyVersion, Scope: workflow.Scope{ReadPaths: allPaths},
 			AcceptanceCriteria: append([]string(nil), plan.AcceptanceCriteria...), FailureAction: reviewDefinition.Workflow.DefaultFailure, MaxAttempts: reviewDefinition.Workflow.DefaultAttempts, Status: workflow.NodePending,
 		})
 		totalRuns += reviewDefinition.Workflow.DefaultAttempts
@@ -147,11 +155,11 @@ func CompilePlanWorkflowWithRegistry(plan Plan, now time.Time, roles *roleprofil
 	digest := sha256.Sum256([]byte(string(plan.ID) + "\x00" + fmt.Sprint(plan.Version) + "\x00" + plan.Digest))
 	value := workflow.Workflow{
 		ID: workflow.ID("workflow_" + hex.EncodeToString(digest[:16])), OwnerID: string(plan.TurnID),
-		Plan: workflow.PlanReference{ID: string(plan.ID), Version: plan.Version, Digest: plan.Digest}, Strategy: workflowStrategyForExecution(plan.RecommendedStrategy),
+		Plan: workflow.PlanReference{ID: string(plan.ID), Version: plan.Version, Digest: plan.Digest}, Strategy: workflowStrategyForExecution(strategy),
 		Status: workflow.StatusPending, Budget: workflow.Budget{MaxNodes: len(nodes), MaxRuns: totalRuns, MaxAttempts: maximumAttempts, MaxAgentSteps: totalRuns * 32},
 		Nodes: nodes, Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}
-	if parallelExecutionStrategy(plan.RecommendedStrategy) {
+	if parallelExecutionStrategy(strategy) {
 		value.Budget.MaxAgents = len(nodes)
 		value.Budget.MaxConcurrency = min(2, len(nodes))
 		value.Budget.MaxTotalTokens = 2_000_000

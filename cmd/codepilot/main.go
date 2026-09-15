@@ -65,6 +65,8 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 	disableSubagents := flags.Bool("disable-subagents", false, "disable new Plan exploration and serial multi-Agent delegation while preserving recovery")
 	disableParallelSubagents := flags.Bool("disable-parallel-subagents", false, "disable new parallel read-only child Agents while preserving recovery")
 	disableParallelWriteSubagents := flags.Bool("disable-parallel-write-subagents", false, "disable new parallel isolated-write child Agents while preserving recovery")
+	disableAdaptiveStrategy := flags.Bool("disable-adaptive-strategy", false, "disable trusted adaptive execution recommendations for new Plans")
+	preferSingleAgent := flags.Bool("prefer-single-agent", false, "prefer single-Agent execution for newly submitted Plans")
 	maxParallelAgents := flags.Int("max-parallel-agents", 8, "maximum child Agents running concurrently across Coding sessions")
 	if err := flags.Parse(arguments); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -110,6 +112,8 @@ func run(ctx context.Context, arguments []string, stdin io.Reader, stdout io.Wri
 		DisableSubagents:              *disableSubagents,
 		DisableParallelSubagents:      *disableParallelSubagents,
 		DisableParallelWriteSubagents: *disableParallelWriteSubagents,
+		DisableAdaptiveStrategy:       *disableAdaptiveStrategy,
+		PreferSingleAgent:             *preferSingleAgent,
 		MaxParallelAgents:             *maxParallelAgents,
 		Input:                         stdin,
 		Output:                        stdout,

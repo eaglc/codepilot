@@ -78,7 +78,8 @@ func TestRunHelpExitsSuccessfully(t *testing.T) {
 	if exitCode := run(context.Background(), []string{"--help"}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("help exit code = %d", exitCode)
 	}
-	if !strings.Contains(stderr.String(), "Usage of codepilot") {
+	help := stderr.String()
+	if !strings.Contains(help, "Usage of codepilot") || !strings.Contains(help, "-prefer-single-agent") || !strings.Contains(help, "-disable-adaptive-strategy") || !strings.Contains(help, "-max-parallel-agents") {
 		t.Fatalf("help output = %q", stderr.String())
 	}
 }

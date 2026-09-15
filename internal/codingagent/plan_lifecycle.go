@@ -82,7 +82,7 @@ func summarizePlanChanges(previous *Plan, current Plan) []string {
 	if !reflect.DeepEqual(previous.AcceptanceCriteria, current.AcceptanceCriteria) {
 		changes = append(changes, "Acceptance criteria changed")
 	}
-	if previous.RecommendedStrategy != current.RecommendedStrategy || previous.CompletionMode != current.CompletionMode {
+	if previous.RecommendedStrategy != current.RecommendedStrategy || !reflect.DeepEqual(previous.StrategyRecommendation, current.StrategyRecommendation) || previous.CompletionMode != current.CompletionMode {
 		changes = append(changes, "Execution recommendation changed")
 	}
 	if previous.WorkspaceRelevant != current.WorkspaceRelevant || previous.WorkspaceRevision.StatusDigest != current.WorkspaceRevision.StatusDigest || previous.WorkspaceRevision.DiffDigest != current.WorkspaceRevision.DiffDigest || !reflect.DeepEqual(previous.WorkspaceRevision.RelevantPaths, current.WorkspaceRevision.RelevantPaths) {

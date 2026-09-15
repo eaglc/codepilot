@@ -44,11 +44,14 @@ type FeatureFlags struct {
 	// ParallelWriteSubagents is a separate experimental gate because isolated
 	// write generation and active-worktree integration have higher risk.
 	ParallelWriteSubagents bool
+	// AdaptiveStrategy evaluates model-proposed execution strategies against a
+	// versioned product policy before a Plan is shown for approval.
+	AdaptiveStrategy bool
 }
 
 // DefaultFeatureFlags returns the current stable product defaults.
 func DefaultFeatureFlags() FeatureFlags {
-	return FeatureFlags{ProductTurns: true, PlanMode: true, PlanSuggestions: true, Workflows: true, Subagents: true, ParallelSubagents: true}
+	return FeatureFlags{ProductTurns: true, PlanMode: true, PlanSuggestions: true, Workflows: true, Subagents: true, ParallelSubagents: true, AdaptiveStrategy: true}
 }
 
 // ToolScope contains immutable trusted Coding facts captured before model-controlled execution.
@@ -122,9 +125,10 @@ type Dependencies struct {
 	Limits           agent.RunLimits
 	// MaxParallelAgents bounds child Agent executions across all sessions owned
 	// by this Service. Zero selects the product default.
-	MaxParallelAgents int
-	Features          *FeatureFlags
-	Roles             *roleprofile.Registry
+	MaxParallelAgents    int
+	ExecutionPreferences ExecutionPreferences
+	Features             *FeatureFlags
+	Roles                *roleprofile.Registry
 }
 
 // Service owns Coding session lifecycle while delegating model/tool loops to generic Agent.
@@ -185,16 +189,24 @@ func NewService(deps Dependencies) (*Service, error) {
 		features.Workflows = false
 		features.Subagents = false
 		features.ParallelSubagents = false
+		features.ParallelWriteSubagents = false
+		features.AdaptiveStrategy = false
 	}
 	if !features.PlanMode {
 		features.PlanSuggestions = false
+		features.AdaptiveStrategy = false
 	}
 	if deps.Children == nil {
 		features.Subagents = false
 		features.ParallelSubagents = false
+		features.ParallelWriteSubagents = false
 	}
 	if !features.Subagents {
 		features.ParallelSubagents = false
+		features.ParallelWriteSubagents = false
+	}
+	if !features.ParallelSubagents || deps.ManagedWorktrees == nil {
+		features.ParallelWriteSubagents = false
 	}
 	if deps.MaxParallelAgents == 0 {
 		deps.MaxParallelAgents = 8
@@ -202,8 +214,11 @@ func NewService(deps Dependencies) (*Service, error) {
 	if deps.MaxParallelAgents < 1 || deps.MaxParallelAgents > workflow.MaxNodes {
 		return nil, errors.New("create Coding Agent service: global parallel Agent limit must be between 1 and 64")
 	}
-	if features.ParallelSubagents && deps.MaxParallelAgents < 2 {
-		return nil, errors.New("create Coding Agent service: parallel subagents require a global Agent limit of at least 2")
+	if deps.ExecutionPreferences.MaxParallelAgents == 0 {
+		deps.ExecutionPreferences.MaxParallelAgents = deps.MaxParallelAgents
+	}
+	if deps.ExecutionPreferences.MaxParallelAgents < 1 || deps.ExecutionPreferences.MaxParallelAgents > deps.MaxParallelAgents {
+		return nil, errors.New("create Coding Agent service: preferred parallel Agent limit must be between 1 and the global limit")
 	}
 	if deps.Sessions == nil || (features.ProductTurns && deps.Turns == nil) || (features.PlanMode && deps.Plans == nil) || (features.Workflows && deps.Workflows == nil) || deps.AgentSessions == nil || deps.Worktrees == nil || deps.Agent == nil || deps.Tools == nil || deps.Prompts == nil || deps.Events == nil {
 		return nil, errors.New("create Coding Agent service: dependencies are incomplete")
@@ -620,7 +635,11 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 		if reviewedPlan.CompletionMode == PlanCompletionDeliverable {
 			selected = ExecutionSingle
 		}
-		if !validExecutionStrategy(selected) || selected != ExecutionSingle && selected != reviewedPlan.RecommendedStrategy {
+		proposed := reviewedPlan.RecommendedStrategy
+		if reviewedPlan.StrategyRecommendation != nil {
+			proposed = reviewedPlan.StrategyRecommendation.ProposedStrategy
+		}
+		if !validExecutionStrategy(selected) || selected != ExecutionSingle && selected != reviewedPlan.RecommendedStrategy && selected != proposed {
 			return TurnResult{}, errors.New("resume Coding Agent turn: selected execution strategy was not offered by the reviewed Plan")
 		}
 		if isWorkflowStrategy(selected) && (!s.features.Workflows || s.deps.Workflows == nil) {
@@ -634,6 +653,9 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 		}
 		if selected == ExecutionWorkflowMultiParallelIsolatedWrite && (!s.features.ParallelWriteSubagents || s.deps.ManagedWorktrees == nil) {
 			return TurnResult{}, errors.New("resume Coding Agent turn: parallel isolated-write execution is disabled")
+		}
+		if parallelExecutionStrategy(selected) && s.deps.ExecutionPreferences.MaxParallelAgents < 2 {
+			return TurnResult{}, errors.New("resume Coding Agent turn: parallel execution requires a configured concurrency limit of at least two")
 		}
 		if selected == ExecutionWorkflowMultiParallelIsolatedWrite && (reviewedPlan.WorkspaceRevision.GitHead == "" || len(reviewedPlan.WorkspaceRevision.ChangedPaths) != 0) {
 			return TurnResult{}, errors.New("resume Coding Agent turn: parallel isolated-write execution requires a clean committed Plan baseline")
@@ -1038,6 +1060,7 @@ func (s *Service) projectChildAgentSnapshot(ctx context.Context, snapshot *Snaps
 			snapshot.Metrics.ReasoningTokens += metrics.ReasoningTokens
 			snapshot.Metrics.TotalTokens += metrics.TotalTokens
 			snapshot.Metrics.Cost += metrics.Cost
+			addStrategyOutcomeUsage(&snapshot.Metrics.Strategy, turn.Strategy, metrics.TotalTokens, metrics.Cost)
 			if child.Kind == ChildAgentWorkflowNode {
 				snapshot.Metrics.Workflow.TotalTokens += metrics.TotalTokens
 				snapshot.Metrics.Workflow.Cost += metrics.Cost
@@ -1170,6 +1193,8 @@ func (s *Service) projectPlanSnapshot(ctx context.Context, snapshot *Snapshot, t
 		return nil
 	}
 	var active *Turn
+	recommendedCounts := make(map[ExecutionStrategy]int)
+	selectedCounts := make(map[ExecutionStrategy]int)
 	for index := range turns {
 		turn := &turns[index]
 		if turn.PlanID == "" {
@@ -1178,6 +1203,27 @@ func (s *Service) projectPlanSnapshot(ctx context.Context, snapshot *Snapshot, t
 		versions, err := s.deps.Plans.ListPlanVersions(ctx, turn.PlanID)
 		if err != nil {
 			return fmt.Errorf("load Coding Agent snapshot: list Plan versions: %w", err)
+		}
+		if turn.PlanVersion != 0 && int(turn.PlanVersion) <= len(versions) {
+			current := versions[turn.PlanVersion-1]
+			snapshot.Metrics.Strategy.Recommendations++
+			recommendedCounts[current.RecommendedStrategy]++
+			if isMultiAgentStrategy(current.RecommendedStrategy) {
+				snapshot.Metrics.Strategy.MultiAgentRecommendations++
+			}
+			if current.StrategyRecommendation != nil && current.StrategyRecommendation.AutoEligible {
+				snapshot.Metrics.Strategy.AutoEligible++
+			}
+			if turn.ApprovedPlanVersion != 0 {
+				snapshot.Metrics.Strategy.ApprovedSelections++
+				selectedCounts[turn.Strategy]++
+				if isMultiAgentStrategy(turn.Strategy) {
+					snapshot.Metrics.Strategy.SelectedMultiAgent++
+				}
+				if current.RecommendedStrategy != ExecutionSingle && turn.Strategy == ExecutionSingle {
+					snapshot.Metrics.Strategy.OverridesToSingle++
+				}
+			}
 		}
 		var previous *Plan
 		for index := range versions {
@@ -1189,6 +1235,8 @@ func (s *Service) projectPlanSnapshot(ctx context.Context, snapshot *Snapshot, t
 			active = turn
 		}
 	}
+	snapshot.Metrics.Strategy.ByRecommended = strategyCounts(recommendedCounts)
+	snapshot.Metrics.Strategy.BySelected = strategyCounts(selectedCounts)
 	if active == nil && len(turns) != 0 && turns[len(turns)-1].PlanID != "" {
 		active = &turns[len(turns)-1]
 	}
@@ -1251,6 +1299,11 @@ func projectPlanForSnapshot(plan Plan) PlanSnapshot {
 		}
 		return result
 	}
+	if plan.StrategyRecommendation != nil {
+		value.StrategyRecommendation = *plan.StrategyRecommendation
+		value.StrategyRecommendation.Summary = boundedUTF8(redactSensitiveText(value.StrategyRecommendation.Summary), 2048)
+		value.StrategyRecommendation.Workstreams = projectList(value.StrategyRecommendation.Workstreams)
+	}
 	value.Scope = PlanScope{Included: projectList(plan.Scope.Included), Excluded: projectList(plan.Scope.Excluded)}
 	value.Findings = projectList(plan.Findings)
 	value.Assumptions = projectList(plan.Assumptions)
@@ -1265,6 +1318,17 @@ func projectPlanForSnapshot(plan Plan) PlanSnapshot {
 		}
 	}
 	return value
+}
+
+func strategyCounts(values map[ExecutionStrategy]int) []StrategyCount {
+	order := []ExecutionStrategy{ExecutionSingle, ExecutionWorkflowSingle, ExecutionWorkflowMultiSerial, ExecutionWorkflowMultiParallelReadOnly, ExecutionWorkflowMultiParallelIsolatedWrite}
+	result := make([]StrategyCount, 0, len(values))
+	for _, strategy := range order {
+		if values[strategy] != 0 {
+			result = append(result, StrategyCount{Strategy: strategy, Count: values[strategy]})
+		}
+	}
+	return result
 }
 
 func (s *Service) startLegacyTurn(ctx context.Context, product Session, requestText string) (TurnResult, error) {

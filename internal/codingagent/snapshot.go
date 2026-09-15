@@ -85,25 +85,26 @@ type TranscriptItem struct {
 
 // PendingInterrupt is a product-safe resumable input request.
 type PendingInterrupt struct {
-	TurnID           TurnID
-	RunID            RunID
-	ChildAgentID     ChildAgentID
-	NodeID           NodeID
-	Role             string
-	InterruptID      string
-	Kind             string
-	ToolCallID       string
-	Summary          string
-	Proposed         *ProposedChange
-	CanGrantSession  bool
-	PlanID           PlanID
-	PlanVersion      uint64
-	PlanDigest       string
-	PlanCompletion   PlanCompletionMode
-	PlanStrategy     ExecutionStrategy
-	PlanEntryReason  PlanEntryReasonCode
-	PlanReplanReason PlanReplanReasonCode
-	Clarification    *ClarificationPrompt
+	TurnID             TurnID
+	RunID              RunID
+	ChildAgentID       ChildAgentID
+	NodeID             NodeID
+	Role               string
+	InterruptID        string
+	Kind               string
+	ToolCallID         string
+	Summary            string
+	Proposed           *ProposedChange
+	CanGrantSession    bool
+	PlanID             PlanID
+	PlanVersion        uint64
+	PlanDigest         string
+	PlanCompletion     PlanCompletionMode
+	PlanStrategy       ExecutionStrategy
+	PlanRecommendation StrategyRecommendation
+	PlanEntryReason    PlanEntryReasonCode
+	PlanReplanReason   PlanReplanReasonCode
+	Clarification      *ClarificationPrompt
 }
 
 // RecoveryDecision is a product-level operator choice for unfinished work.
@@ -161,6 +162,45 @@ type SessionMetrics struct {
 	WorkspaceDrifts  int
 	Replans          int
 	Workflow         WorkflowMetrics
+	Strategy         StrategyMetrics
+}
+
+// StrategyMetrics compares trusted recommendations with the user's approved
+// execution choice without exposing Plan or model internals.
+type StrategyMetrics struct {
+	Recommendations           int
+	MultiAgentRecommendations int
+	AutoEligible              int
+	ApprovedSelections        int
+	SelectedMultiAgent        int
+	OverridesToSingle         int
+	ByRecommended             []StrategyCount
+	BySelected                []StrategyCount
+	Outcomes                  []StrategyOutcomeMetrics
+}
+
+type StrategyCount struct {
+	Strategy ExecutionStrategy
+	Count    int
+}
+
+// StrategyOutcomeMetrics supplies the durable comparison dimensions used by
+// the P8 evaluation set: completion, rework, elapsed time, and total resources.
+type StrategyOutcomeMetrics struct {
+	Strategy        ExecutionStrategy
+	Turns           int
+	CompletedTurns  int
+	FailedTurns     int
+	CancelledTurns  int
+	Runs            int
+	FailedRuns      int
+	Retries         int
+	Replans         int
+	WorkspaceDrifts int
+	Steps           int
+	TotalTokens     int
+	Cost            float64
+	Elapsed         time.Duration
 }
 
 // WorkflowMetrics separates serial Workflow cost and reliability from Direct
@@ -213,25 +253,26 @@ type PlanVersionSummary struct {
 
 // PlanSnapshot is the bounded structured Plan shown by presentation layers.
 type PlanSnapshot struct {
-	ID                  PlanID
-	TurnID              TurnID
-	Version             uint64
-	Digest              string
-	Goal                string
-	Scope               PlanScope
-	Findings            []string
-	Assumptions         []string
-	Risks               []string
-	Steps               []PlanStep
-	AcceptanceCriteria  []string
-	RecommendedStrategy ExecutionStrategy
-	WorkspaceRelevant   bool
-	CompletionMode      PlanCompletionMode
-	Changes             []string
-	RevisionReason      string
-	ApprovedVersion     uint64
-	WorkspaceDrift      *WorkspaceDrift
-	Replan              *PlanReplanRequest
+	ID                     PlanID
+	TurnID                 TurnID
+	Version                uint64
+	Digest                 string
+	Goal                   string
+	Scope                  PlanScope
+	Findings               []string
+	Assumptions            []string
+	Risks                  []string
+	Steps                  []PlanStep
+	AcceptanceCriteria     []string
+	RecommendedStrategy    ExecutionStrategy
+	StrategyRecommendation StrategyRecommendation
+	WorkspaceRelevant      bool
+	CompletionMode         PlanCompletionMode
+	Changes                []string
+	RevisionReason         string
+	ApprovedVersion        uint64
+	WorkspaceDrift         *WorkspaceDrift
+	Replan                 *PlanReplanRequest
 }
 
 // WorkflowNodeSnapshot is the bounded, product-safe progress of one durable node.

@@ -50,6 +50,11 @@ never see paths, credentials, or runtime objects.
   material risk is discovered. `--disable-plan-suggestions` stops new proposals.
 - Explicit and Agent-suggested Plan Runs use capability-level read-only tool
   profiles. Plan approval selects a workflow transition, not a permission grant.
+- P8 stores both the model-proposed and trusted product-selected execution
+  strategy. The versioned policy requires independently runnable task shapes,
+  enabled capabilities, hard resource bounds, and user preferences before it
+  recommends parallel work. Snapshots expose rationale and per-strategy outcome
+  metrics without exposing model reasoning.
 - The package never forwards generic runtime objects across its API — everything
   is mapped through typed, secret-free DTOs.
 
