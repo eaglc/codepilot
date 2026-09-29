@@ -21,7 +21,8 @@ interfaces so the package stays ignorant of the product.
 - `Event` / `EventKind` — normalized agent events (`assistant_text_delta`,
   `tool_started`, `run_finished`, …) with typed payloads.
 - `EventSink` / `NopEventSink` — event delivery seam.
-- `ContextProcessor`, `IDGenerator`, `RetryWaiter`, `DataPolicy` — injected capabilities.
+- `ContextProcessor`, `ContextCategory`, `ContextCategoryPolicy`, `IDGenerator`,
+  `RetryWaiter`, `DataPolicy` — injected capabilities.
 
 ## Dependencies
 
@@ -34,6 +35,10 @@ interfaces so the package stays ignorant of the product.
   canceled context still persists the outcome.
 - `DataPolicy` is threaded through every boundary (messages, tool args, results,
   free text) and a `safeError` wrapper redacts failure diagnostics.
+- Request-scoped Instructions and Skills retain explicit categories through
+  Run, Continue, Resume, and Recover. After final sanitization, Runtime recounts
+  the selected request and persists a content-free `context_prepared` record
+  before calling the Provider.
 - Budget enforcement (`runBudgetReason`, `toolBudgetReason`, `noProgressReason`)
   is centralized and derived from the durable journal.
 

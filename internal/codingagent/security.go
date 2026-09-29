@@ -187,6 +187,26 @@ func (p *SecurityPolicy) SanitizeToolResult(_ string, result tool.Result) tool.R
 // SanitizeText implements the generic Agent error/event policy.
 func (p *SecurityPolicy) SanitizeText(value string) string { return p.RedactText(value) }
 
+// ContextCategory classifies only explicit artifact-boundary metadata. It does
+// not inspect or expose tool result bodies.
+func (*SecurityPolicy) ContextCategory(message llm.Message) agent.ContextCategory {
+	if message.Role != llm.RoleTool || len(message.Details) == 0 {
+		return ""
+	}
+	var metadata struct {
+		Kind string `json:"kind"`
+	}
+	if json.Unmarshal(message.Details, &metadata) != nil {
+		return ""
+	}
+	switch metadata.Kind {
+	case "coding_tool_artifact_v1", "tool_result_chunk_v1":
+		return agent.ContextArtifacts
+	default:
+		return ""
+	}
+}
+
 // NewTextStreamSanitizer keeps only the small suffix that could still become
 // part of a recognized credential, allowing earlier safe text to render while
 // the model response is still arriving.

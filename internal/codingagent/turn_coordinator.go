@@ -15,11 +15,12 @@ import (
 )
 
 type runEnvironment struct {
-	tools             *tool.Registry
-	systemPrompt      string
-	untrustedContext  []llm.Message
-	events            *AgentEventAdapter
-	toolCallPreviewer agent.ToolCallStreamPreviewer
+	tools                      *tool.Registry
+	systemPrompt               string
+	untrustedContext           []llm.Message
+	untrustedContextCategories []agent.ContextCategory
+	events                     *AgentEventAdapter
+	toolCallPreviewer          agent.ToolCallStreamPreviewer
 }
 
 func (s *Service) refreshProductTurn(ctx context.Context, turn Turn) (Turn, error) {
@@ -147,7 +148,7 @@ func (s *Service) prepareRunEnvironment(ctx context.Context, product Session, tu
 		ToolNames: names, SensitivePaths: append([]string(nil), product.SensitivePaths...),
 		ReadScope: readScope, WriteScope: writeScope,
 	}
-	systemPrompt, untrustedContext, err := buildPromptContext(ctx, s.deps.Prompts, promptScope)
+	systemPrompt, untrustedContext, untrustedContextCategories, err := buildPromptContext(ctx, s.deps.Prompts, promptScope)
 	if err != nil {
 		return runEnvironment{}, fmt.Errorf("build %s prompt: %w", profile, err)
 	}
@@ -234,12 +235,15 @@ func (s *Service) prepareRunEnvironment(ctx context.Context, product Session, tu
 			untrustedContext = append(untrustedContext, llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "This is a product-validated structured result from a read-only Plan exploration child. Its transcript is intentionally excluded. Combine independent evidence carefully and verify important facts before submitting the Plan.\n" + string(encoded)}}})
 		}
 	}
+	for len(untrustedContextCategories) < len(untrustedContext) {
+		untrustedContextCategories = append(untrustedContextCategories, agent.ContextTask)
+	}
 	revisions := productRevisionSource{service: s}
 	events, err := NewAgentEventAdapter(product.ID, turn.ID, runID, nodeID, s.deps.Events, revisions)
 	if err != nil {
 		return runEnvironment{}, err
 	}
-	return runEnvironment{tools: tools, systemPrompt: systemPrompt, untrustedContext: untrustedContext, events: events, toolCallPreviewer: toolCallPreviewer}, nil
+	return runEnvironment{tools: tools, systemPrompt: systemPrompt, untrustedContext: untrustedContext, untrustedContextCategories: untrustedContextCategories, events: events, toolCallPreviewer: toolCallPreviewer}, nil
 }
 
 func (s *Service) integrationSourceChild(ctx context.Context, turn Turn, durable workflow.Workflow, node workflow.Node) (ChildAgent, error) {
@@ -510,7 +514,7 @@ func (s *Service) continueTurnLocked(ctx context.Context, product Session, turn 
 	result, runErr := continuation.Continue(runCtx, agent.ContinueRequest{
 		SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: agentsession.RunID(runIDValue),
 		SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
-		UntrustedContext: environment.untrustedContext, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: s.deps.Limits,
+		UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: s.deps.Limits,
 	}, environment.events)
 	if result.RunID == "" {
 		result.RunID = agentsession.RunID(runIDValue)

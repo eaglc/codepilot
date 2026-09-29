@@ -76,6 +76,12 @@ func (record Record) Clone() Record {
 		value := *record.Checkpoint
 		clone.Checkpoint = &value
 	}
+	if record.Context != nil {
+		value := *record.Context
+		value.Categories = append([]ContextCategoryData(nil), record.Context.Categories...)
+		value.Degradations = append([]ContextDegradationData(nil), record.Context.Degradations...)
+		clone.Context = &value
+	}
 	if record.LaneFork != nil {
 		value := *record.LaneFork
 		clone.LaneFork = &value

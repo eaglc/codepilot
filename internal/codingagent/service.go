@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -104,6 +105,13 @@ type PromptBuilder interface {
 // trusted system prompt.
 type UntrustedContextBuilder interface {
 	BuildUntrustedContext(ctx context.Context, scope PromptScope) ([]llm.Message, error)
+}
+
+// InstructionContextBuilder builds the repository instruction context and its
+// product-safe provenance report from one discovery pass. Implementations must
+// never include instruction bodies or absolute local paths in the report.
+type InstructionContextBuilder interface {
+	BuildInstructionContext(ctx context.Context, scope PromptScope) ([]llm.Message, InstructionReport, error)
 }
 
 // Dependencies contains concrete capabilities required by Service.
@@ -405,7 +413,7 @@ func (s *Service) StartTurn(ctx context.Context, request TurnRequest) (TurnResul
 		SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: agentsession.RunID(runIDValue), UserEntryID: agentsession.EntryID(entryIDValue), SystemPrompt: environment.systemPrompt,
 		Model:            llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
 		UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: turn.RequestText}}, Timestamp: now},
-		UntrustedContext: environment.untrustedContext, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: s.deps.Limits,
+		UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: s.deps.Limits,
 	}, environment.events)
 	if result.RunID == "" {
 		result.RunID = agentsession.RunID(runIDValue)
@@ -784,7 +792,7 @@ func (s *Service) ResumeTurn(ctx context.Context, request ResumeTurnRequest) (Tu
 	result, resumeErr := s.deps.Agent.Resume(runCtx, agent.ResumeRequest{
 		SessionID: agentSessionID, Lane: agentLane, RunID: binding.RunID, InterruptID: request.InterruptID,
 		Resolution: resolution, SystemPrompt: environment.systemPrompt,
-		Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID}, UntrustedContext: environment.untrustedContext, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: resumeLimits,
+		Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID}, UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: resumeLimits,
 	}, environment.events)
 	if result.RunID == "" {
 		result.RunID = binding.RunID
@@ -975,7 +983,12 @@ func (s *Service) Snapshot(ctx context.Context, id SessionID) (Snapshot, error) 
 		revision = durable.Log[len(durable.Log)-1].Sequence
 	}
 	if !s.features.ProductTurns {
-		return ProjectSnapshot(product, durable, sessionLane(product), s.state(id), revision)
+		snapshot, projectErr := ProjectSnapshot(product, durable, sessionLane(product), s.state(id), revision)
+		if projectErr != nil {
+			return Snapshot{}, projectErr
+		}
+		s.projectWorkspaceSnapshot(ctx, &snapshot)
+		return snapshot, nil
 	}
 	turns, err := s.deps.Turns.ListTurns(ctx, id)
 	if err != nil {
@@ -1000,7 +1013,215 @@ func (s *Service) Snapshot(ctx context.Context, id SessionID) (Snapshot, error) 
 			return Snapshot{}, err
 		}
 	}
+	s.projectWorkspaceSnapshot(ctx, &snapshot)
 	return snapshot, nil
+}
+
+// Instructions discovers the active worktree's project instructions on demand
+// without exposing file bodies through the product API.
+func (s *Service) Instructions(ctx context.Context, id SessionID) ([]InstructionSource, error) {
+	builder, ok := s.deps.Prompts.(InstructionContextBuilder)
+	if !ok {
+		return nil, errors.New("load project instructions: instruction discovery is unavailable")
+	}
+	product, err := s.deps.Sessions.LoadSession(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("load project instructions: load session: %w", err)
+	}
+	worktree, err := s.deps.Worktrees.LoadWorktree(ctx, product.WorktreeID)
+	if err != nil {
+		return nil, fmt.Errorf("load project instructions: load worktree: %w", err)
+	}
+	_, report, discoveryErr := builder.BuildInstructionContext(ctx, PromptScope{
+		Profile: CapabilityDirect, WorkspaceID: product.WorkspaceID, WorktreeID: product.WorktreeID,
+		WorktreeRoot: worktree.Root, SensitivePaths: append([]string(nil), product.SensitivePaths...),
+	})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	const maxSources = 64
+	limit := min(len(report.Sources), maxSources)
+	if len(report.Sources) > maxSources {
+		limit = maxSources - 1
+	}
+	sources := make([]InstructionSource, 0, min(len(report.Sources), maxSources))
+	for _, source := range report.Sources[:limit] {
+		sources = append(sources, projectInstructionSource(source))
+	}
+	if len(report.Sources) > maxSources {
+		sources = append(sources, InstructionSource{
+			Source: ".", Scope: ".", Status: InstructionFailed,
+			Diagnostic: "Project instruction report exceeded its source limit.",
+		})
+	}
+	if discoveryErr != nil && len(sources) == 0 {
+		sources = append(sources, InstructionSource{
+			Source: ".", Scope: ".", Status: InstructionFailed,
+			Diagnostic: "Project instruction discovery failed safely.",
+		})
+	}
+	return sources, nil
+}
+
+// Context returns the latest content-free context observation for the active
+// session lane. Provider input is reported as exact only when the Provider
+// supplied a non-zero input token count for that same prepared request.
+func (s *Service) Context(ctx context.Context, id SessionID) (ContextReport, error) {
+	product, err := s.deps.Sessions.LoadSession(ctx, id)
+	if err != nil {
+		return ContextReport{}, fmt.Errorf("load context report: load session: %w", err)
+	}
+	durable, err := s.deps.AgentSessions.Load(ctx, product.AgentSessionID)
+	if err != nil {
+		return ContextReport{}, fmt.Errorf("load context report: load Agent session: %w", err)
+	}
+	lane := sessionLane(product)
+	var selected *agentsession.Record
+	providerInput := 0
+	providerExact := false
+	awaitingProviderUsage := false
+	for index := range durable.Records {
+		record := &durable.Records[index]
+		if record.Lane != lane {
+			continue
+		}
+		if record.Type == agentsession.RecordContextPrepared && record.Context != nil {
+			selected = record
+			providerInput = 0
+			providerExact = false
+			awaitingProviderUsage = true
+			continue
+		}
+		if awaitingProviderUsage && record.Type == agentsession.RecordUsage && record.RunID == selected.RunID && record.Usage != nil && record.Usage.InputTokens > 0 {
+			providerInput = record.Usage.InputTokens
+			providerExact = true
+		}
+		if selected != nil && record.RunID == selected.RunID && ((record.Type == agentsession.RecordStepFinished && record.Step != nil && record.Step.Attempt == selected.Context.Attempt) || record.Type == agentsession.RecordOperationFinished) {
+			awaitingProviderUsage = false
+		}
+	}
+	if selected == nil {
+		return ContextReport{}, nil
+	}
+	report := projectContextReport(*selected.Context)
+	report.Available = true
+	report.RunID = RunID(selected.RunID)
+	report.ProviderInput = providerInput
+	report.ProviderExact = providerExact
+	return report, nil
+}
+
+func projectContextReport(value agentsession.ContextData) ContextReport {
+	report := ContextReport{
+		Attempt: value.Attempt, CountSource: safeContextCountSource(value.CountSource), Estimated: value.Estimated,
+		EstimatedInput: max(0, value.InputTokens), ContextWindow: max(0, value.ContextWindow), InputBudget: max(0, value.InputBudget),
+		ReservedOutput: max(0, value.ReservedOutput), SafetyMargin: max(0, value.SafetyMargin),
+		SummarizeThreshold: max(0, value.SummarizeThreshold), HardLimit: max(0, value.HardLimit),
+		BudgetSource: safeContextBudgetSource(value.BudgetSource), Compacted: value.Compacted,
+	}
+	for _, category := range value.Categories {
+		name, source, ok := projectContextCategory(category.Category)
+		if !ok {
+			continue
+		}
+		report.Categories = append(report.Categories, ContextCategoryStat{Category: name, Tokens: max(0, category.Tokens), Items: max(0, category.Items), Source: source})
+	}
+	for _, degradation := range value.Degradations[:min(len(value.Degradations), 16)] {
+		kind := boundedUTF8(redactSensitiveText(degradation.Kind), 128)
+		reason := boundedUTF8(redactSensitiveText(degradation.Reason), 1024)
+		if kind != "" && reason != "" {
+			report.Degradations = append(report.Degradations, ContextDegradation{Kind: kind, Reason: reason})
+		}
+	}
+	return report
+}
+
+func projectContextCategory(value string) (ContextCategory, string, bool) {
+	switch ContextCategory(value) {
+	case ContextSystem:
+		return ContextSystem, "trusted prompt and tool schemas", true
+	case ContextTask:
+		return ContextTask, "current task context", true
+	case ContextInstructions:
+		return ContextInstructions, "project instruction context", true
+	case ContextSkills:
+		return ContextSkills, "active skill context", true
+	case ContextHistory:
+		return ContextHistory, "selected conversation history", true
+	case ContextToolResults:
+		return ContextToolResults, "selected tool result previews", true
+	case ContextArtifacts:
+		return ContextArtifacts, "selected artifact references", true
+	case ContextReservedOutput:
+		return ContextReservedOutput, "model output reservation", true
+	default:
+		return "", "", false
+	}
+}
+
+func safeContextCountSource(value string) string {
+	if value == "local_byte_estimate" {
+		return value
+	}
+	return "local_estimate"
+}
+
+func safeContextBudgetSource(value string) string {
+	if value == "model_metadata" {
+		return value
+	}
+	return "fallback_policy"
+}
+
+func projectInstructionSource(source InstructionSource) InstructionSource {
+	if !validInstructionProductPath(source.Source) || !validInstructionProductPath(source.Scope) {
+		return InstructionSource{
+			Source: ".", Scope: ".", Status: InstructionFailed,
+			Diagnostic: "Project instruction source metadata was rejected.",
+		}
+	}
+	source.Source = boundedUTF8(redactSensitiveText(source.Source), 4096)
+	source.Scope = boundedUTF8(redactSensitiveText(source.Scope), 4096)
+	source.Diagnostic = sanitizeInstructionDiagnostic(source.Diagnostic)
+	switch source.Status {
+	case InstructionLoaded:
+		if len(source.SHA256) != 64 {
+			return InstructionSource{Source: source.Source, Scope: source.Scope, Status: InstructionFailed, Diagnostic: "Project instruction digest was invalid."}
+		}
+		if _, err := hex.DecodeString(source.SHA256); err != nil {
+			return InstructionSource{Source: source.Source, Scope: source.Scope, Status: InstructionFailed, Diagnostic: "Project instruction digest was invalid."}
+		}
+	case InstructionNotFound, InstructionIgnored, InstructionFailed:
+		source.SHA256 = ""
+	default:
+		return InstructionSource{Source: source.Source, Scope: source.Scope, Status: InstructionFailed, Diagnostic: "Project instruction status was invalid."}
+	}
+	return source
+}
+
+func validInstructionProductPath(value string) bool {
+	if value == "." {
+		return true
+	}
+	if value == "" || len(value) > 4096 || value != path.Clean(value) || path.IsAbs(value) || value == ".." || strings.HasPrefix(value, "../") || strings.ContainsAny(value, "\\:") {
+		return false
+	}
+	for _, character := range value {
+		if character < ' ' || character == '\x7f' {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeInstructionDiagnostic(value string) string {
+	value = strings.Map(func(character rune) rune {
+		if character < ' ' || character == '\x7f' {
+			return ' '
+		}
+		return character
+	}, redactSensitiveText(value))
+	return boundedUTF8(strings.Join(strings.Fields(value), " "), 512)
 }
 
 func (s *Service) projectChildAgentSnapshot(ctx context.Context, snapshot *Snapshot, turns []Turn) error {
@@ -1017,6 +1238,7 @@ func (s *Service) projectChildAgentSnapshot(ctx context.Context, snapshot *Snaps
 				ID: child.ID, Kind: child.Kind, TurnID: child.ParentTurnID, WorkflowID: child.WorkflowID, NodeID: child.NodeID,
 				Role: string(child.Role), Profile: child.Profile, PolicyVersion: child.PolicyVersion, Status: child.Status, Attempt: child.Attempt,
 				Goal: boundedUTF8(redactSensitiveText(child.Task.Goal), maxPlanTextBytes), Failure: boundedUTF8(redactSensitiveText(child.Failure), 2048),
+				ReadPaths: append([]string(nil), child.Task.ReadPaths...), WritePaths: append([]string(nil), child.Task.WritePaths...),
 				StartedAt: child.StartedAt, CompletedAt: child.CompletedAt,
 			}
 			if child.Result != nil {
@@ -1164,6 +1386,8 @@ func (s *Service) projectWorkflowSnapshot(ctx context.Context, snapshot *Snapsho
 			Executor: string(workflow.NodeExecutor(node)), PolicyVersion: node.PolicyVersion,
 			Status: string(node.Status), Attempts: node.Attempts, MaxAttempts: node.MaxAttempts,
 			ResultRef: boundedUTF8(redactSensitiveText(node.ResultRef), 1024), Failure: boundedUTF8(redactSensitiveText(node.Failure), 2048),
+			ReadPaths: append([]string(nil), node.Scope.ReadPaths...), WritePaths: append([]string(nil), node.Scope.WritePaths...),
+			StartedAt: node.StartedAt, FinishedAt: node.FinishedAt,
 		}
 		for _, dependency := range node.DependsOn {
 			projected.DependsOn = append(projected.DependsOn, NodeID(dependency))
@@ -1353,7 +1577,7 @@ func (s *Service) startLegacyTurn(ctx context.Context, product Session, requestT
 		SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: agentsession.RunID(runID), UserEntryID: agentsession.EntryID(entryIDValue), SystemPrompt: environment.systemPrompt,
 		Model:            llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
 		UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: requestText}}, Timestamp: time.Now().UTC()},
-		UntrustedContext: environment.untrustedContext, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: s.deps.Limits,
+		UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: s.deps.Limits,
 	}, environment.events)
 	if result.RunID == "" {
 		result.RunID = agentsession.RunID(runID)

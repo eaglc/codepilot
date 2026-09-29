@@ -201,7 +201,7 @@ func (s *Service) runWorkflowNodeLocked(ctx context.Context, product Session, tu
 	result, runErr := continuation.Continue(runCtx, agent.ContinueRequest{
 		SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: agentsession.RunID(runIDValue),
 		SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
-		UntrustedContext: environment.untrustedContext, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: limits,
+		UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: limits,
 	}, environment.events)
 	if result.RunID == "" {
 		result.RunID = agentsession.RunID(runIDValue)

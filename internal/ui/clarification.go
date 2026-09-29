@@ -158,7 +158,7 @@ func (m *Model) handleClarificationOtherKey(pending codingagent.PendingInterrupt
 		m.followBottom = true
 		return nil
 	}
-	if key.Code == tea.KeyEnter && key.Mod&tea.ModAlt == 0 {
+	if matchesComposerBinding(key, m.composerKeymap.Submit) {
 		other := strings.TrimSpace(string(m.input))
 		if other == "" {
 			m.errorMessage = "Describe the option you prefer, or press Esc."
@@ -184,29 +184,32 @@ func (m *Model) handleClarificationOtherKey(pending codingagent.PendingInterrupt
 		m.clearInput()
 		return m.acceptClarificationAnswer(pending, answer)
 	}
-	switch key.Code {
-	case tea.KeyEnter:
+	if matchesComposerBinding(key, m.composerKeymap.Newline) {
 		m.insert([]rune{'\n'})
+		return nil
+	}
+	switch key.Code {
 	case tea.KeyLeft:
-		m.cursor = max(0, m.cursor-1)
+		m.cursor = previousGraphemeBoundary(m.input, m.cursor)
+		m.resetComposerGoalColumn()
 	case tea.KeyRight:
-		m.cursor = min(len(m.input), m.cursor+1)
+		m.cursor = nextGraphemeBoundary(m.input, m.cursor)
+		m.resetComposerGoalColumn()
 	case tea.KeyHome:
-		m.cursor = 0
+		m.moveComposerHome(key.Mod&tea.ModCtrl != 0)
 	case tea.KeyEnd:
-		m.cursor = len(m.input)
+		m.moveComposerEnd(key.Mod&tea.ModCtrl != 0)
 	case tea.KeyBackspace:
-		if m.cursor > 0 {
-			m.input = append(m.input[:m.cursor-1], m.input[m.cursor:]...)
-			m.cursor--
-		}
+		m.deleteComposerBackward()
 	case tea.KeyDelete:
-		if m.cursor < len(m.input) {
-			m.input = append(m.input[:m.cursor], m.input[m.cursor+1:]...)
-		}
+		m.deleteComposerForward()
+	case tea.KeyUp:
+		m.moveComposerVertical(-1)
+	case tea.KeyDown:
+		m.moveComposerVertical(1)
 	default:
 		if key.Text != "" && key.Mod&tea.ModCtrl == 0 {
-			m.insert([]rune(key.Text))
+			m.insert(normalizeComposerText(key.Text))
 		}
 	}
 	m.errorMessage = ""

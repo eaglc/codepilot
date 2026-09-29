@@ -65,7 +65,7 @@ func (s *Service) RecoverTurn(ctx context.Context, request RecoverTurnRequest) (
 		RunID: binding.RunID, ActionID: request.ActionID, Decision: decision, ContinueRun: true,
 		SystemPrompt:     environment.systemPrompt,
 		Model:            llm.ModelRef{Provider: environment.product.ProviderProfileID, Model: environment.product.ModelID},
-		UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: limits,
+		UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, Limits: limits,
 	}, environment.events)
 	if result.RunID == "" {
 		result.RunID = binding.RunID
@@ -199,7 +199,7 @@ func (s *Service) RecoverAutomatically(ctx context.Context, sessionID SessionID)
 			SessionID: environment.agentSessionID, Lane: targetLane, RunID: action.RunID, ActionID: action.ID,
 			Automatic: true, ContinueRun: false, SystemPrompt: environment.systemPrompt,
 			Model:            llm.ModelRef{Provider: environment.product.ProviderProfileID, Model: environment.product.ModelID},
-			UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: recoveryLimits,
+			UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, Limits: recoveryLimits,
 		}, environment.events)
 		if result.RunID == "" {
 			result.RunID = action.RunID
@@ -462,7 +462,7 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 			result, runErr = s.deps.Agent.Run(ctx, agent.RunRequest{
 				SessionID: runChild.AgentSessionID, Lane: agentsession.MainLane, RunID: binding.RunID, UserEntryID: agentsession.EntryID("entry_" + string(runChild.ID)),
 				SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID}, UserMessage: message,
-				UntrustedContext: environment.untrustedContext, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: limits,
+				UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: limits,
 			}, environment.events)
 		} else if binding.UserEntryID == "" {
 			continuation, ok := s.deps.Agent.(ContinuationRunner)
@@ -472,14 +472,14 @@ func (s *Service) reconcileProductTurns(ctx context.Context, product Session) (i
 			result, runErr = continuation.Continue(ctx, agent.ContinueRequest{
 				SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: binding.RunID,
 				SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
-				UntrustedContext: environment.untrustedContext, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: limits,
+				UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: limits,
 			}, environment.events)
 		} else {
 			result, runErr = s.deps.Agent.Run(ctx, agent.RunRequest{
 				SessionID: product.AgentSessionID, Lane: sessionLane(product), RunID: binding.RunID, UserEntryID: binding.UserEntryID,
 				SystemPrompt: environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
 				UserMessage:      llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: turn.RequestText}}, Timestamp: turn.CreatedAt},
-				UntrustedContext: environment.untrustedContext, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: limits,
+				UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, ToolCallPreviewer: environment.toolCallPreviewer, Limits: limits,
 			}, environment.events)
 		}
 		if result.RunID == "" {
@@ -642,14 +642,15 @@ func runTerminalFacts(snapshot agentsession.Snapshot, runID agentsession.RunID) 
 }
 
 type recoveryEnvironment struct {
-	product          Session
-	agentSessionID   agentsession.ID
-	lane             agentsession.Lane
-	child            *ChildAgent
-	tools            *tool.Registry
-	systemPrompt     string
-	untrustedContext []llm.Message
-	events           *AgentEventAdapter
+	product                    Session
+	agentSessionID             agentsession.ID
+	lane                       agentsession.Lane
+	child                      *ChildAgent
+	tools                      *tool.Registry
+	systemPrompt               string
+	untrustedContext           []llm.Message
+	untrustedContextCategories []agent.ContextCategory
+	events                     *AgentEventAdapter
 }
 
 func (s *Service) prepareRecovery(ctx context.Context, sessionID SessionID, turnID TurnID, runID agentsession.RunID) (recoveryEnvironment, error) {
@@ -694,7 +695,7 @@ func (s *Service) prepareRecovery(ctx context.Context, sessionID SessionID, turn
 	if err != nil {
 		return recoveryEnvironment{}, err
 	}
-	return recoveryEnvironment{product: product, agentSessionID: agentSessionID, lane: lane, child: child, tools: environment.tools, systemPrompt: environment.systemPrompt, untrustedContext: environment.untrustedContext, events: environment.events}, nil
+	return recoveryEnvironment{product: product, agentSessionID: agentSessionID, lane: lane, child: child, tools: environment.tools, systemPrompt: environment.systemPrompt, untrustedContext: environment.untrustedContext, untrustedContextCategories: environment.untrustedContextCategories, events: environment.events}, nil
 }
 
 func (s *Service) refreshRecoveryState(ctx context.Context, product Session) {

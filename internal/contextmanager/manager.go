@@ -29,6 +29,9 @@ type Message struct {
 	// Ephemeral marks request-scoped context that must not become part of a
 	// durable conversation summary. It remains visible to the primary model.
 	Ephemeral bool
+	// Category identifies the product-safe ownership bucket used for context
+	// observability. Empty categories are derived from message role and state.
+	Category Category
 	// SummaryFacts carries durable facts when this message represents a prior
 	// derived summary, so hierarchical merges can validate every level.
 	SummaryFacts []SummaryFact
@@ -62,6 +65,7 @@ type Result struct {
 	// producing this result. Cache hits do not add usage.
 	SummaryUsage []llm.Usage
 	Degradations []Degradation
+	Statistics   Statistics
 }
 
 // Degradation records a safe context fallback without exposing Provider or
@@ -125,6 +129,15 @@ func (m *Manager) Process(ctx context.Context, request Request) (Result, error) 
 		}
 		current.Messages = messages
 	}
+	tokenizer := Tokenizer(ByteTokenizer{})
+	policy := Policy{}
+	for _, strategy := range m.strategies {
+		if source, ok := strategy.(statisticsSource); ok {
+			tokenizer, policy = source.statisticsPolicy(request.Budget)
+		}
+	}
+	current.Statistics = Measure(tokenizer, current.SystemPrompt, current.Messages, request.Tools, request.Budget, policy)
+	current.Statistics.Compacted = len(current.Summaries) != 0
 	return cloneResult(current), nil
 }
 
@@ -135,6 +148,7 @@ func cloneResult(value Result) Result {
 		Summaries:    cloneSummaries(value.Summaries),
 		SummaryUsage: append([]llm.Usage(nil), value.SummaryUsage...),
 		Degradations: append([]Degradation(nil), value.Degradations...),
+		Statistics:   value.Statistics.Clone(),
 	}
 }
 

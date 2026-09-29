@@ -12,6 +12,8 @@ CodePilot is a terminal AI coding agent for working with a local Git repository.
 - Bounded parallel read-only child Agents for independent Plan explorations and approved Explore/Validate/Review Workflows.
 - Isolated parallel Implement child Agents with exact ChangeSet approval, serial integration, and combined validation/review.
 - Trusted adaptive execution recommendations with visible rationale, expected Agent count, user override, and versioned quality gates.
+- Visible project-instruction provenance with exact source, scope, digest, status, and effective root-to-leaf chain.
+- Compact workspace, Git, execution-mode, permission, context, and provider badges plus a durable Workflow/Child Agent status tree.
 - `read-only`, `ask`, and `auto-edit` permission modes.
 - Optional Go and Python language-server navigation.
 
@@ -44,10 +46,14 @@ Project documentation is indexed in [docs/README.md](docs/README.md). Release pa
 
 ## TUI basics
 
-- Enter sends a prompt; Alt+Enter inserts a newline.
+- The Composer grows from 2 to 8 rows. Enter sends a prompt; Alt+Enter inserts a newline.
+- Left/Right move by Unicode character, Up/Down move across visual lines before browsing sent-input history, and Home/End target the current visual line.
+- Unsent drafts follow their Session when switching conversations; sent-input history remains separate.
 - Ctrl+C cancels the active turn; Ctrl+D saves and exits while idle.
 - Type `/` to open and filter the command menu.
 - Tab selects messages and tool results when the input is empty; `Y` copies the selection.
+- `/status` opens the full Task/Plan/Workflow/Agent tree; wide terminals also show its collapsible nodes inline.
+- With a Diff tool result selected, `D` toggles a full-screen Diff view; `q`, `D`, or Esc returns.
 - Alt+M or `/md` switches between Markdown and plain text.
 - Approval choices are displayed inline in the conversation.
 
@@ -58,6 +64,9 @@ Common commands:
 /permissions
 /session
 /workspace
+/instructions [path]
+/context
+/status
 /plan [request]
 /rename <title>
 /fork
@@ -68,6 +77,12 @@ Common commands:
 ```
 
 `/fork` opens the conversation history so no internal entry ID is required. `/clear` starts a new persisted session without deleting the previous session or changing worktree files.
+
+`/instructions [path]` shows the canonical `AGENTS.md` sources discovered for the active worktree, including bounded load diagnostics and the root-to-leaf chain that applies to an optional worktree-relative file or directory. Common misspellings such as `AGENT.md` are reported but never loaded. The same discovery boundary supplies the lower-trust context used by the Agent; instruction bodies are not exposed through the product API.
+
+`/context` shows the latest request prepared for the active conversation: input budget, reserved output, compression thresholds and result, safe degradation reasons, and estimated occupancy across System, Task, Instructions, Skills, History, Tool Results, and Artifacts. Category counts are always labeled as local estimates; a separate exact input total appears only when the Provider reports one. No prompt, file, secret, or tool-result body is exposed.
+
+The Composer uses terminal-cell-aware soft wrapping for CJK, emoji, and combining characters. It accepts bounded multiline paste, keeps the cursor visible while the terminal is resized, and preserves one in-memory draft per Session. Recalling sent prompts never replaces that draft. Provider credentials continue to use a separate masked buffer and are never copied into Composer drafts or history.
 
 Plan mode is scoped to one task. An Agent suggestion offers **Enter Plan mode**, **Continue Direct**, or **Cancel task**; it never switches modes or grants write permission without the user's choice. Every submitted Plan is an immutable version bound to an exact workspace baseline and digest. Before approval and execution, CodePilot distinguishes unrelated workspace drift from changes to Plan-relevant files or worktree identity; material drift returns to read-only planning and requires a new version. During execution, a material assumption, scope, risk, strategy, or workspace deviation pauses at an explicit **Return to Plan mode / Continue approved Plan / Cancel task** boundary. `--disable-plan-suggestions` disables new Agent suggestions while preserving explicit `/plan`; `--disable-plan-mode` disables both new Plan entry paths while keeping previously persisted Plan decisions recoverable.
 

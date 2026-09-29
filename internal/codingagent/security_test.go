@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/eaglc/codepilot/internal/agent"
+	"github.com/eaglc/codepilot/internal/llm"
 )
 
 func TestSecurityPolicyClassifiesBuiltInAndConfiguredSensitivePaths(t *testing.T) {
@@ -26,6 +29,18 @@ func TestSecurityPolicyClassifiesBuiltInAndConfiguredSensitivePaths(t *testing.T
 	}
 	if _, err := NewSecurityPolicy([]string{"../outside"}); err == nil {
 		t.Fatal("traversing custom sensitive path was accepted")
+	}
+}
+
+func TestSecurityPolicyClassifiesOnlyExplicitArtifactMetadata(t *testing.T) {
+	policy, _ := NewSecurityPolicy(nil)
+	artifact := llm.Message{Role: llm.RoleTool, Details: json.RawMessage(`{"kind":"coding_tool_artifact_v1","detail":"safe preview"}`)}
+	if category := policy.ContextCategory(artifact); category != agent.ContextArtifacts {
+		t.Fatalf("artifact category = %q", category)
+	}
+	ordinary := llm.Message{Role: llm.RoleTool, Details: json.RawMessage(`{"kind":"ordinary_result","artifact":"text-only-coincidence"}`)}
+	if category := policy.ContextCategory(ordinary); category != "" {
+		t.Fatalf("ordinary category = %q", category)
 	}
 }
 

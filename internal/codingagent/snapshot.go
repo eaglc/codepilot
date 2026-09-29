@@ -2,6 +2,104 @@ package codingagent
 
 import "time"
 
+// InstructionStatus describes why a project instruction source is or is not
+// available to a Coding Agent run.
+type InstructionStatus string
+
+const (
+	// InstructionLoaded means a canonical AGENTS.md file was validated and loaded.
+	InstructionLoaded InstructionStatus = "loaded"
+	// InstructionNotFound means the canonical instruction source does not exist.
+	InstructionNotFound InstructionStatus = "not_found"
+	// InstructionIgnored means a discovered source is intentionally not loaded.
+	InstructionIgnored InstructionStatus = "ignored"
+	// InstructionFailed means a canonical source could not be loaded safely.
+	InstructionFailed InstructionStatus = "failed"
+)
+
+// InstructionSource is the bounded, content-free provenance of one project
+// instruction discovery result.
+type InstructionSource struct {
+	Source     string            `json:"source"`
+	Scope      string            `json:"scope"`
+	SHA256     string            `json:"sha256,omitempty"`
+	Status     InstructionStatus `json:"status"`
+	Diagnostic string            `json:"diagnostic,omitempty"`
+}
+
+// InstructionReport is the stable product projection produced alongside the
+// exact lower-trust instruction context sent to the model.
+type InstructionReport struct {
+	Sources []InstructionSource `json:"sources"`
+}
+
+// ContextCategory identifies one stable context ownership bucket.
+type ContextCategory string
+
+const (
+	ContextSystem         ContextCategory = "system"
+	ContextTask           ContextCategory = "task"
+	ContextInstructions   ContextCategory = "instructions"
+	ContextSkills         ContextCategory = "skills"
+	ContextHistory        ContextCategory = "history"
+	ContextToolResults    ContextCategory = "tool_results"
+	ContextArtifacts      ContextCategory = "artifacts"
+	ContextReservedOutput ContextCategory = "reserved_output"
+)
+
+// ContextCategoryStat is a content-free category estimate for one prepared request.
+type ContextCategoryStat struct {
+	Category ContextCategory `json:"category"`
+	Tokens   int             `json:"tokens"`
+	Items    int             `json:"items"`
+	Source   string          `json:"source"`
+}
+
+// ContextDegradation is a bounded, product-safe context fallback explanation.
+type ContextDegradation struct {
+	Kind   string `json:"kind"`
+	Reason string `json:"reason"`
+}
+
+// ContextReport describes the latest model request prepared for the active
+// conversation lane. It never contains prompt, message, file, or Tool bodies.
+type ContextReport struct {
+	Available          bool                  `json:"available"`
+	RunID              RunID                 `json:"run_id,omitempty"`
+	Attempt            int                   `json:"attempt,omitempty"`
+	CountSource        string                `json:"count_source,omitempty"`
+	Estimated          bool                  `json:"estimated"`
+	EstimatedInput     int                   `json:"estimated_input"`
+	ProviderExact      bool                  `json:"provider_exact"`
+	ProviderInput      int                   `json:"provider_input,omitempty"`
+	ContextWindow      int                   `json:"context_window,omitempty"`
+	InputBudget        int                   `json:"input_budget,omitempty"`
+	ReservedOutput     int                   `json:"reserved_output,omitempty"`
+	SafetyMargin       int                   `json:"safety_margin,omitempty"`
+	SummarizeThreshold int                   `json:"summarize_threshold,omitempty"`
+	HardLimit          int                   `json:"hard_limit,omitempty"`
+	BudgetSource       string                `json:"budget_source,omitempty"`
+	Compacted          bool                  `json:"compacted"`
+	Categories         []ContextCategoryStat `json:"categories"`
+	Degradations       []ContextDegradation  `json:"degradations,omitempty"`
+}
+
+// WorkspaceSnapshot is a bounded, content-free observation of the active
+// worktree used by presentation layers. It never exposes absolute paths or
+// changed file names.
+type WorkspaceSnapshot struct {
+	WorkspaceID  WorkspaceID `json:"workspace_id"`
+	WorktreeID   WorktreeID  `json:"worktree_id"`
+	DisplayName  string      `json:"display_name"`
+	Branch       string      `json:"branch,omitempty"`
+	Head         string      `json:"head,omitempty"`
+	Available    bool        `json:"available"`
+	Detached     bool        `json:"detached,omitempty"`
+	Dirty        bool        `json:"dirty"`
+	ChangedFiles int         `json:"changed_files,omitempty"`
+	ObservedAt   time.Time   `json:"observed_at,omitempty"`
+}
+
 // TranscriptRole identifies a product-safe transcript item author.
 type TranscriptRole string
 
@@ -288,8 +386,12 @@ type WorkflowNodeSnapshot struct {
 	Attempts           int
 	MaxAttempts        int
 	AcceptanceCriteria []string
+	ReadPaths          []string
+	WritePaths         []string
 	ResultRef          string
 	Failure            string
+	StartedAt          time.Time
+	FinishedAt         time.Time
 }
 
 // ChildAgentSnapshot is the bounded lifecycle and structured output shown to
@@ -306,6 +408,8 @@ type ChildAgentSnapshot struct {
 	Status        ChildAgentStatus
 	Attempt       int
 	Goal          string
+	ReadPaths     []string
+	WritePaths    []string
 	Conclusion    string
 	Evidence      []AgentTaskEvidence
 	Validation    []string
@@ -346,6 +450,7 @@ type WorkflowSnapshot struct {
 type Snapshot struct {
 	Revision                 uint64
 	Session                  Session
+	Workspace                WorkspaceSnapshot
 	RuntimeState             RuntimeState
 	Transcript               []TranscriptItem
 	PendingInterrupts        []PendingInterrupt

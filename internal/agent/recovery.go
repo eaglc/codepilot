@@ -17,18 +17,19 @@ import (
 // RecoveryPlan. Automatic callers stop at the next journal boundary so product
 // startup never silently continues a model conversation.
 type RecoverRequest struct {
-	SessionID        agentsession.ID
-	Lane             agentsession.Lane
-	RunID            agentsession.RunID
-	ActionID         string
-	Decision         agentsession.RecoveryDecision
-	Automatic        bool
-	ContinueRun      bool
-	SystemPrompt     string
-	Model            llm.ModelRef
-	UntrustedContext []llm.Message
-	Tools            *tool.Registry
-	Limits           RunLimits
+	SessionID                  agentsession.ID
+	Lane                       agentsession.Lane
+	RunID                      agentsession.RunID
+	ActionID                   string
+	Decision                   agentsession.RecoveryDecision
+	Automatic                  bool
+	ContinueRun                bool
+	SystemPrompt               string
+	Model                      llm.ModelRef
+	UntrustedContext           []llm.Message
+	UntrustedContextCategories []ContextCategory
+	Tools                      *tool.Registry
+	Limits                     RunLimits
 }
 
 // Recover applies one typed crash-recovery action. The plan is rebuilt and the
@@ -95,7 +96,7 @@ func (r *Runtime) normalizeRecoverRequest(recover RecoverRequest) (RunRequest, e
 	}
 	request := RunRequest{
 		SessionID: recover.SessionID, Lane: recover.Lane, RunID: recover.RunID,
-		SystemPrompt: recover.SystemPrompt, Model: recover.Model, UntrustedContext: cloneLLMMessages(recover.UntrustedContext), Tools: recover.Tools, Limits: recover.Limits,
+		SystemPrompt: recover.SystemPrompt, Model: recover.Model, UntrustedContext: cloneLLMMessages(recover.UntrustedContext), UntrustedContextCategories: append([]ContextCategory(nil), recover.UntrustedContextCategories...), Tools: recover.Tools, Limits: recover.Limits,
 	}
 	if request.Lane == "" {
 		request.Lane = agentsession.MainLane
@@ -114,7 +115,7 @@ func (r *Runtime) normalizeRecoverRequest(recover RecoverRequest) (RunRequest, e
 		request.Limits.MaxDuration = 30 * time.Minute
 	}
 	request.Limits = normalizeRetryLimits(request.Limits)
-	if err := validateUntrustedContext(request.UntrustedContext); err != nil {
+	if err := validateUntrustedContext(request.UntrustedContext, request.UntrustedContextCategories); err != nil {
 		return RunRequest{}, err
 	}
 	return request, nil

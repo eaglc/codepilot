@@ -11,7 +11,8 @@ tool availability, permissions, model selection, or policy.
 
 ## Key types
 
-- `Builder` — `NewBuilder`, `BuildSystemPrompt`, `BuildUntrustedContext`.
+- `Builder` — `NewBuilder`, `BuildSystemPrompt`, `BuildUntrustedContext`,
+  `BuildInstructionContext`.
 
 ## Dependencies
 
@@ -23,6 +24,9 @@ tool availability, permissions, model selection, or policy.
 - Guidance is structurally separated from the system prompt and explicitly
   de-authorized; hard limits (≤32 files, ≤16 KiB/file, ≤64 KiB total) with
   per-file source/scope/sha256 metadata.
+- One bounded discovery pass produces both the lower-trust model context and a
+  content-free product report with loaded, not-found, ignored, and failed
+  statuses. Non-standard names such as `AGENT.md` are diagnosed but not loaded.
 - Symlink-safe resolution and `security.RedactText` applied to guidance content.
 
 ## Tests

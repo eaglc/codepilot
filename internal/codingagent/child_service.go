@@ -74,7 +74,7 @@ func (s *Service) runWorkflowChildNodeLocked(ctx context.Context, product Sessio
 		SessionID: child.AgentSessionID, Lane: agentsession.MainLane, RunID: child.RunID,
 		UserEntryID: agentsession.EntryID("entry_" + string(child.ID)), SystemPrompt: environment.systemPrompt,
 		Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID}, UserMessage: requestMessage,
-		UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: limits,
+		UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, Limits: limits,
 	}, environment.events)
 	if result.RunID == "" {
 		result.RunID = child.RunID
@@ -154,7 +154,7 @@ func (s *Service) runPlanExploreChildLocked(ctx context.Context, product Session
 		SessionID: child.AgentSessionID, Lane: agentsession.MainLane, RunID: child.RunID,
 		UserEntryID: agentsession.EntryID("entry_" + string(child.ID)), SystemPrompt: environment.systemPrompt,
 		Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID}, UserMessage: message,
-		UntrustedContext: environment.untrustedContext, Tools: environment.tools, Limits: s.deps.Limits,
+		UntrustedContext: environment.untrustedContext, UntrustedContextCategories: environment.untrustedContextCategories, Tools: environment.tools, Limits: s.deps.Limits,
 	}, environment.events)
 	if result.RunID == "" {
 		result.RunID = child.RunID
@@ -389,7 +389,7 @@ func (s *Service) prepareChildRunEnvironment(ctx context.Context, product Sessio
 		ToolNames: names, SensitivePaths: append([]string(nil), product.SensitivePaths...),
 		ReadScope: append([]string(nil), child.Task.ReadPaths...), WriteScope: append([]string(nil), child.Task.WritePaths...),
 	}
-	systemPrompt, untrustedContext, err := buildPromptContext(ctx, s.deps.Prompts, scope)
+	systemPrompt, untrustedContext, untrustedContextCategories, err := buildPromptContext(ctx, s.deps.Prompts, scope)
 	if err != nil {
 		return runEnvironment{}, fmt.Errorf("prepare child Agent %q prompt: %w", child.ID, err)
 	}
@@ -399,7 +399,7 @@ func (s *Service) prepareChildRunEnvironment(ctx context.Context, product Sessio
 		return runEnvironment{}, err
 	}
 	events.childAgentID = child.ID
-	return runEnvironment{tools: tools, systemPrompt: systemPrompt, untrustedContext: untrustedContext, events: events}, nil
+	return runEnvironment{tools: tools, systemPrompt: systemPrompt, untrustedContext: untrustedContext, untrustedContextCategories: untrustedContextCategories, events: events}, nil
 }
 
 func childTaskMessage(child ChildAgent) (llm.Message, error) {

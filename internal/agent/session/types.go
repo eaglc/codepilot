@@ -121,6 +121,7 @@ const (
 	RecordApprovalRequested  RecordType = "approval_requested"
 	RecordApprovalResolved   RecordType = "approval_resolved"
 	RecordCheckpointSaved    RecordType = "checkpoint_saved"
+	RecordContextPrepared    RecordType = "context_prepared"
 	RecordUsage              RecordType = "usage"
 	RecordLaneForked         RecordType = "lane_forked"
 )
@@ -189,6 +190,38 @@ type CheckpointData struct {
 	Digest       string `json:"digest"`
 }
 
+// ContextCategoryData stores one content-free local context count.
+type ContextCategoryData struct {
+	Category string `json:"category"`
+	Tokens   int    `json:"tokens"`
+	Items    int    `json:"items"`
+}
+
+// ContextDegradationData stores a bounded safe fallback explanation.
+type ContextDegradationData struct {
+	Kind   string `json:"kind"`
+	Reason string `json:"reason"`
+}
+
+// ContextData records the exact request shape prepared immediately before a
+// model call. It intentionally excludes prompts, messages, paths, and schemas.
+type ContextData struct {
+	Attempt            int                      `json:"attempt"`
+	CountSource        string                   `json:"count_source"`
+	Estimated          bool                     `json:"estimated"`
+	InputTokens        int                      `json:"input_tokens"`
+	ContextWindow      int                      `json:"context_window,omitempty"`
+	InputBudget        int                      `json:"input_budget,omitempty"`
+	ReservedOutput     int                      `json:"reserved_output,omitempty"`
+	SafetyMargin       int                      `json:"safety_margin,omitempty"`
+	SummarizeThreshold int                      `json:"summarize_threshold,omitempty"`
+	HardLimit          int                      `json:"hard_limit,omitempty"`
+	BudgetSource       string                   `json:"budget_source,omitempty"`
+	Compacted          bool                     `json:"compacted,omitempty"`
+	Categories         []ContextCategoryData    `json:"categories"`
+	Degradations       []ContextDegradationData `json:"degradations,omitempty"`
+}
+
 // LaneForkData records the creation point of a durable branch lane.
 type LaneForkData struct {
 	Lane        Lane    `json:"lane"`
@@ -210,6 +243,7 @@ type Record struct {
 	Interrupt  *InterruptData  `json:"interrupt,omitempty"`
 	Approval   *ApprovalData   `json:"approval,omitempty"`
 	Checkpoint *CheckpointData `json:"checkpoint,omitempty"`
+	Context    *ContextData    `json:"context,omitempty"`
 	Usage      *llm.Usage      `json:"usage,omitempty"`
 	LaneFork   *LaneForkData   `json:"lane_fork,omitempty"`
 }

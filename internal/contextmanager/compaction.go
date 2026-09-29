@@ -81,6 +81,10 @@ type CompactionStrategy struct {
 	sanitizer  TextSanitizer
 }
 
+func (s *CompactionStrategy) statisticsPolicy(budget Budget) (Tokenizer, Policy) {
+	return s.tokenizer, s.effectivePolicy(budget)
+}
+
 // NewCompactionStrategy creates a model-neutral rolling-summary strategy.
 func NewCompactionStrategy(policy Policy, tokenizer Tokenizer, summarizer Summarizer, store SummaryStore, sanitizers ...TextSanitizer) (*CompactionStrategy, error) {
 	if err := policy.Validate(); err != nil {

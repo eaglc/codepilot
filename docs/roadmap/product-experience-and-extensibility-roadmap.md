@@ -69,53 +69,61 @@ P3 的目标是降低日常使用中的不确定感。完成后，用户不需�
 
 ### P3-01 项目指令标准化与可见性
 
-- [ ] 仓库根开发规范使用大小写精确的 `AGENTS.md` 文件名，并增加回归检查防止重新出现 `AGENT.md` 等误拼。
-- [ ] 将项目指令发现结果投影为稳定的产品 DTO，至少包含 `source`、`scope`、`sha256`、状态和有界诊断。
-- [ ] 增加 `/instructions` 页面，展示已加载、未命中、被忽略和加载失败的指令来源。
-- [ ] 在当前 Turn 或选中文件的上下文中标明实际生效的根到叶规则链。
-- [ ] 对常见误拼只给出修复提示，不静默加载非标准文件。
-- [ ] Prompt Builder 与 UI 使用同一个可信发现结果，避免展示内容与模型实际收到的内容不一致。
+- [x] 仓库根开发规范使用大小写精确的 `AGENTS.md` 文件名，并增加回归检查防止重新出现 `AGENT.md` 等误拼。
+- [x] 将项目指令发现结果投影为稳定的产品 DTO，至少包含 `source`、`scope`、`sha256`、状态和有界诊断。
+- [x] 增加 `/instructions` 页面，展示已加载、未命中、被忽略和加载失败的指令来源。
+- [x] 在当前 Turn 或选中文件的上下文中标明实际生效的根到叶规则链。
+- [x] 对常见误拼只给出修复提示，不静默加载非标准文件。
+- [x] Prompt Builder 与 UI 使用同一个可信发现结果，避免展示内容与模型实际收到的内容不一致。
 
 验收：针对同一 worktree 和 scope，UI 展示的指令集合、顺序和 digest 与 Agent Run 使用的集合完全一致；切换 worktree、敏感路径或文件 scope 后结果正确刷新；仓库文本仍无法改变权限和安全策略。
 
+完成记录：2026-09-15。指令发现现在通过单次可信边界同时生成低信任模型上下文和无正文产品报告；`/instructions [path]` 针对当前 Session/Worktree 按需刷新来源、状态和 digest，并展示全部诊断和指定路径的根到叶生效链。大小写或单复数误拼只显示修复提示，架构回归测试锁定仓库根标准文件名。
+
 ### P3-02 Context 可观测性
 
-- [ ] 在 Context Manager 输出稳定的分类统计：System、Task、Instructions、Skills、History、Tool Results、Artifacts、Reserved Output。
-- [ ] 区分 Provider 精确计数和本地估算，未知时明确显示 `estimated`，不伪造精度。
-- [ ] 增加 `/context` 页面，展示当前输入预算、保留输出、压缩阈值、最近压缩结果和降级原因。
-- [ ] Context 统计只暴露产品安全的大小和来源摘要，不回显 secret、敏感文件正文或内部 system prompt。
-- [ ] 增加指令或 Skill 后，在发起模型请求前重新执行预算检查。
+- [x] 在 Context Manager 输出稳定的分类统计：System、Task、Instructions、Skills、History、Tool Results、Artifacts、Reserved Output。
+- [x] 区分 Provider 精确计数和本地估算，未知时明确显示 `estimated`，不伪造精度。
+- [x] 增加 `/context` 页面，展示当前输入预算、保留输出、压缩阈值、最近压缩结果和降级原因。
+- [x] Context 统计只暴露产品安全的大小和来源摘要，不回显 secret、敏感文件正文或内部 system prompt。
+- [x] 增加指令或 Skill 后，在发起模型请求前重新执行预算检查。
 
 验收：用户能够解释当前 Context 的主要占用来源；摘要、Artifact 外置或安全裁剪发生后，页面与真实下一次模型输入保持一致。
 
+完成记录：2026-09-15。Context Manager 现在在最终安全清洗后、每次模型请求前记录八类稳定的无正文统计和真实预算策略；指令及未来 Skill 上下文通过显式分类进入同一次压缩与硬限制检查。`/context` 按需展示最近一次已准备请求、压缩/降级结果和 Artifact 引用占用，本地分类始终标为估算，只有 Provider 明确返回输入 token 时才单独显示精确总数。
+
 ### P3-03 多行 Composer
 
-- [ ] 将输入区改为 2–8 行自适应高度的真实多行编辑器。
-- [ ] 保持 Enter 发送、Alt+Enter 插入换行的默认语义，并允许后续 Keymap 配置覆盖。
-- [ ] 支持 CJK、emoji、组合字符、软换行、长行定位和大段粘贴。
-- [ ] 草稿按 Session 保存或显式丢弃；草稿和已发送输入历史使用不同的数据模型。
-- [ ] Provider Credential 输入继续使用独立的敏感缓冲区，不复用普通 Composer。
-- [ ] 窄终端下优先保证输入内容和确认操作可见。
+- [x] 将输入区改为 2–8 行自适应高度的真实多行编辑器。
+- [x] 保持 Enter 发送、Alt+Enter 插入换行的默认语义，并允许后续 Keymap 配置覆盖。
+- [x] 支持 CJK、emoji、组合字符、软换行、长行定位和大段粘贴。
+- [x] 草稿按 Session 保存或显式丢弃；草稿和已发送输入历史使用不同的数据模型。
+- [x] Provider Credential 输入继续使用独立的敏感缓冲区，不复用普通 Composer。
+- [x] 窄终端下优先保证输入内容和确认操作可见。
 
 验收：多行编辑、历史切换、Session 切换、取消、粘贴和窗口 resize 不丢失或错位；敏感输入仍不进入历史、草稿和日志。
 
+完成记录：2026-09-28。Composer 现在按终端单元格进行 Unicode grapheme 布局，在 2–8 行之间随显式换行和软换行自适应，并在垂直移动到边界后才进入已发送输入历史。默认 Enter/Alt+Enter 语义通过可验证的 `ComposerKeymap` 配置；大段粘贴经过换行归一化、控制字符过滤和大小上限。未发送草稿按 Session 独立保存在 UI 生命周期内，历史浏览保留进入前的草稿与光标；Provider Credential 继续使用独立的遮罩、清零敏感缓冲区。窄终端会收起次要指标，优先保留 Composer、确认区域和状态。
+
 ### P3-04 Task/Plan/Agent 状态层级
 
-- [ ] Header 使用紧凑状态 Badge 展示 workspace、branch/dirty、Direct/Plan/Workflow、Permission、Context 占用和 Provider/Model。
-- [ ] 将 Workflow 和 Child Agent 投影为可折叠树，明确 `queued/running/waiting/blocked/failed/completed`。
-- [ ] 每个节点显示角色、目标摘要、文件 scope、耗时、重试和 ChangeSet/检查结果入口。
-- [ ] 将需要用户输入、审批或 replan 的节点置于视觉优先位置。
-- [ ] 普通模型过程文本保持可访问，但不与任务状态竞争主要视觉层级。
-- [ ] 为小终端定义明确降级：状态树单独页面、Diff 全屏切换、Header 自动收缩。
+- [x] Header 使用紧凑状态 Badge 展示 workspace、branch/dirty、Direct/Plan/Workflow、Permission、Context 占用和 Provider/Model。
+- [x] 将 Workflow 和 Child Agent 投影为可折叠树，明确 `queued/running/waiting/blocked/failed/completed`。
+- [x] 每个节点显示角色、目标摘要、文件 scope、耗时、重试和 ChangeSet/检查结果入口。
+- [x] 将需要用户输入、审批或 replan 的节点置于视觉优先位置。
+- [x] 普通模型过程文本保持可访问，但不与任务状态竞争主要视觉层级。
+- [x] 为小终端定义明确降级：状态树单独页面、Diff 全屏切换、Header 自动收缩。
 
 验收：用户无需展开完整聊天即可判断任务阶段、并行度、失败位置、等待原因和下一步操作；状态全部来自 durable source of truth，而非临时文本推断。
+
+完成记录：2026-09-29。`codingagent.Snapshot` 现在提供内容无关的 workspace/Git 状态，并将 Workflow 节点和 Child Agent 的文件 scope、生命周期时间、重试、ChangeSet 与检查结果投影为稳定 DTO。TUI Header 以优先级 Badge 展示 workspace、branch/dirty、执行模式、Permission、Context 和 Provider/Model，并在窄屏自动收缩；Workflow/Child Agent 状态树只读取 durable Snapshot 枚举，不解析聊天正文。宽屏可逐节点折叠并复制，用户输入、审批和 replan 提示保持视觉优先；窄屏通过 `/status` 打开独立状态页，选中 Diff 后可用 `D` 切换全屏审核。
 
 ### P3 退出门槛
 
 - [ ] P3-01 至 P3-04 的行为测试和 UI snapshot/golden 测试通过。
 - [ ] Windows、Linux、macOS 原生 TUI 关键测试实际成功，关闭上一阶段遗留的跨平台验证项。
-- [ ] `go test ./...`、`go vet ./...`、架构依赖检查和 CLI 构建通过。
-- [ ] README、TUI Help 和文档索引与新命令保持一致。
+- [x] `go test ./...`、`go vet ./...`、架构依赖检查和 CLI 构建通过。
+- [x] README、TUI Help 和文档索引与新命令保持一致。
 
 ## 5. P4：Skills 最小可用系统
 

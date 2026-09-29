@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/eaglc/codepilot/internal/codingagent"
@@ -190,4 +192,50 @@ func padANSI(value string, width int) string {
 		value += strings.Repeat(" ", padding)
 	}
 	return value
+}
+
+func (m *Model) handleDiffFocusKey(message tea.KeyPressMsg) tea.Cmd {
+	key := message.Key()
+	if key.Code == tea.KeyEscape || key.Code == tea.KeyEsc || strings.EqualFold(key.Text, "q") || strings.EqualFold(key.Text, "d") {
+		m.diffFocus = false
+		return nil
+	}
+	switch key.Code {
+	case tea.KeyUp:
+		m.diffScroll = max(0, m.diffScroll-1)
+	case tea.KeyDown:
+		m.diffScroll++
+	case tea.KeyPgUp:
+		m.diffScroll = max(0, m.diffScroll-max(1, m.height-3))
+	case tea.KeyPgDown:
+		m.diffScroll += max(1, m.height-3)
+	case tea.KeyHome:
+		m.diffScroll = 0
+	case tea.KeyEnd:
+		m.diffScroll = m.diffMaxScroll
+	}
+	return nil
+}
+
+func (m *Model) diffFocusView(width, height int) tea.View {
+	pane, available := m.selectedDiffPane()
+	if !available {
+		m.diffFocus = false
+		return m.View()
+	}
+	contentHeight := max(1, height-1)
+	lines, maxScroll := renderDiffPane(pane, width, contentHeight, m.diffScroll)
+	m.diffMaxScroll = maxScroll
+	m.diffScroll = min(max(0, m.diffScroll), maxScroll)
+	for len(lines) < contentHeight {
+		lines = append(lines, "")
+	}
+	lines = append(lines, theme.muted.Render("↑/↓ scroll  •  D, q, or Esc returns to conversation"))
+	view := tea.NewView(strings.Join(lines[:height], "\n"))
+	view.AltScreen = true
+	view.MouseMode = tea.MouseModeCellMotion
+	view.WindowTitle = "CodePilot Changes"
+	view.BackgroundColor = lipgloss.Color("#111318")
+	view.ForegroundColor = lipgloss.Color("#E5E7EB")
+	return view
 }

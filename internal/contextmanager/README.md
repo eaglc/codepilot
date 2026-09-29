@@ -24,6 +24,7 @@ provider-neutral — it depends only on `llm` and injects `Summarizer` /
 - `Summary` / `SummaryFact` — durable, provider-neutral summary and its facts.
 - `ExtractSummaryFacts` / `ValidateSummaryFacts` / `FormatSummaryInput` — summary fact safety.
 - `Tokenizer` / `ByteTokenizer` — token estimation seam.
+- `Statistics` / `CategoryStatistics` / `Measure` — stable content-free request accounting.
 - `CurrentTurnTooLargeError` — returned when the current turn alone exceeds the budget.
 
 ## Dependencies
@@ -49,11 +50,14 @@ provider-neutral — it depends only on `llm` and injects `Summarizer` /
   turns. A summary that still cannot fit is not persisted as authoritative.
 - Request-scoped ephemeral context remains visible to the primary model but is
   excluded from durable summary sources.
+- Every selected request is partitioned into stable System, Task, Instructions,
+  Skills, History, Tool Results, Artifacts, and Reserved Output buckets. Local
+  byte-tokenizer counts remain explicitly estimated and contain no source body.
 - Any failure (summary generation, sanitizer, cache) falls back to whole-turn
   `safeTrim` with a recorded `Degradation`, never a hard error.
 
 ## Tests
 
-- `compaction_test.go` — tool-aware summaries reused across model switch,
+- `compaction_test.go`, `statistics_test.go` — tool-aware summaries reused across model switch,
   sanitization, hard-limit whole-turn trimming, budget override, fact
   consistency, and golden `FormatSummaryInput` fixtures.

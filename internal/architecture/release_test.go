@@ -52,6 +52,27 @@ func TestReleaseConfigurationKeepsIdentityPackagingAndSupplyChainGates(t *testin
 	}
 }
 
+func TestRepositoryUsesCanonicalAgentsFilename(t *testing.T) {
+	root := filepath.Join("..", "..")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read repository root: %v", err)
+	}
+	canonicalFound := false
+	for _, entry := range entries {
+		if entry.Name() == "AGENTS.md" {
+			canonicalFound = !entry.IsDir()
+			continue
+		}
+		if strings.EqualFold(entry.Name(), "AGENTS.md") || strings.EqualFold(entry.Name(), "AGENT.md") {
+			t.Fatalf("repository root contains non-standard %s; rename it to AGENTS.md", entry.Name())
+		}
+	}
+	if !canonicalFound {
+		t.Fatal("repository root must contain the canonical AGENTS.md instruction file")
+	}
+}
+
 func readYAMLFile(t *testing.T, path string) string {
 	t.Helper()
 	content, err := os.ReadFile(path)

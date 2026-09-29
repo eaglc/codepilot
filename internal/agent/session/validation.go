@@ -124,6 +124,10 @@ func (r Record) Validate() error {
 		if r.Checkpoint == nil || r.Checkpoint.CheckpointID == "" || r.Checkpoint.Digest == "" {
 			return fmt.Errorf("validate checkpoint record %q: checkpoint metadata is incomplete", r.ID)
 		}
+	case RecordContextPrepared:
+		if err := validateContextData(r.Context); err != nil {
+			return fmt.Errorf("validate context-prepared record %q: %w", r.ID, err)
+		}
 	case RecordUsage:
 		if r.Usage == nil {
 			return fmt.Errorf("validate usage record %q: usage is missing", r.ID)
@@ -134,6 +138,44 @@ func (r Record) Validate() error {
 		}
 	default:
 		return fmt.Errorf("validate session record %q: unsupported type %q", r.ID, r.Type)
+	}
+	return nil
+}
+
+func validateContextData(value *ContextData) error {
+	if value == nil || value.Attempt < 1 || value.CountSource == "" || value.InputTokens < 0 {
+		return fmt.Errorf("context metadata is incomplete")
+	}
+	if value.ContextWindow < 0 || value.InputBudget < 0 || value.ReservedOutput < 0 || value.SafetyMargin < 0 || value.SummarizeThreshold < 0 || value.HardLimit < 0 {
+		return fmt.Errorf("context bounds cannot be negative")
+	}
+	if len(value.Categories) != 8 || len(value.Degradations) > 16 {
+		return fmt.Errorf("context category or degradation count is invalid")
+	}
+	expected := []string{"system", "task", "instructions", "skills", "history", "tool_results", "artifacts", "reserved_output"}
+	inputTokens := 0
+	for index, category := range value.Categories {
+		if category.Category == "" || category.Tokens < 0 || category.Items < 0 {
+			return fmt.Errorf("context category is invalid")
+		}
+		if category.Category != expected[index] {
+			return fmt.Errorf("context category %d must be %q", index, expected[index])
+		}
+		if category.Category == "reserved_output" {
+			if category.Tokens != value.ReservedOutput {
+				return fmt.Errorf("reserved output category does not match budget")
+			}
+			continue
+		}
+		inputTokens += category.Tokens
+	}
+	if inputTokens != value.InputTokens {
+		return fmt.Errorf("context categories do not match input total")
+	}
+	for _, degradation := range value.Degradations {
+		if degradation.Kind == "" || degradation.Reason == "" || len(degradation.Kind) > 128 || len(degradation.Reason) > 1024 {
+			return fmt.Errorf("context degradation is invalid")
+		}
 	}
 	return nil
 }

@@ -445,6 +445,55 @@ func TestRuntimeRetriesOnlyUnobservedTransientModelFailures(t *testing.T) {
 	}
 }
 
+func TestRuntimeRecordsFinalContextBeforeProviderUsage(t *testing.T) {
+	repository := agentsession.NewMemoryRepository()
+	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-context"}); err != nil {
+		t.Fatal(err)
+	}
+	manager, _ := contextmanager.NewManager()
+	usage := llm.Usage{InputTokens: 37, OutputTokens: 4, TotalTokens: 41}
+	model := &fakeModel{responses: []llm.Message{{
+		Role: llm.RoleAssistant, Provider: "test", Model: "model", StopReason: llm.StopReasonStop,
+		Content: []llm.Content{{Type: llm.ContentText, Text: "done"}}, Usage: &usage,
+	}}}
+	runtime, _ := NewRuntime(Dependencies{Models: fakeModelFactory{model: model}, Contexts: manager, Sessions: repository, IDs: &sequenceIDs{}})
+	result, err := runtime.Run(context.Background(), RunRequest{
+		SessionID: "session-context", RunID: "run-context", UserEntryID: "user-context",
+		Model: llm.ModelRef{Provider: "test", Model: "model"}, SystemPrompt: "trusted policy",
+		UserMessage:                llm.Message{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "task"}}},
+		UntrustedContext:           []llm.Message{{Role: llm.RoleUser, Content: []llm.Content{{Type: llm.ContentText, Text: "project rules"}}}},
+		UntrustedContextCategories: []ContextCategory{ContextInstructions},
+	}, &eventCollector{})
+	if err != nil || result.Status != RunCompleted {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	snapshot, _ := repository.Load(context.Background(), "session-context")
+	var prepared, provider uint64
+	for _, record := range snapshot.Records {
+		if record.Type == agentsession.RecordContextPrepared {
+			prepared = record.Sequence
+			if record.Context == nil || len(record.Context.Categories) != 8 || record.Context.InputTokens <= 0 {
+				t.Fatalf("context record = %#v", record.Context)
+			}
+			for _, category := range record.Context.Categories {
+				if category.Category == string(contextmanager.CategoryInstructions) && category.Tokens <= 0 {
+					t.Fatalf("instruction category was not budgeted: %#v", record.Context.Categories)
+				}
+			}
+			encoded, encodeErr := json.Marshal(record.Context)
+			if encodeErr != nil || strings.Contains(string(encoded), "project rules") || strings.Contains(string(encoded), "trusted policy") {
+				t.Fatalf("context record exposed request content: %s err=%v", encoded, encodeErr)
+			}
+		}
+		if record.Type == agentsession.RecordUsage && record.Usage != nil && record.Usage.InputTokens == 37 {
+			provider = record.Sequence
+		}
+	}
+	if prepared == 0 || provider <= prepared {
+		t.Fatalf("context/provider sequence = %d/%d records=%#v", prepared, provider, snapshot.Records)
+	}
+}
+
 func TestRuntimeDoesNotRetryAfterVisibleStreamDelta(t *testing.T) {
 	repository := agentsession.NewMemoryRepository()
 	if err := repository.Create(context.Background(), agentsession.Metadata{ID: "session-partial"}); err != nil {

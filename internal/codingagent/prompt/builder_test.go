@@ -79,6 +79,71 @@ func TestBuilderLoadsOnlyBoundedScopedAgentsFilesAsUntrustedGuidance(t *testing.
 	}
 }
 
+func TestBuilderInstructionReportMatchesLoadedContextAndDiagnosesIgnoredSources(t *testing.T) {
+	root := t.TempDir()
+	initializePromptGit(t, root)
+	writeInstructionFixture(t, filepath.Join(root, "AGENTS.md"), "Root guidance")
+	writeInstructionFixture(t, filepath.Join(root, "internal", "AGENTS.md"), "Nested guidance")
+	writeInstructionFixture(t, filepath.Join(root, "typo", "AGENT.md"), "Must not load")
+	writeInstructionFixture(t, filepath.Join(root, "private", "AGENTS.md"), "Private guidance")
+
+	messages, report, err := NewBuilder().BuildInstructionContext(context.Background(), codingagent.PromptScope{
+		WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+		SensitivePaths: []string{"private"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("instruction messages = %#v", messages)
+	}
+	contextValue := messages[0].Content[0].Text
+	statuses := make(map[string]codingagent.InstructionSource)
+	for _, source := range report.Sources {
+		statuses[source.Source] = source
+		if source.Status == codingagent.InstructionLoaded {
+			if source.SHA256 == "" || !strings.Contains(contextValue, source.Source) || !strings.Contains(contextValue, source.SHA256) {
+				t.Fatalf("loaded source does not match model context: source=%#v context=%q", source, contextValue)
+			}
+		}
+	}
+	for _, source := range []string{"AGENTS.md", "internal/AGENTS.md"} {
+		if statuses[source].Status != codingagent.InstructionLoaded {
+			t.Fatalf("source %q status = %#v", source, statuses[source])
+		}
+	}
+	for _, source := range []string{"typo/AGENT.md", "private/AGENTS.md"} {
+		if statuses[source].Status != codingagent.InstructionIgnored || statuses[source].Diagnostic == "" {
+			t.Fatalf("source %q status = %#v", source, statuses[source])
+		}
+		if strings.Contains(contextValue, source) {
+			t.Fatalf("ignored source %q entered model context: %q", source, contextValue)
+		}
+	}
+}
+
+func TestBuilderReportsMissingCanonicalRootAndDoesNotLoadMisspelling(t *testing.T) {
+	root := t.TempDir()
+	initializePromptGit(t, root)
+	writeInstructionFixture(t, filepath.Join(root, "AGENT.md"), "Non-standard guidance")
+
+	messages, report, err := NewBuilder().BuildInstructionContext(context.Background(), codingagent.PromptScope{
+		WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 0 || len(report.Sources) != 2 {
+		t.Fatalf("messages=%#v report=%#v", messages, report)
+	}
+	if report.Sources[0].Source != "AGENT.md" || report.Sources[0].Status != codingagent.InstructionIgnored {
+		t.Fatalf("misspelled source = %#v", report.Sources[0])
+	}
+	if report.Sources[1].Source != "AGENTS.md" || report.Sources[1].Status != codingagent.InstructionNotFound {
+		t.Fatalf("canonical source = %#v", report.Sources[1])
+	}
+}
+
 func TestPlanPromptDoesNotEagerlyReadRepositoryGuidance(t *testing.T) {
 	root := t.TempDir()
 	initializePromptGit(t, root)
@@ -131,6 +196,21 @@ func TestBuilderRejectsOversizedProjectInstruction(t *testing.T) {
 	})
 	if err == nil || strings.Contains(err.Error(), root) || !strings.Contains(err.Error(), "size limit") {
 		t.Fatalf("oversized guidance error = %v", err)
+	}
+}
+
+func TestBuilderReportsOversizedProjectInstructionWithoutContent(t *testing.T) {
+	root := t.TempDir()
+	initializePromptGit(t, root)
+	writeInstructionFixture(t, filepath.Join(root, "AGENTS.md"), strings.Repeat("x", maxInstructionFileSize+1))
+	messages, report, err := NewBuilder().BuildInstructionContext(context.Background(), codingagent.PromptScope{
+		WorkspaceID: "workspace", WorktreeID: "worktree", WorktreeRoot: root,
+	})
+	if err == nil || len(messages) != 0 || len(report.Sources) != 1 {
+		t.Fatalf("messages=%#v report=%#v err=%v", messages, report, err)
+	}
+	if report.Sources[0].Status != codingagent.InstructionFailed || report.Sources[0].SHA256 != "" || !strings.Contains(report.Sources[0].Diagnostic, "size limit") {
+		t.Fatalf("oversized source report = %#v", report.Sources[0])
 	}
 }
 

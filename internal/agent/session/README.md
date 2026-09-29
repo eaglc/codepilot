@@ -7,7 +7,7 @@ contract, and crash-recovery analysis.
 ## Purpose
 
 Entries form the model context tree; Records store execution facts (operation,
-step, tool, approval, usage, compaction, lane) that don't necessarily enter the
+step, tool, approval, usage, prepared-context statistics, compaction, lane) that don't necessarily enter the
 model context but are needed for recovery and audit. The package is deliberately
 unaware of workspaces, Git, or the TUI — it only knows how to save enough data to
 rebuild model context and decide a recovery strategy.
@@ -17,7 +17,8 @@ rebuild model context and decide a recovery strategy.
 - `ID` / `EntryID` / `RecordID` / `RunID` / `Lane` / `MainLane`.
 - `Entry` — tagged union (`EntryMessage`, `EntryModelChange`, `EntryCompaction`,
   `EntryBranchSummary`, `EntryCustomMessage`, …) with `Validate()`.
-- `Record` — tagged union of 14 record kinds with `Validate()`.
+- `Record` — tagged union of 15 record kinds with `Validate()`; `ContextData`
+  persists only bounded counts, budget metadata, and safe degradation reasons.
 - `Repository` — `Create`, `Load`, `List`, `SetArchived`, `AppendEntry`, `AppendRecord`, `ForkLane`.
 - `Snapshot` / `Metadata` — the rebuildable in-memory view and session metadata.
 - `MemoryRepository` — in-memory `Repository` for tests.

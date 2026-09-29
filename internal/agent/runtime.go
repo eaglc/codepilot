@@ -44,6 +44,25 @@ type DataPolicy interface {
 	SanitizeText(value string) string
 }
 
+// ContextCategory identifies one provider-neutral context ownership bucket at
+// the product-to-runtime boundary.
+type ContextCategory string
+
+const (
+	ContextTask         ContextCategory = "task"
+	ContextInstructions ContextCategory = "instructions"
+	ContextSkills       ContextCategory = "skills"
+	ContextHistory      ContextCategory = "history"
+	ContextToolResults  ContextCategory = "tool_results"
+	ContextArtifacts    ContextCategory = "artifacts"
+)
+
+// ContextCategoryPolicy optionally classifies already-sanitized messages into
+// product-safe context statistics buckets.
+type ContextCategoryPolicy interface {
+	ContextCategory(message llm.Message) ContextCategory
+}
+
 // TextStreamSanitizer preserves a data policy while making safe text prefixes
 // observable before the provider finishes the whole response.
 type TextStreamSanitizer interface {
@@ -121,31 +140,33 @@ type RunLimits struct {
 
 // RunRequest starts one user-triggered run on an existing Agent session lane.
 type RunRequest struct {
-	SessionID         agentsession.ID
-	Lane              agentsession.Lane
-	RunID             agentsession.RunID
-	UserEntryID       agentsession.EntryID
-	SystemPrompt      string
-	Model             llm.ModelRef
-	UserMessage       llm.Message
-	UntrustedContext  []llm.Message
-	Tools             *tool.Registry
-	ToolCallPreviewer ToolCallStreamPreviewer
-	Limits            RunLimits
+	SessionID                  agentsession.ID
+	Lane                       agentsession.Lane
+	RunID                      agentsession.RunID
+	UserEntryID                agentsession.EntryID
+	SystemPrompt               string
+	Model                      llm.ModelRef
+	UserMessage                llm.Message
+	UntrustedContext           []llm.Message
+	UntrustedContextCategories []ContextCategory
+	Tools                      *tool.Registry
+	ToolCallPreviewer          ToolCallStreamPreviewer
+	Limits                     RunLimits
 }
 
 // ContinueRequest starts another Run in an existing conversation without
 // appending a synthetic user message.
 type ContinueRequest struct {
-	SessionID         agentsession.ID
-	Lane              agentsession.Lane
-	RunID             agentsession.RunID
-	SystemPrompt      string
-	Model             llm.ModelRef
-	UntrustedContext  []llm.Message
-	Tools             *tool.Registry
-	ToolCallPreviewer ToolCallStreamPreviewer
-	Limits            RunLimits
+	SessionID                  agentsession.ID
+	Lane                       agentsession.Lane
+	RunID                      agentsession.RunID
+	SystemPrompt               string
+	Model                      llm.ModelRef
+	UntrustedContext           []llm.Message
+	UntrustedContextCategories []ContextCategory
+	Tools                      *tool.Registry
+	ToolCallPreviewer          ToolCallStreamPreviewer
+	Limits                     RunLimits
 }
 
 // RunStatus describes how a generic Agent run returned to its caller.
@@ -175,17 +196,18 @@ type RunResult struct {
 // ResumeRequest supplies the product-resolved result for one durable interrupt.
 // It does not add another user message or create another operation.
 type ResumeRequest struct {
-	SessionID         agentsession.ID
-	Lane              agentsession.Lane
-	RunID             agentsession.RunID
-	InterruptID       string
-	Resolution        tool.Result
-	SystemPrompt      string
-	Model             llm.ModelRef
-	UntrustedContext  []llm.Message
-	Tools             *tool.Registry
-	ToolCallPreviewer ToolCallStreamPreviewer
-	Limits            RunLimits
+	SessionID                  agentsession.ID
+	Lane                       agentsession.Lane
+	RunID                      agentsession.RunID
+	InterruptID                string
+	Resolution                 tool.Result
+	SystemPrompt               string
+	Model                      llm.ModelRef
+	UntrustedContext           []llm.Message
+	UntrustedContextCategories []ContextCategory
+	Tools                      *tool.Registry
+	ToolCallPreviewer          ToolCallStreamPreviewer
+	Limits                     RunLimits
 }
 
 // Run executes model steps and centrally journals all tool activity.
@@ -472,6 +494,10 @@ func (r *Runtime) runSteps(ctx context.Context, request RunRequest, dispatcher *
 		chatRequest := llm.ChatRequest{
 			Model: request.Model, SystemPrompt: r.dataPolicy.SanitizeText(contextResult.SystemPrompt), Messages: unwrapMessages(safeContext), Tools: request.Tools.Definitions(),
 		}
+		statistics := contextmanager.Recount(contextResult.Statistics, chatRequest.SystemPrompt, safeContext, chatRequest.Tools)
+		if err := r.recordContextPrepared(ctx, request, step, statistics, contextResult.Degradations); err != nil {
+			return r.failRun(ctx, request, dispatcher, step-1, "record_context_prepared", err)
+		}
 		assistant, err := r.streamAssistantWithRetry(ctx, request, model, chatRequest, dispatcher)
 		if err != nil {
 			return r.failRun(ctx, request, dispatcher, step-1, "model_step", err)
@@ -604,7 +630,8 @@ func (r *Runtime) normalizeRequest(request RunRequest) (RunRequest, error) {
 		return RunRequest{}, fmt.Errorf("run agent: %w", err)
 	}
 	request.UntrustedContext = cloneLLMMessages(request.UntrustedContext)
-	if err := validateUntrustedContext(request.UntrustedContext); err != nil {
+	request.UntrustedContextCategories = append([]ContextCategory(nil), request.UntrustedContextCategories...)
+	if err := validateUntrustedContext(request.UntrustedContext, request.UntrustedContextCategories); err != nil {
 		return RunRequest{}, err
 	}
 	if request.Tools == nil {
@@ -634,7 +661,7 @@ func (r *Runtime) normalizeContinueRequest(continuation ContinueRequest) (RunReq
 	request := RunRequest{
 		SessionID: continuation.SessionID, Lane: continuation.Lane, RunID: continuation.RunID,
 		SystemPrompt: continuation.SystemPrompt, Model: continuation.Model,
-		UntrustedContext: cloneLLMMessages(continuation.UntrustedContext), Tools: continuation.Tools,
+		UntrustedContext: cloneLLMMessages(continuation.UntrustedContext), UntrustedContextCategories: append([]ContextCategory(nil), continuation.UntrustedContextCategories...), Tools: continuation.Tools,
 		ToolCallPreviewer: continuation.ToolCallPreviewer, Limits: continuation.Limits,
 	}
 	if request.Lane == "" {
@@ -654,7 +681,7 @@ func (r *Runtime) normalizeContinueRequest(continuation ContinueRequest) (RunReq
 		request.Limits.MaxDuration = 30 * time.Minute
 	}
 	request.Limits = normalizeRetryLimits(request.Limits)
-	if err := validateUntrustedContext(request.UntrustedContext); err != nil {
+	if err := validateUntrustedContext(request.UntrustedContext, request.UntrustedContextCategories); err != nil {
 		return RunRequest{}, err
 	}
 	return request, nil
@@ -673,9 +700,12 @@ func validateExclusiveControlCalls(registry *tool.Registry, calls []llm.ToolCall
 	return nil
 }
 
-func validateUntrustedContext(messages []llm.Message) error {
+func validateUntrustedContext(messages []llm.Message, categories []ContextCategory) error {
 	if len(messages) > 16 {
 		return errors.New("run agent: untrusted context exceeds its message limit")
+	}
+	if len(categories) != 0 && len(categories) != len(messages) {
+		return errors.New("run agent: untrusted context categories do not match messages")
 	}
 	for index, message := range messages {
 		if message.Role != llm.RoleUser {
@@ -683,6 +713,9 @@ func validateUntrustedContext(messages []llm.Message) error {
 		}
 		if err := message.Validate(); err != nil {
 			return fmt.Errorf("run agent: untrusted context message %d: %w", index, err)
+		}
+		if len(categories) != 0 && !validContextCategory(categories[index]) {
+			return fmt.Errorf("run agent: untrusted context message %d has invalid category %q", index, categories[index])
 		}
 	}
 	return nil
@@ -711,7 +744,7 @@ func (r *Runtime) normalizeResumeRequest(resume ResumeRequest) (RunRequest, erro
 	}
 	request := RunRequest{
 		SessionID: resume.SessionID, Lane: resume.Lane, RunID: resume.RunID,
-		SystemPrompt: resume.SystemPrompt, Model: resume.Model, UntrustedContext: cloneLLMMessages(resume.UntrustedContext), Tools: resume.Tools,
+		SystemPrompt: resume.SystemPrompt, Model: resume.Model, UntrustedContext: cloneLLMMessages(resume.UntrustedContext), UntrustedContextCategories: append([]ContextCategory(nil), resume.UntrustedContextCategories...), Tools: resume.Tools,
 		ToolCallPreviewer: resume.ToolCallPreviewer, Limits: resume.Limits,
 	}
 	if request.Lane == "" {
@@ -731,7 +764,7 @@ func (r *Runtime) normalizeResumeRequest(resume ResumeRequest) (RunRequest, erro
 		request.Limits.MaxDuration = 30 * time.Minute
 	}
 	request.Limits = normalizeRetryLimits(request.Limits)
-	if err := validateUntrustedContext(request.UntrustedContext); err != nil {
+	if err := validateUntrustedContext(request.UntrustedContext, request.UntrustedContextCategories); err != nil {
 		return RunRequest{}, err
 	}
 	return request, nil
@@ -792,18 +825,25 @@ func (r *Runtime) buildContext(ctx context.Context, request RunRequest, dispatch
 		if coveredThrough >= 0 && index <= coveredThrough {
 			continue
 		}
-		messages = append(messages, contextmanager.Message{EntryID: string(entry.ID), TurnID: string(entry.RunID), Message: entry.Message.Clone()})
+		message := contextmanager.Message{EntryID: string(entry.ID), TurnID: string(entry.RunID), Message: entry.Message.Clone()}
+		message.Category = contextmanager.Category(r.contextCategory(message.Message))
+		messages = append(messages, message)
 	}
 	if len(messages) == 0 {
 		return contextmanager.Result{}, errors.New("build agent context: branch has no messages")
 	}
 	messages[len(messages)-1].Current = true
+	messages[len(messages)-1].Category = contextmanager.CategoryTask
 	if len(request.UntrustedContext) != 0 {
 		current := messages[len(messages)-1]
 		messages = messages[:len(messages)-1]
 		for index, message := range request.UntrustedContext {
+			category := ContextTask
+			if len(request.UntrustedContextCategories) != 0 {
+				category = request.UntrustedContextCategories[index]
+			}
 			messages = append(messages, contextmanager.Message{
-				EntryID: fmt.Sprintf("untrusted-context:%s:%d", request.RunID, index+1), TurnID: string(request.RunID), Message: message.Clone(), Ephemeral: true,
+				EntryID: fmt.Sprintf("untrusted-context:%s:%d", request.RunID, index+1), TurnID: string(request.RunID), Message: message.Clone(), Ephemeral: true, Category: contextmanager.Category(category),
 			})
 		}
 		messages = append(messages, current)
@@ -821,6 +861,60 @@ func (r *Runtime) buildContext(ctx context.Context, request RunRequest, dispatch
 			return dispatcher.publish(ctx, Event{Kind: EventCompactionStarted, Compaction: &CompactionEvent{
 				SourceDigest: boundary.SourceDigest, FromEntryID: boundary.FromEntryID, ToEntryID: boundary.ToEntryID,
 			}})
+		},
+	})
+}
+
+func validContextCategory(category ContextCategory) bool {
+	switch category {
+	case ContextTask, ContextInstructions, ContextSkills:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Runtime) contextCategory(message llm.Message) ContextCategory {
+	if classifier, ok := r.dataPolicy.(ContextCategoryPolicy); ok {
+		if category := classifier.ContextCategory(message); category != "" {
+			return category
+		}
+	}
+	if message.Role == llm.RoleTool {
+		return ContextToolResults
+	}
+	return ContextHistory
+}
+
+func (r *Runtime) recordContextPrepared(ctx context.Context, request RunRequest, attempt int, statistics contextmanager.Statistics, degradations []contextmanager.Degradation) error {
+	categories := make([]agentsession.ContextCategoryData, len(statistics.Categories))
+	for index, category := range statistics.Categories {
+		categories[index] = agentsession.ContextCategoryData{Category: string(category.Category), Tokens: category.Tokens, Items: category.Items}
+	}
+	limit := min(len(degradations), 16)
+	safeDegradations := make([]agentsession.ContextDegradationData, 0, limit)
+	for _, degradation := range degradations[:limit] {
+		kind := r.dataPolicy.SanitizeText(degradation.Kind)
+		reason := r.dataPolicy.SanitizeText(degradation.Reason)
+		if len(kind) > 128 {
+			kind = kind[:128]
+		}
+		if len(reason) > 1024 {
+			reason = reason[:1024]
+		}
+		if kind != "" && reason != "" {
+			safeDegradations = append(safeDegradations, agentsession.ContextDegradationData{Kind: kind, Reason: reason})
+		}
+	}
+	return r.appendRecord(ctx, request, agentsession.Record{
+		Type: agentsession.RecordContextPrepared, RunID: request.RunID,
+		Context: &agentsession.ContextData{
+			Attempt: attempt, CountSource: statistics.CountSource, Estimated: statistics.Estimated,
+			InputTokens: statistics.InputTokens, ContextWindow: statistics.ContextWindow, InputBudget: statistics.InputBudget,
+			ReservedOutput: statistics.ReservedOutput, SafetyMargin: statistics.SafetyMargin,
+			SummarizeThreshold: statistics.SummarizeThreshold, HardLimit: statistics.HardLimit,
+			BudgetSource: statistics.BudgetSource, Compacted: statistics.Compacted,
+			Categories: categories, Degradations: safeDegradations,
 		},
 	})
 }

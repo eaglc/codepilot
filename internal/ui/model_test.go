@@ -14,10 +14,20 @@ import (
 	"github.com/eaglc/codepilot/internal/codingagent"
 )
 
-type fakeClient struct{ snapshot codingagent.Snapshot }
+type fakeClient struct {
+	snapshot      codingagent.Snapshot
+	instructions  []codingagent.InstructionSource
+	contextReport codingagent.ContextReport
+}
 
 func (c fakeClient) Snapshot(context.Context, codingagent.SessionID) (codingagent.Snapshot, error) {
 	return c.snapshot, nil
+}
+func (c fakeClient) Instructions(context.Context, codingagent.SessionID) ([]codingagent.InstructionSource, error) {
+	return append([]codingagent.InstructionSource(nil), c.instructions...), nil
+}
+func (c fakeClient) Context(context.Context, codingagent.SessionID) (codingagent.ContextReport, error) {
+	return c.contextReport, nil
 }
 func (fakeClient) ListSessions(context.Context, codingagent.SessionListOptions) ([]codingagent.Session, error) {
 	return nil, nil
@@ -422,7 +432,7 @@ func TestComposerFooterPlacesStatusBelowInput(t *testing.T) {
 	model.width, model.height = 60, 10
 	lines := strings.Split(model.View().Content, "\n")
 	if len(lines) != model.height ||
-		!strings.Contains(lines[len(lines)-4], "❯") ||
+		!strings.Contains(lines[len(lines)-5], "❯") ||
 		!strings.Contains(ansi.Strip(lines[len(lines)-3]), "────") ||
 		!strings.Contains(ansi.Strip(lines[len(lines)-2]), "Current context 40") ||
 		!strings.Contains(ansi.Strip(lines[len(lines)-1]), "Ready") {
@@ -450,10 +460,10 @@ func TestComposerUsesNativeCursorForChineseAndEmojiInput(t *testing.T) {
 	if string(model.input) != "中文🙂" || model.cursor != 3 {
 		t.Fatalf("input=%q cursor=%d", string(model.input), model.cursor)
 	}
-	if view.Cursor == nil || view.Cursor.X != ansi.StringWidth("❯ 中文🙂") || view.Cursor.Y != model.height-4 {
-		t.Fatalf("native cursor=%#v want x=%d y=%d", view.Cursor, ansi.StringWidth("❯ 中文🙂"), model.height-4)
+	if view.Cursor == nil || view.Cursor.X != ansi.StringWidth("❯ 中文🙂") || view.Cursor.Y != model.height-5 {
+		t.Fatalf("native cursor=%#v want x=%d y=%d", view.Cursor, ansi.StringWidth("❯ 中文🙂"), model.height-5)
 	}
-	prompt := strings.Split(view.Content, "\n")[model.height-4]
+	prompt := strings.Split(view.Content, "\n")[model.height-5]
 	if got := ansi.Strip(prompt); got != "❯ 中文🙂" || strings.Contains(prompt, "\x1b[7m") {
 		t.Fatalf("prompt contains a fake cursor or duplicate text: %q", prompt)
 	}
@@ -474,7 +484,7 @@ func TestComposerUsesNativeCursorForChineseAndEmojiInput(t *testing.T) {
 	}
 }
 
-func TestComposerHorizontallyKeepsWideCursorOnScreen(t *testing.T) {
+func TestComposerKeepsWideSoftWrappedCursorOnScreen(t *testing.T) {
 	bridge, _ := NewEventBridge(2)
 	defer bridge.Close()
 	snapshot := codingagent.Snapshot{Session: codingagent.Session{ID: "session", Title: "repo"}}
@@ -489,7 +499,7 @@ func TestComposerHorizontallyKeepsWideCursorOnScreen(t *testing.T) {
 	if view.Cursor == nil || view.Cursor.X < 0 || view.Cursor.X >= model.width {
 		t.Fatalf("off-screen cursor: %#v", view.Cursor)
 	}
-	prompt := strings.Split(view.Content, "\n")[model.height-4]
+	prompt := strings.Split(view.Content, "\n")[view.Cursor.Y]
 	if width := ansi.StringWidth(prompt); width > model.width {
 		t.Fatalf("prompt width=%d exceeds terminal width=%d: %q", width, model.width, prompt)
 	}
@@ -990,6 +1000,93 @@ func TestSlashInputShowsFilteredRegistryCompletion(t *testing.T) {
 	}
 }
 
+func TestInstructionsCommandShowsSourcesAndEffectiveScope(t *testing.T) {
+	bridge, _ := NewEventBridge(2)
+	defer bridge.Close()
+	snapshot := codingagent.Snapshot{Session: codingagent.Session{ID: "session", Title: "repo"}}
+	client := fakeClient{
+		snapshot: snapshot,
+		instructions: []codingagent.InstructionSource{
+			{Source: "AGENTS.md", Scope: ".", SHA256: strings.Repeat("a", 64), Status: codingagent.InstructionLoaded},
+			{Source: "docs/AGENTS.md", Scope: "docs", SHA256: strings.Repeat("b", 64), Status: codingagent.InstructionLoaded},
+			{Source: "internal/AGENTS.md", Scope: "internal", SHA256: strings.Repeat("c", 64), Status: codingagent.InstructionLoaded},
+			{Source: "internal/AGENT.md", Scope: "internal", Status: codingagent.InstructionIgnored, Diagnostic: "Use the exact filename AGENTS.md."},
+		},
+	}
+	model, err := NewModel(context.Background(), client, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width, model.height = 100, 30
+	command := runInstructionsCommand(model, "internal/ui/model.go")
+	if command == nil || !model.instructionsActive || !model.instructionsLoading {
+		t.Fatalf("instructions command = %#v active=%v loading=%v", command, model.instructionsActive, model.instructionsLoading)
+	}
+	model.Update(command())
+	view := ansi.Strip(model.View().Content)
+	for _, expected := range []string{"Project instructions", "Scope: internal/ui/model.go", "loaded", "not matched", "ignored", "sha256 aaaaaaaaaaaa", "1. AGENTS.md", "2. internal/AGENTS.md"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("instructions page does not contain %q: %q", expected, view)
+		}
+	}
+	model.height = 8
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnd}))
+	if view := ansi.Strip(model.View().Content); !strings.Contains(view, "Effective root-to-leaf chain") {
+		t.Fatalf("End did not reveal the bottom of the instructions page: %q", view)
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEscape}))
+	if model.instructionsActive {
+		t.Fatal("Esc did not close instructions page")
+	}
+}
+
+func TestContextCommandDistinguishesEstimatedAndProviderExactCounts(t *testing.T) {
+	bridge, _ := NewEventBridge(2)
+	defer bridge.Close()
+	snapshot := codingagent.Snapshot{Session: codingagent.Session{ID: "session", Title: "repo"}}
+	report := codingagent.ContextReport{
+		Available: true, RunID: "run", Attempt: 2, Estimated: true, EstimatedInput: 120,
+		ProviderExact: true, ProviderInput: 127, ContextWindow: 1000, InputBudget: 800,
+		ReservedOutput: 150, SafetyMargin: 50, SummarizeThreshold: 640, HardLimit: 800,
+		BudgetSource: "model_metadata", Compacted: true,
+		Categories: []codingagent.ContextCategoryStat{
+			{Category: codingagent.ContextInstructions, Tokens: 20, Items: 1, Source: "project instruction context"},
+			{Category: codingagent.ContextReservedOutput, Tokens: 150, Items: 1, Source: "model output reservation"},
+		},
+		Degradations: []codingagent.ContextDegradation{{Kind: "summary_safe_trim", Reason: "Old history was safely trimmed."}},
+	}
+	model, err := NewModel(context.Background(), fakeClient{snapshot: snapshot, contextReport: report}, bridge, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width, model.height = 100, 35
+	command := runContextCommand(model, "")
+	if command == nil || !model.contextActive || !model.contextLoading {
+		t.Fatalf("context command = %#v active=%v loading=%v", command, model.contextActive, model.contextLoading)
+	}
+	model.Update(command())
+	view := ansi.Strip(model.View().Content)
+	for _, expected := range []string{"Estimated input: ~120 tokens", "Provider input: 127 tokens (exact)", "Input budget: 800 tokens", "Instructions", "Reserved Output", "History was summarized", "summary_safe_trim"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("context page does not contain %q: %q", expected, view)
+		}
+	}
+	model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEscape}))
+	if model.contextActive {
+		t.Fatal("Esc did not close context page")
+	}
+}
+
+func TestInstructionsCommandRejectsAbsoluteOrParentScope(t *testing.T) {
+	for _, value := range []string{"../outside", "C:/outside"} {
+		model := &Model{}
+		runInstructionsCommand(model, value)
+		if model.instructionsActive || !strings.Contains(model.errorMessage, "worktree-relative") {
+			t.Fatalf("value=%q active=%v error=%q", value, model.instructionsActive, model.errorMessage)
+		}
+	}
+}
+
 func TestCommandCompletionAcceptsDismissesAndUsesAWindow(t *testing.T) {
 	bridge, _ := NewEventBridge(2)
 	defer bridge.Close()
@@ -1013,6 +1110,7 @@ func TestCommandCompletionAcceptsDismissesAndUsesAWindow(t *testing.T) {
 		t.Fatalf("dismissed=%v input=%q active=%v", model.completionDismissed, model.input, model.completionActive())
 	}
 	model.Update(tea.KeyPressMsg(tea.Key{Code: 's', Text: "s"}))
+	model.Update(tea.KeyPressMsg(tea.Key{Code: 'e', Text: "e"}))
 	if model.completionDismissed || len(model.commandMatches()) != 1 || model.commandMatches()[0].name != "/session" {
 		t.Fatalf("printable input did not reopen filtered completion: dismissed=%v matches=%#v", model.completionDismissed, model.commandMatches())
 	}
@@ -1901,6 +1999,9 @@ func TestProviderIssueOpensPickerAndCredentialIsMasked(t *testing.T) {
 	}
 	if len(model.history) != 0 {
 		t.Fatalf("credential form changed conversation history: %#v", model.history)
+	}
+	if len(model.drafts) != 0 {
+		t.Fatalf("credential form changed Composer drafts: %#v", model.drafts)
 	}
 }
 

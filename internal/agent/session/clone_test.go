@@ -28,11 +28,17 @@ func TestEntryAndRecordCloneAreDeepCopies(t *testing.T) {
 	record := Record{
 		Tool:      &ToolData{EffectiveArgs: json.RawMessage(`{"path":"main.go"}`)},
 		Interrupt: &InterruptData{Payload: json.RawMessage(`{"decision":"ask"}`)},
+		Context: &ContextData{
+			Categories:   []ContextCategoryData{{Category: "system", Tokens: 1}},
+			Degradations: []ContextDegradationData{{Kind: "trim", Reason: "safe"}},
+		},
 	}
 	recordClone := record.Clone()
 	record.Tool.EffectiveArgs[2] = 'X'
 	record.Interrupt.Payload[2] = 'X'
-	if string(recordClone.Tool.EffectiveArgs) != `{"path":"main.go"}` || string(recordClone.Interrupt.Payload) != `{"decision":"ask"}` {
+	record.Context.Categories[0].Category = "changed"
+	record.Context.Degradations[0].Reason = "changed"
+	if string(recordClone.Tool.EffectiveArgs) != `{"path":"main.go"}` || string(recordClone.Interrupt.Payload) != `{"decision":"ask"}` || recordClone.Context.Categories[0].Category != "system" || recordClone.Context.Degradations[0].Reason != "safe" {
 		t.Fatalf("record clone retained mutable input: %#v", recordClone)
 	}
 }

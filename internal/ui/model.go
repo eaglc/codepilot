@@ -25,6 +25,8 @@ const (
 // Client is the complete product boundary used by the terminal UI.
 type Client interface {
 	Snapshot(ctx context.Context, id codingagent.SessionID) (codingagent.Snapshot, error)
+	Instructions(ctx context.Context, id codingagent.SessionID) ([]codingagent.InstructionSource, error)
+	Context(ctx context.Context, id codingagent.SessionID) (codingagent.ContextReport, error)
 	ListSessions(ctx context.Context, options codingagent.SessionListOptions) ([]codingagent.Session, error)
 	CreateSession(ctx context.Context, session codingagent.Session) (codingagent.Session, error)
 	SwitchSession(ctx context.Context, id codingagent.SessionID) (codingagent.Snapshot, error)
@@ -110,6 +112,10 @@ type Model struct {
 	cursor                int
 	history               []string
 	historyIndex          int
+	drafts                map[codingagent.SessionID]composerDraft
+	historyDraft          *composerDraft
+	composerKeymap        ComposerKeymap
+	composerGoalColumn    int
 	busy                  bool
 	thinking              bool
 	status                string
@@ -146,6 +152,22 @@ type Model struct {
 	approvalInterruptID   string
 	forkPicker            forkPicker
 	helpActive            bool
+	instructionsActive    bool
+	instructionsPath      string
+	instructionsScroll    int
+	instructions          []codingagent.InstructionSource
+	instructionsLoading   bool
+	instructionsError     string
+	instructionsRequest   uint64
+	contextActive         bool
+	contextScroll         int
+	contextReport         codingagent.ContextReport
+	contextLoading        bool
+	contextError          string
+	contextRequest        uint64
+	taskStatusActive      bool
+	taskStatusScroll      int
+	diffFocus             bool
 	planInput             bool
 	planFeedback          bool
 	clarificationOther    bool
@@ -194,6 +216,20 @@ type autoTitleMsg struct {
 	sessionID  codingagent.SessionID
 	generation uint64
 }
+type instructionsMsg struct {
+	sources    []codingagent.InstructionSource
+	err        error
+	sessionID  codingagent.SessionID
+	generation uint64
+	request    uint64
+}
+type contextMsg struct {
+	report     codingagent.ContextReport
+	err        error
+	sessionID  codingagent.SessionID
+	generation uint64
+	request    uint64
+}
 type blinkMsg struct{}
 
 // NewModel creates a single-column, command-line style conversation UI.
@@ -205,12 +241,15 @@ func NewModel(ctx context.Context, client Client, bridge *EventBridge, initial c
 		ctx: ctx, client: client, bridge: bridge, sessionID: initial.Session.ID, snapshot: initial,
 		width: 80, height: 24, activities: make(map[string]codingagent.ToolActivityEvent),
 		expanded: make(map[string]bool), markdownCache: make(map[string][]string), markdownEnabled: true, followBottom: true, history: historyFromSnapshot(initial), historyIndex: -1, generation: 1,
-		hitTextRows: make(map[int]textHit),
+		hitTextRows: make(map[int]textHit), drafts: make(map[codingagent.SessionID]composerDraft), composerKeymap: DefaultComposerKeymap(), composerGoalColumn: -1,
 	}
 	for _, option := range options {
 		if option != nil {
 			option(model)
 		}
+	}
+	if err := validateComposerKeymap(model.composerKeymap); err != nil {
+		return nil, err
 	}
 	return model, nil
 }
@@ -232,8 +271,20 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.width, m.height = max(20, value.Width), max(6, value.Height)
 	case tea.KeyPressMsg:
+		if m.diffFocus {
+			return m, m.handleDiffFocusKey(value)
+		}
+		if m.taskStatusActive {
+			return m, m.handleTaskStatusKey(value)
+		}
 		if m.helpActive {
 			return m, m.handleHelpKey(value)
+		}
+		if m.instructionsActive {
+			return m, m.handleInstructionsKey(value)
+		}
+		if m.contextActive {
+			return m, m.handleContextKey(value)
 		}
 		if m.forkPicker.active {
 			return m, m.handleForkKey(value)
@@ -252,7 +303,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.handleKey(value)
 	case tea.PasteMsg:
-		if m.helpActive || m.permissionPicker.active || m.forkPicker.active {
+		if m.diffFocus || m.taskStatusActive || m.helpActive || m.instructionsActive || m.contextActive || m.permissionPicker.active || m.forkPicker.active {
 			break
 		} else if m.workspacePicker.active {
 			m.pasteWorkspaceInput(value.Content)
@@ -262,13 +313,29 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.pasteProviderInput(value.Content)
 		} else if !m.busy && (m.pendingApproval() == nil || m.planFeedback) && (m.pendingClarification() == nil || m.clarificationOther) && m.pendingRecovery() == nil {
 			m.clearTextSelection()
-			m.insert([]rune(value.Content))
+			m.insert(normalizeComposerText(value.Content))
 			if m.clarificationOther {
 				m.errorMessage = ""
 				m.followBottom = true
 			}
 		}
 	case tea.MouseWheelMsg:
+		if m.diffFocus {
+			if value.Mouse().Button == tea.MouseWheelUp {
+				m.diffScroll = max(0, m.diffScroll-3)
+			} else if value.Mouse().Button == tea.MouseWheelDown {
+				m.diffScroll += 3
+			}
+			break
+		}
+		if m.taskStatusActive {
+			if value.Mouse().Button == tea.MouseWheelUp {
+				m.taskStatusScroll = max(0, m.taskStatusScroll-3)
+			} else if value.Mouse().Button == tea.MouseWheelDown {
+				m.taskStatusScroll += 3
+			}
+			break
+		}
 		m.scrollbar.dragging = false
 		if m.diffPaneActive && value.Mouse().X > m.conversationWidth {
 			if value.Mouse().Button == tea.MouseWheelUp {
@@ -483,6 +550,30 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case permissionModeChangedMsg:
 		m.applyPermissionModeChanged(value)
+	case instructionsMsg:
+		if value.generation != m.generation || value.sessionID != m.sessionID || value.request != m.instructionsRequest || !m.instructionsActive {
+			break
+		}
+		m.instructionsLoading = false
+		if value.err != nil {
+			m.instructionsError = safeError(value.err)
+			m.instructions = nil
+		} else {
+			m.instructionsError = ""
+			m.instructions = append([]codingagent.InstructionSource(nil), value.sources...)
+		}
+	case contextMsg:
+		if value.generation != m.generation || value.sessionID != m.sessionID || value.request != m.contextRequest || !m.contextActive {
+			break
+		}
+		m.contextLoading = false
+		if value.err != nil {
+			m.contextError = safeError(value.err)
+			m.contextReport = codingagent.ContextReport{}
+		} else {
+			m.contextError = ""
+			m.contextReport = value.report
+		}
 	case workspacesMsg:
 		m.applyWorkspaces(value)
 	case workspaceActivatedMsg:
@@ -508,6 +599,14 @@ func (m *Model) handleKey(message tea.KeyPressMsg) tea.Cmd {
 	}
 	if key.Code == tea.KeyPgDown {
 		m.scroll += max(3, m.bodyHeight()-2)
+		return nil
+	}
+	if strings.EqualFold(key.Text, "d") && len(m.input) == 0 && m.selectedTool != "" {
+		m.expanded[m.selectedTool] = true
+		if _, available := m.selectedDiffPane(); available {
+			m.diffFocus = true
+			m.diffScroll = 0
+		}
 		return nil
 	}
 	// An explicit mouse selection takes precedence over modal approval,
@@ -583,10 +682,9 @@ func (m *Model) handleKey(message tea.KeyPressMsg) tea.Cmd {
 				m.completeCommand()
 				return nil
 			}
-		case tea.KeyEnter:
-			if key.Mod&tea.ModAlt == 0 {
-				return m.submitSelectedCommand()
-			}
+		}
+		if matchesComposerBinding(key, m.composerKeymap.Submit) {
+			return m.submitSelectedCommand()
 		}
 	}
 	if key.Code == tea.KeyEscape || key.Code == tea.KeyEsc {
@@ -599,56 +697,61 @@ func (m *Model) handleKey(message tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 	if m.selectedBlock != "" && len(m.input) == 0 {
+		block, _ := m.blockByKey(m.selectedBlock)
 		switch {
 		case strings.EqualFold(key.Text, "y"):
 			return m.copySelection()
 		case key.Code == tea.KeyEnter || key.Text == " ":
-			if m.selectedTool != "" {
-				m.expanded[m.selectedTool] = !m.expanded[m.selectedTool]
+			if block.expandID != "" {
+				m.expanded[block.expandID] = !m.expanded[block.expandID]
 			}
 			return nil
 		case key.Code == tea.KeyLeft:
-			m.expanded[m.selectedTool] = false
+			if block.expandID != "" {
+				m.expanded[block.expandID] = false
+			}
 			return nil
 		case key.Code == tea.KeyRight:
-			m.expanded[m.selectedTool] = true
+			if block.expandID != "" {
+				m.expanded[block.expandID] = true
+			}
 			return nil
 		}
 	}
-	switch key.Code {
-	case tea.KeyEnter:
-		if key.Mod&tea.ModAlt != 0 {
-			m.insert([]rune{'\n'})
-			return nil
-		}
+	if matchesComposerBinding(key, m.composerKeymap.Newline) {
+		m.insert([]rune{'\n'})
+		return nil
+	}
+	if matchesComposerBinding(key, m.composerKeymap.Submit) {
 		return m.submit()
+	}
+	switch key.Code {
 	case tea.KeyLeft:
-		m.cursor = max(0, m.cursor-1)
+		m.cursor = previousGraphemeBoundary(m.input, m.cursor)
+		m.resetComposerGoalColumn()
 	case tea.KeyRight:
-		m.cursor = min(len(m.input), m.cursor+1)
+		m.cursor = nextGraphemeBoundary(m.input, m.cursor)
+		m.resetComposerGoalColumn()
 	case tea.KeyHome:
-		m.cursor = 0
+		m.moveComposerHome(key.Mod&tea.ModCtrl != 0)
 	case tea.KeyEnd:
-		m.cursor = len(m.input)
+		m.moveComposerEnd(key.Mod&tea.ModCtrl != 0)
 	case tea.KeyBackspace:
-		if m.cursor > 0 {
-			m.input = append(m.input[:m.cursor-1], m.input[m.cursor:]...)
-			m.cursor--
-			m.resetCompletion()
-		}
+		m.deleteComposerBackward()
 	case tea.KeyDelete:
-		if m.cursor < len(m.input) {
-			m.input = append(m.input[:m.cursor], m.input[m.cursor+1:]...)
-			m.resetCompletion()
-		}
+		m.deleteComposerForward()
 	case tea.KeyUp:
-		m.historyBack()
+		if !m.moveComposerVertical(-1) {
+			m.historyBack()
+		}
 	case tea.KeyDown:
-		m.historyForward()
+		if !m.moveComposerVertical(1) {
+			m.historyForward()
+		}
 	default:
 		if key.Text != "" && key.Mod&tea.ModCtrl == 0 {
 			m.resetCompletion()
-			m.insert([]rune(key.Text))
+			m.insert(normalizeComposerText(key.Text))
 		}
 	}
 	return nil
@@ -775,26 +878,40 @@ func (m *Model) insert(value []rune) {
 	if len(value) > remaining {
 		value = value[:remaining]
 	}
+	if len(value) == 0 {
+		return
+	}
+	m.beginComposerEdit()
 	m.input = append(m.input, make([]rune, len(value))...)
 	copy(m.input[m.cursor+len(value):], m.input[m.cursor:len(m.input)-len(value)])
 	copy(m.input[m.cursor:], value)
 	m.cursor += len(value)
 	m.completionCursor = 0
+	m.resetComposerGoalColumn()
+	m.syncDraft()
 }
 
 func (m *Model) replaceInput(value string) {
 	clear(m.input)
-	m.input = []rune(value)
+	m.input = normalizeComposerText(value)
 	m.cursor = len(m.input)
+	m.historyIndex = -1
+	m.historyDraft = nil
 	m.completionCursor = 0
 	m.completionDismissed = false
+	m.resetComposerGoalColumn()
+	m.syncDraft()
 }
 
 func (m *Model) clearInput() {
 	clear(m.input)
 	m.input = nil
 	m.cursor = 0
+	m.historyIndex = -1
+	m.historyDraft = nil
 	m.resetCompletion()
+	m.resetComposerGoalColumn()
+	m.syncDraft()
 }
 
 func (m *Model) resetCompletion() {
@@ -807,12 +924,16 @@ func (m *Model) historyBack() {
 		return
 	}
 	if m.historyIndex < 0 {
+		draft := m.currentDraft()
+		m.historyDraft = &draft
+		m.saveCurrentDraft()
 		m.historyIndex = len(m.history) - 1
 	} else if m.historyIndex > 0 {
 		m.historyIndex--
 	}
 	m.input = []rune(m.history[m.historyIndex])
 	m.cursor = len(m.input)
+	m.resetComposerGoalColumn()
 }
 
 func (m *Model) historyForward() {
@@ -824,9 +945,24 @@ func (m *Model) historyForward() {
 		m.input = []rune(m.history[m.historyIndex])
 	} else {
 		m.historyIndex = -1
-		m.clearInput()
+		if m.historyDraft != nil {
+			draft := m.historyDraft.clone()
+			m.input = draft.input
+			m.cursor = draft.cursor
+			m.planInput = draft.planInput
+		} else {
+			m.input = nil
+			m.cursor = 0
+		}
+		m.historyDraft = nil
 	}
 	m.cursor = len(m.input)
+	if m.historyIndex < 0 && m.historyDraft == nil {
+		if draft, ok := m.drafts[m.sessionID]; ok {
+			m.cursor = nearestGraphemeBoundary(m.input, draft.cursor)
+		}
+	}
+	m.resetComposerGoalColumn()
 }
 
 func (m *Model) waitEvent() tea.Cmd {
@@ -852,11 +988,17 @@ func (m *Model) activateSnapshot(snapshot codingagent.Snapshot) {
 	if snapshot.Session.ID == "" {
 		return
 	}
+	m.saveCurrentDraft()
 	m.clearTurnCancel()
 	m.generation++
 	m.sessionID = snapshot.Session.ID
 	m.snapshot = snapshot
-	m.clearInput()
+	clear(m.input)
+	m.input = nil
+	m.cursor = 0
+	m.historyDraft = nil
+	m.resetCompletion()
+	m.resetComposerGoalColumn()
 	m.history = historyFromSnapshot(snapshot)
 	m.historyIndex = -1
 	m.busy = false
@@ -890,6 +1032,23 @@ func (m *Model) activateSnapshot(snapshot codingagent.Snapshot) {
 	m.clarificationSelected = nil
 	m.forkPicker = forkPicker{}
 	m.helpActive = false
+	m.instructionsActive = false
+	m.instructionsPath = ""
+	m.instructionsScroll = 0
+	m.instructions = nil
+	m.instructionsLoading = false
+	m.instructionsError = ""
+	m.instructionsRequest = 0
+	m.contextActive = false
+	m.contextScroll = 0
+	m.contextReport = codingagent.ContextReport{}
+	m.contextLoading = false
+	m.contextError = ""
+	m.contextRequest = 0
+	m.taskStatusActive = false
+	m.taskStatusScroll = 0
+	m.diffFocus = false
+	m.restoreDraft(snapshot.Session.ID)
 }
 
 func historyFromSnapshot(snapshot codingagent.Snapshot) []string {
@@ -1043,11 +1202,23 @@ func recoveryAllows(action codingagent.RecoveryAction, decision codingagent.Reco
 
 func (m *Model) View() tea.View {
 	width, height := max(20, m.width), max(6, m.height)
+	if m.diffFocus {
+		return m.diffFocusView(width, height)
+	}
+	if m.taskStatusActive {
+		return m.taskStatusView(width, height)
+	}
 	if m.workspacePicker.active {
 		return m.workspaceView(width, height)
 	}
 	if m.helpActive {
 		return m.helpView(width, height)
+	}
+	if m.instructionsActive {
+		return m.instructionsView(width, height)
+	}
+	if m.contextActive {
+		return m.contextView(width, height)
 	}
 	if m.forkPicker.active {
 		return m.forkView(width, height)
@@ -1061,7 +1232,11 @@ func (m *Model) View() tea.View {
 	if m.picker.active {
 		return m.providerView(width, height)
 	}
-	completionLines := m.commandCompletionLines(width, max(0, height-6))
+	footerHeight := composerFooterHeight(height)
+	completionLimit := max(0, height-1-1-minComposerHeight-footerHeight)
+	completionLines := m.commandCompletionLines(width, completionLimit)
+	composerMaximum := max(minComposerHeight, height-1-1-len(completionLines)-footerHeight)
+	composer := m.renderComposer(width, composerMaximum)
 	pane, hasDiff := m.selectedDiffPane()
 	conversationWidth, diffWidth := diffPaneLayout(width, hasDiff)
 	m.diffPaneActive = diffWidth != 0
@@ -1092,10 +1267,7 @@ func (m *Model) View() tea.View {
 	if strings.TrimSpace(rootName) == "" || rootName == "." {
 		rootName = "CodePilot"
 	}
-	header := theme.header.Render("CodePilot") + theme.muted.Render("  "+rootName+"  •  "+m.snapshot.Session.ProviderProfileID+"/"+m.snapshot.Session.ModelID)
-	if distanceFromBottom := maxScroll - m.scroll; distanceFromBottom > 0 {
-		header += theme.muted.Render(fmt.Sprintf("  •  %d lines below", distanceFromBottom))
-	}
+	header := m.headerLine(rootName, width, maxScroll-m.scroll)
 	lines := []string{truncateANSI(header, width)}
 	for index := 0; index < bodyHeight; index++ {
 		screenY := index + 1
@@ -1128,11 +1300,12 @@ func (m *Model) View() tea.View {
 		}
 	}
 	lines = append(lines, completionLines...)
-	promptY := len(lines)
-	prompt, promptX, promptCursor := m.renderPrompt(width)
-	lines = append(lines, prompt)
-	lines = append(lines, truncateANSI(m.footerDividerLine(width), width))
-	lines = append(lines, truncateANSI(m.sessionMetricsLine(), width))
+	composerY := len(lines)
+	lines = append(lines, composer.lines...)
+	if footerHeight == 3 {
+		lines = append(lines, truncateANSI(m.footerDividerLine(width), width))
+		lines = append(lines, truncateANSI(m.sessionMetricsLine(), width))
+	}
 	lines = append(lines, truncateANSI(m.statusLine(), width))
 	view := tea.NewView(strings.Join(lines, "\n"))
 	view.AltScreen = true
@@ -1142,14 +1315,14 @@ func (m *Model) View() tea.View {
 	view.ForegroundColor = lipgloss.Color("#E5E7EB")
 	if inlineCursor {
 		view.Cursor = nativeTextCursor(inlineCursorX, inlineCursorY)
-	} else if promptCursor {
-		view.Cursor = nativeTextCursor(promptX, promptY)
+	} else if composer.cursorActive {
+		view.Cursor = nativeTextCursor(composer.cursorX, composerY+composer.cursorY)
 	}
 	return view
 }
 
 func (m *Model) overlayActive() bool {
-	return m.workspacePicker.active || m.helpActive || m.forkPicker.active || m.permissionPicker.active || m.sessionPicker.active || m.picker.active
+	return m.diffFocus || m.taskStatusActive || m.workspacePicker.active || m.helpActive || m.instructionsActive || m.contextActive || m.forkPicker.active || m.permissionPicker.active || m.sessionPicker.active || m.picker.active
 }
 
 func (m *Model) conversationRows(width int) []renderRow {
@@ -1257,19 +1430,14 @@ func (m *Model) conversationRows(width int) []renderRow {
 	if len(liveCreates.activities) != 0 {
 		rows = append(rows, m.createFileGroupRows(liveCreates, contentWidth)...)
 	}
-	if pending := m.pendingApproval(); pending != nil {
-		if (pending.Kind == "plan_approval" || pending.Kind == "plan_replan_approval") && m.snapshot.ActivePlan != nil {
-			rows = append(rows, m.planRows(*m.snapshot.ActivePlan, contentWidth)...)
-		}
-		rows = append(rows, m.approvalRows(*pending, contentWidth)...)
-	} else if m.snapshot.ActivePlan != nil {
+	if m.snapshot.ActivePlan != nil {
 		rows = append(rows, m.planRows(*m.snapshot.ActivePlan, contentWidth)...)
 	}
-	if m.snapshot.ActiveWorkflow != nil {
-		rows = append(rows, m.workflowRows(*m.snapshot.ActiveWorkflow, contentWidth)...)
+	if m.snapshot.ActiveWorkflow != nil || len(m.snapshot.ChildAgents) != 0 {
+		rows = append(rows, m.taskHierarchyRows(contentWidth, m.width >= minInlineTaskTreeWidth)...)
 	}
-	if len(m.snapshot.ChildAgents) != 0 {
-		rows = append(rows, m.childAgentRows(m.snapshot.ChildAgents, contentWidth)...)
+	if pending := m.pendingApproval(); pending != nil {
+		rows = append(rows, m.approvalRows(*pending, contentWidth)...)
 	}
 	if pending := m.pendingClarification(); pending != nil {
 		rows = append(rows, m.clarificationRows(*pending, contentWidth)...)
@@ -1434,11 +1602,14 @@ func (m *Model) statusLine() string {
 		return theme.muted.Render("Text selected  •  Ctrl+C copy  •  Esc clear")
 	}
 	if m.selectedBlock != "" {
+		if strings.HasPrefix(m.selectedBlock, taskSelectionPrefix) {
+			return theme.muted.Render("Task selected  •  Enter/Space expand  •  Y copy  •  /status full tree")
+		}
 		if m.selectedTool != "" {
 			if m.diffPaneActive {
-				return theme.muted.Render("Diff open  •  Wheel over right pane to scroll  •  Y copy  •  ← collapse")
+				return theme.muted.Render("Diff open  •  D full screen  •  Wheel over right pane to scroll  •  Y copy  •  ← collapse")
 			}
-			return theme.muted.Render("Tool selected")
+			return theme.muted.Render("Tool selected  •  Enter expand  •  D open diff full screen")
 		}
 		return theme.muted.Render("Message selected")
 	}
@@ -1505,34 +1676,7 @@ func formatMetricDuration(value time.Duration) string {
 }
 
 func (m *Model) promptLine() string {
-	line, _, _ := m.renderPrompt(max(20, m.width))
-	return line
-}
-
-func (m *Model) renderPrompt(width int) (string, int, bool) {
-	prefixText := "❯ "
-	if m.planInput {
-		prefixText = "Plan ❯ "
-	} else if m.planFeedback {
-		prefixText = "Revise ❯ "
-	}
-	prefix := theme.user.Render(prefixText)
-	if m.busy || (m.pendingApproval() != nil && !m.planFeedback) || m.pendingClarification() != nil || m.pendingRecovery() != nil {
-		return truncateANSI(theme.muted.Render("❯ "), width), 0, false
-	}
-	prefixWidth := ansi.StringWidth(prefix)
-	viewport := renderInputViewport(m.input, m.cursor, max(1, width-prefixWidth))
-	line := prefix + theme.assistant.Render(viewport.text)
-	if len(m.input) == 0 {
-		placeholder := "Ask CodePilot anything…"
-		if m.planInput {
-			placeholder = "Describe what should be planned…"
-		} else if m.planFeedback {
-			placeholder = "Describe the Plan changes you want…"
-		}
-		line = prefix + " " + theme.muted.Render(placeholder)
-	}
-	return truncateANSI(line, width), min(width-1, prefixWidth+viewport.cursorOffset), true
+	return strings.Join(m.renderComposer(max(20, m.width), maxComposerHeight).lines, "\n")
 }
 
 func recoveryDecisionHelp(action codingagent.RecoveryAction) string {
@@ -1553,8 +1697,20 @@ func recoveryDecisionHelp(action codingagent.RecoveryAction) string {
 }
 
 func (m *Model) bodyHeight() int {
-	completionLines := m.commandCompletionLines(max(20, m.width), max(0, m.height-6))
-	return max(1, m.height-5-len(completionLines))
+	width, height := max(20, m.width), max(6, m.height)
+	footerHeight := composerFooterHeight(height)
+	completionLimit := max(0, height-1-1-minComposerHeight-footerHeight)
+	completionLines := m.commandCompletionLines(width, completionLimit)
+	composerMaximum := max(minComposerHeight, height-1-1-len(completionLines)-footerHeight)
+	composer := m.renderComposer(width, composerMaximum)
+	return max(1, height-1-len(completionLines)-len(composer.lines)-footerHeight)
+}
+
+func composerFooterHeight(height int) int {
+	if height < 8 {
+		return 1
+	}
+	return 3
 }
 
 func pluralize(value int, singular, plural string) string {

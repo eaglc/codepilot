@@ -209,7 +209,7 @@ func (s *Service) runParallelChild(ctx context.Context, product Session, executi
 				SessionID: child.AgentSessionID, Lane: agentsession.MainLane, RunID: child.RunID,
 				UserEntryID: agentsession.EntryID("entry_" + string(child.ID)), SystemPrompt: execution.environment.systemPrompt,
 				Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID}, UserMessage: execution.message,
-				UntrustedContext: execution.environment.untrustedContext, Tools: execution.environment.tools, Limits: limits,
+				UntrustedContext: execution.environment.untrustedContext, UntrustedContextCategories: execution.environment.untrustedContextCategories, Tools: execution.environment.tools, Limits: limits,
 			}, execution.environment.events)
 		} else if action.Kind == agentsession.RecoveryResolveInterrupt || action.Kind == agentsession.RecoveryDecideTool || action.Kind == agentsession.RecoveryDecideRun {
 			result, runErr = agent.RunResult{RunID: child.RunID, Status: agent.RunFailed, Reason: "parallel_recovery_requires_decision"}, errors.New("parallel read-only child recovery reached a user decision boundary")
@@ -218,7 +218,7 @@ func (s *Service) runParallelChild(ctx context.Context, product Session, executi
 				SessionID: child.AgentSessionID, Lane: agentsession.MainLane, RunID: child.RunID,
 				ActionID: action.ID, Decision: agentsession.RecoveryRetry, Automatic: action.Automatic, ContinueRun: true,
 				SystemPrompt: execution.environment.systemPrompt, Model: llm.ModelRef{Provider: product.ProviderProfileID, Model: product.ModelID},
-				UntrustedContext: execution.environment.untrustedContext, Tools: execution.environment.tools, Limits: limits,
+				UntrustedContext: execution.environment.untrustedContext, UntrustedContextCategories: execution.environment.untrustedContextCategories, Tools: execution.environment.tools, Limits: limits,
 			}, execution.environment.events)
 		}
 	}

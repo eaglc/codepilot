@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"path"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -22,6 +23,9 @@ type commandSpec struct {
 func registeredCommands() []commandSpec {
 	return []commandSpec{
 		{name: "/help", usage: "/help", description: "Show this command guide", run: runHelpCommand},
+		{name: "/instructions", usage: "/instructions [path]", description: "Show project instruction sources and effective scope", takesArg: true, run: runInstructionsCommand},
+		{name: "/context", usage: "/context", description: "Show the latest prepared model context budget", run: runContextCommand},
+		{name: "/status", usage: "/status", description: "Show Task, Plan, Workflow, and Agent status", run: runStatusCommand},
 		{name: "/plan", usage: "/plan [request]", description: "Start a read-only Plan task", takesArg: true, run: runPlanCommand},
 		{name: "/workspace", usage: "/workspace", description: "Choose or repair a workspace", run: runWorkspaceCommand},
 		{name: "/provider", usage: "/provider", description: "Configure a provider and choose a model", aliases: []string{"/model"}, run: runModelCommand},
@@ -33,6 +37,12 @@ func registeredCommands() []commandSpec {
 		{name: "/md", usage: "/md [on|off]", description: "Toggle Markdown rendering for assistant messages", aliases: []string{"/markdown"}, takesArg: true, run: runMarkdownCommand},
 		{name: "/exit", usage: "/exit", description: "Exit CodePilot", aliases: []string{"/quit"}, run: runExitCommand},
 	}
+}
+
+func runStatusCommand(model *Model, _ string) tea.Cmd {
+	model.taskStatusActive = true
+	model.taskStatusScroll = 0
+	return nil
 }
 
 func (m *Model) submitCommand(text string) tea.Cmd {
@@ -87,7 +97,7 @@ func (m *Model) commandMatches() []commandSpec {
 }
 
 func (m *Model) completionActive() bool {
-	return !m.busy && !m.picker.active && !m.sessionPicker.active && !m.workspacePicker.active && !m.permissionPicker.active && !m.forkPicker.active && !m.helpActive &&
+	return !m.busy && !m.picker.active && !m.sessionPicker.active && !m.workspacePicker.active && !m.permissionPicker.active && !m.forkPicker.active && !m.helpActive && !m.instructionsActive && !m.contextActive &&
 		m.pendingApproval() == nil && m.pendingRecovery() == nil && !m.completionDismissed && len(m.commandMatches()) != 0
 }
 
@@ -165,6 +175,63 @@ func runHelpCommand(m *Model, arguments string) tea.Cmd {
 		m.helpActive = true
 	}
 	return nil
+}
+
+func runInstructionsCommand(m *Model, arguments string) tea.Cmd {
+	target, ok := normalizeInstructionTarget(arguments)
+	if !ok {
+		m.errorMessage = "Usage: /instructions [worktree-relative path]"
+		return nil
+	}
+	m.instructionsPath = target
+	m.instructionsScroll = 0
+	m.instructions = nil
+	m.instructionsError = ""
+	m.instructionsLoading = true
+	m.instructionsRequest++
+	m.instructionsActive = true
+	return m.loadInstructions()
+}
+
+func (m *Model) loadInstructions() tea.Cmd {
+	client, ctx, sessionID, generation, request := m.client, m.ctx, m.sessionID, m.generation, m.instructionsRequest
+	return func() tea.Msg {
+		sources, err := client.Instructions(ctx, sessionID)
+		return instructionsMsg{sources: sources, err: err, sessionID: sessionID, generation: generation, request: request}
+	}
+}
+
+func runContextCommand(m *Model, arguments string) tea.Cmd {
+	if !noCommandArguments(m, arguments, "/context") {
+		return nil
+	}
+	m.contextScroll = 0
+	m.contextReport = codingagent.ContextReport{}
+	m.contextError = ""
+	m.contextLoading = true
+	m.contextRequest++
+	m.contextActive = true
+	return m.loadContext()
+}
+
+func (m *Model) loadContext() tea.Cmd {
+	client, ctx, sessionID, generation, request := m.client, m.ctx, m.sessionID, m.generation, m.contextRequest
+	return func() tea.Msg {
+		report, err := client.Context(ctx, sessionID)
+		return contextMsg{report: report, err: err, sessionID: sessionID, generation: generation, request: request}
+	}
+}
+
+func normalizeInstructionTarget(value string) (string, bool) {
+	value = strings.ReplaceAll(strings.TrimSpace(value), "\\", "/")
+	if value == "" {
+		return ".", true
+	}
+	clean := path.Clean(value)
+	if clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") || strings.ContainsAny(clean, "\x00\r\n:") {
+		return "", false
+	}
+	return clean, true
 }
 
 func runPlanCommand(m *Model, arguments string) tea.Cmd {

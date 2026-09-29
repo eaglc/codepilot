@@ -13,13 +13,15 @@ import (
 const (
 	messageSelectionPrefix = "message:"
 	toolSelectionPrefix    = "tool:"
+	taskSelectionPrefix    = "task:"
 )
 
 type selectableBlock struct {
-	key    string
-	kind   string
-	toolID string
-	text   string
+	key      string
+	kind     string
+	toolID   string
+	expandID string
+	text     string
 }
 
 type textPosition struct {
@@ -63,7 +65,7 @@ func (m *Model) selectableBlocks() []selectableBlock {
 		}
 	}
 	seenTools := make(map[string]struct{})
-	var blocks []selectableBlock
+	blocks := m.taskSelectableBlocks()
 	for index := 0; index < len(m.snapshot.Transcript); index++ {
 		item := m.snapshot.Transcript[index]
 		switch item.Kind {
@@ -86,12 +88,12 @@ func (m *Model) selectableBlocks() []selectableBlock {
 					seenTools[grouped.CallID] = struct{}{}
 				}
 				id := group.primaryID()
-				blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + id, kind: "tool", toolID: id, text: createFileGroupCopyText(group)})
+				blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + id, kind: "tool", toolID: id, expandID: id, text: createFileGroupCopyText(group)})
 				index = next - 1
 				continue
 			}
 			seenTools[item.Tool.CallID] = struct{}{}
-			blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + item.Tool.CallID, kind: "tool", toolID: item.Tool.CallID, text: toolCopyText(activity)})
+			blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + item.Tool.CallID, kind: "tool", toolID: item.Tool.CallID, expandID: item.Tool.CallID, text: toolCopyText(activity)})
 		}
 	}
 	var liveCreates createFileGroup
@@ -104,11 +106,11 @@ func (m *Model) selectableBlocks() []selectableBlock {
 			liveCreates.activities = append(liveCreates.activities, activity)
 			continue
 		}
-		blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + activity.CallID, kind: "tool", toolID: activity.CallID, text: toolCopyText(activity)})
+		blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + activity.CallID, kind: "tool", toolID: activity.CallID, expandID: activity.CallID, text: toolCopyText(activity)})
 	}
 	if len(liveCreates.activities) != 0 {
 		id := liveCreates.primaryID()
-		blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + id, kind: "tool", toolID: id, text: createFileGroupCopyText(liveCreates)})
+		blocks = append(blocks, selectableBlock{key: toolSelectionPrefix + id, kind: "tool", toolID: id, expandID: id, text: createFileGroupCopyText(liveCreates)})
 	}
 	return blocks
 }
@@ -165,9 +167,16 @@ func (m *Model) selectBlock(block selectableBlock) {
 }
 
 func (m *Model) selectBlockByKey(key string) (selectableBlock, bool) {
+	block, found := m.blockByKey(key)
+	if found {
+		m.selectBlock(block)
+	}
+	return block, found
+}
+
+func (m *Model) blockByKey(key string) (selectableBlock, bool) {
 	for _, block := range m.selectableBlocks() {
 		if block.key == key {
-			m.selectBlock(block)
 			return block, true
 		}
 	}

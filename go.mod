@@ -14,6 +14,7 @@ require (
 	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/gofrs/flock v0.13.0
 	github.com/hexops/gotextdiff v1.0.3
+	github.com/rivo/uniseg v0.4.7
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/sys v0.46.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -68,7 +69,6 @@ require (
 	github.com/ollama/ollama v0.6.5 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/slongfield/pyfmt v0.0.0-20220222012616-ea85ff4c361f // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
